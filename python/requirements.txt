@@ -1,0 +1,11 @@
+# Core dependencies
+numpy>=1.21.0
+librosa>=0.10.0
+click>=8.0.0
+
+# Optional: VGGish model for audio embeddings
+# tensorflow>=2.10.0  # or tensorflow-hub
+# Uncomment above for full audio pipeline
+
+# For testing
+soundfile>=0.12.0
