@@ -10,6 +10,8 @@ use thiserror::Error;
 // so we'll need to update them after the first successful download if the files change.
 // Using the example hash from the plan for now.
 const CLAP_AUDIO_URL: &str = "https://huggingface.co/laion/clap-htsat-unfused/resolve/main/clap_audio.onnx";
+const CLAP_TEXT_URL: &str = "https://huggingface.co/Xenova/laion-clap-htsat-unfused/resolve/main/onnx/text_model.onnx";
+const TOKENIZER_URL: &str = "https://huggingface.co/Xenova/laion-clap-htsat-unfused/resolve/main/tokenizer.json";
 // const CLAP_AUDIO_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"; // Empty file hash for testing structure
 
 #[derive(Error, Debug)]
@@ -67,6 +69,27 @@ impl ModelManager {
         tracing::info!("Downloading CLAP Audio model to {:?}", path);
         self.download_file(CLAP_AUDIO_URL, &path)?;
         
+        
+        Ok(path)
+    }
+
+    /// Ensure the CLAP Text model exists.
+    pub fn get_clap_text(&self) -> Result<PathBuf, ModelError> {
+        let path = self.root.join("text_model.onnx");
+        if path.exists() { return Ok(path); }
+        
+        tracing::info!("Downloading CLAP Text model to {:?}", path);
+        self.download_file(CLAP_TEXT_URL, &path)?;
+        Ok(path)
+    }
+
+    /// Ensure the Tokenizer exists.
+    pub fn get_tokenizer(&self) -> Result<PathBuf, ModelError> {
+        let path = self.root.join("tokenizer.json");
+        if path.exists() { return Ok(path); }
+        
+        tracing::info!("Downloading Tokenizer to {:?}", path);
+        self.download_file(TOKENIZER_URL, &path)?;
         Ok(path)
     }
 

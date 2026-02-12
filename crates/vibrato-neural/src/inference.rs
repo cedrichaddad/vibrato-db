@@ -10,11 +10,10 @@ use ort::value::Value;
 use ort::inputs;
 use thiserror::Error;
 use tokio::task;
+use tokenizers::Tokenizer;
 
 use crate::spectrogram::Spectrogram;
 use crate::models::ModelManager;
-use crate::decoder;
-use crate::resampler;
 
 #[derive(Error, Debug)]
 pub enum InferenceError {
@@ -36,7 +35,8 @@ pub enum InferenceError {
 #[derive(Clone)]
 pub struct InferenceEngine {
     audio_session: Arc<Mutex<Session>>,
-    // text_session: Arc<Mutex<Session>>, // TODO: Add text model later
+    text_session: Arc<Mutex<Session>>,
+    tokenizer: Arc<Tokenizer>,
     spectrogram: Arc<Spectrogram>,
 }
 
@@ -49,6 +49,8 @@ impl InferenceEngine {
         
         // Ensure audio model is available
         let audio_model_path = manager.get_clap_audio()?;
+        let text_model_path = manager.get_clap_text()?;
+        let tokenizer_path = manager.get_tokenizer()?;
         
         // Initialize ORT environment (global)
         // We ignore error if already initialized
@@ -62,8 +64,17 @@ impl InferenceEngine {
             .with_intra_threads(1)?
             .commit_from_file(audio_model_path)?;
 
+        let text_session = SessionBuilder::new()?
+            .with_intra_threads(1)?
+            .commit_from_file(text_model_path)?;
+
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| InferenceError::Other(e.to_string()))?;
+
         Ok(Self {
             audio_session: Arc::new(Mutex::new(audio_session)),
+            text_session: Arc::new(Mutex::new(text_session)),
+            tokenizer: Arc::new(tokenizer),
             spectrogram: Arc::new(Spectrogram::new()),
         })
     }
@@ -139,10 +150,36 @@ impl InferenceEngine {
         engine.embed_audio(samples).await
     }
 
-    /// Mock method for demo compatibility until text model is added
-    pub async fn embed_text(&self, _text: &str) -> Result<Vec<f32>, InferenceError> {
-        // TODO: Implement real text embedding
-        Ok(vec![0.0; 512]) 
+    /// Embed text query
+    pub async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferenceError> {
+        let tokenizer = self.tokenizer.clone();
+        let session = self.text_session.clone();
+        let text = text.to_string();
+
+        task::spawn_blocking(move || {
+            // 1. Tokenize
+            let encoding = tokenizer.encode(text, true)
+                .map_err(|e| InferenceError::Other(e.to_string()))?;
+
+            let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+            let attention_mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&x| x as i64).collect();
+            
+            let seq_len = input_ids.len();
+            let shape = vec![1, seq_len];
+            
+            let input_ids_val = Value::from_array((shape.clone(), input_ids))?;
+            let attention_mask_val = Value::from_array((shape, attention_mask))?;
+
+            // 2. Inference
+            let mut session = session.lock().unwrap();
+            let outputs = session.run(inputs![input_ids_val, attention_mask_val])?;
+
+            // 3. Extract & Normalize
+            let embedding_tensor = outputs[0].try_extract_tensor::<f32>()?;
+            let embedding: Vec<f32> = embedding_tensor.1.to_vec();
+            
+            Ok(normalize(&embedding))
+        }).await?
     }
 }
 
