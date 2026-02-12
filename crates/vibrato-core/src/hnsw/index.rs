@@ -22,6 +22,28 @@ use super::node::Node;
 use super::visited::VisitedGuard;
 use crate::simd::dot_product;
 
+/// Software prefetch hint — starts loading data into L1 cache before
+/// it's needed, hiding memory latency during HNSW graph traversal.
+///
+/// This is a no-op if the platform doesn't support prefetch intrinsics.
+#[inline(always)]
+fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // PRFM PLDL1KEEP: prefetch into L1 data cache, temporal (keep)
+        // Uses inline asm since std::arch::aarch64::_prefetch is still unstable
+        std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = ptr; // no-op on unsupported platforms
+    }
+}
+
 /// Candidate for search (min-heap)
 #[derive(Clone, Copy)]
 struct Candidate {
@@ -379,11 +401,23 @@ impl HNSW {
 
             // Explore neighbors using O(1) HashMap lookup
             if let Some(node) = self.get_node(current.id) {
-                for &neighbor_id in node.neighbors(layer) {
+                let neighbors = node.neighbors(layer);
+                for (i, &neighbor_id) in neighbors.iter().enumerate() {
                     if visited.is_visited(neighbor_id) {
                         continue;
                     }
                     visited.visit(neighbor_id);
+
+                    // Prefetch the NEXT neighbor's node data to hide memory latency.
+                    // While we compute distance for neighbor_id, the CPU loads the
+                    // next neighbor's Node struct into L1 cache.
+                    if i + 1 < neighbors.len() {
+                        let next_id = neighbors[i + 1];
+                        if let Some(&next_idx) = self.id_to_index.get(&next_id) {
+                            let next_node_ptr = &self.nodes[next_idx] as *const Node as *const u8;
+                            prefetch_read(next_node_ptr);
+                        }
+                    }
 
                     let dist = self.distance(query, neighbor_id);
 
@@ -510,6 +544,146 @@ impl HNSW {
             .take(k)
             .map(|(id, dist)| (id, 1.0 - dist)) // Convert back to similarity
             .collect()
+    }
+
+    /// Search with metadata predicate filter (hybrid search)
+    ///
+    /// Traverses the graph normally but only emits results that pass the
+    /// predicate. Uses over-fetch (ef × 2) to compensate for filtered candidates.
+    ///
+    /// # Parameters
+    /// - `query`: Query vector
+    /// - `k`: Number of results to return
+    /// - `ef`: Base search depth (will be doubled internally for over-fetch)
+    /// - `predicate`: Closure that returns true for IDs to keep
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Find kicks near a query, filtering by metadata
+    /// let results = hnsw.search_filtered(&query, 10, 100, |id| {
+    ///     metadata.get(id).map(|m| m.tags.contains("kick")).unwrap_or(false)
+    /// });
+    /// ```
+    pub fn search_filtered<P>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        predicate: P,
+    ) -> Vec<(usize, f32)>
+    where
+        P: Fn(usize) -> bool,
+    {
+        if self.entry_point.is_none() {
+            return Vec::new();
+        }
+
+        let entry_point = self.entry_point.unwrap();
+        let mut current_node = entry_point;
+
+        // Phase 1: Greedy descent (unfiltered — we don't filter hub nodes)
+        for layer in (1..=self.max_layer).rev() {
+            let nearest = self.search_layer(query, &[current_node], 1, layer);
+            if let Some((nearest_id, _)) = nearest.first() {
+                current_node = *nearest_id;
+            }
+        }
+
+        // Phase 2: Over-fetch beam search on layer 0
+        // We fetch ef*2 candidates because many will be filtered out
+        let over_fetch = (ef * 2).max(k * 4);
+        let candidates = self.search_layer(query, &[current_node], over_fetch, 0);
+
+        // Apply predicate filter and return top k
+        candidates
+            .into_iter()
+            .filter(|(id, _)| predicate(*id))
+            .take(k)
+            .map(|(id, dist)| (id, 1.0 - dist))
+            .collect()
+    }
+
+    /// Sub-sequence search for multi-vector audio queries
+    ///
+    /// Given a sequence of query vectors (e.g., consecutive audio frames),
+    /// finds the best matching contiguous sub-sequence in the index.
+    ///
+    /// Algorithm (optimized per review feedback):
+    /// 1. Find the most "salient" query vector (highest L2 norm = most distinct)
+    /// 2. Search HNSW for that single vector → get candidate anchor positions
+    /// 3. For each candidate, brute-force verify the full sequence alignment
+    ///
+    /// # Parameters
+    /// - `query_sequence`: Ordered sequence of query vectors
+    /// - `k`: Number of results
+    /// - `ef`: Search depth
+    /// - `total_vectors`: Total number of vectors in the store (for bounds checking)
+    ///
+    /// # Returns
+    /// Vector of (start_id, average_score) pairs for best matching sub-sequences
+    pub fn search_subsequence(
+        &self,
+        query_sequence: &[Vec<f32>],
+        k: usize,
+        ef: usize,
+        total_vectors: usize,
+    ) -> Vec<(usize, f32)> {
+        if query_sequence.is_empty() || self.entry_point.is_none() {
+            return Vec::new();
+        }
+
+        let seq_len = query_sequence.len();
+
+        // Step 1: Find the most salient vector (highest L2 norm)
+        let (salient_offset, _) = query_sequence
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+                (i, norm_sq)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+            .unwrap();
+
+        let salient_query = &query_sequence[salient_offset];
+
+        // Step 2: HNSW search for the salient vector (over-fetch for candidates)
+        let anchor_candidates = self.search(salient_query, k * 4, ef);
+
+        // Step 3: For each candidate anchor, compute the start_id and verify
+        // the full sequence alignment via brute-force
+        let mut sequence_results: Vec<(usize, f32)> = Vec::new();
+
+        for (anchor_id, _anchor_score) in &anchor_candidates {
+            // The anchor matches query_sequence[salient_offset],
+            // so the sequence would start at anchor_id - salient_offset
+            let start_id = if *anchor_id >= salient_offset {
+                anchor_id - salient_offset
+            } else {
+                continue; // Can't fit the sequence
+            };
+
+            // Check bounds: sequence must fit within total vectors
+            if start_id + seq_len > total_vectors {
+                continue;
+            }
+
+            // Brute-force verify: compute average similarity across all positions
+            let mut total_sim = 0.0f32;
+            for (offset, query_vec) in query_sequence.iter().enumerate() {
+                let vec_id = start_id + offset;
+                let stored_vec = self.get_vector(vec_id);
+                total_sim += dot_product(query_vec, &stored_vec);
+            }
+            let avg_sim = total_sim / seq_len as f32;
+
+            sequence_results.push((start_id, avg_sim));
+        }
+
+        // Sort by similarity (descending) and return top k
+        sequence_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        sequence_results.truncate(k);
+        sequence_results
     }
 
     /// Get statistics about the index
@@ -815,5 +989,74 @@ mod tests {
         
         assert_eq!(results1[0].0, 25);
         assert_eq!(results2[0].0, 25);
+    }
+
+    #[test]
+    fn test_search_filtered_basic() {
+        let vectors: Vec<_> = (0..100).map(|_| random_vector(128)).collect();
+        let query = vectors[42].clone();
+        let vectors_clone = vectors.clone();
+
+        let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
+        for i in 0..100 {
+            hnsw.insert(i);
+        }
+
+        // Filter to only even IDs
+        let results = hnsw.search_filtered(&query, 5, 100, |id| id % 2 == 0);
+
+        // All results should have even IDs
+        for (id, _score) in &results {
+            assert_eq!(*id % 2, 0, "Filtered results should all be even, got {}", id);
+        }
+        // Vector 42 is even, so it should be the top result
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, 42);
+    }
+
+    #[test]
+    fn test_search_filtered_empty_predicate() {
+        let vectors: Vec<_> = (0..50).map(|_| random_vector(64)).collect();
+        let vectors_clone = vectors.clone();
+
+        let mut hnsw = HNSW::new(8, 50, move |id| vectors_clone[id].clone());
+        for i in 0..50 {
+            hnsw.insert(i);
+        }
+
+        // Filter that rejects everything
+        let query = random_vector(64);
+        let results = hnsw.search_filtered(&query, 5, 100, |_| false);
+        assert!(results.is_empty(), "Should be empty when predicate rejects all");
+    }
+
+    #[test]
+    fn test_search_subsequence_basic() {
+        // Create a sequence of vectors where IDs 10..15 form a distinct sequence
+        let vectors: Vec<_> = (0..50).map(|_| random_vector(128)).collect();
+        let vectors_clone = vectors.clone();
+
+        let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
+        for i in 0..50 {
+            hnsw.insert(i);
+        }
+
+        // Query with the exact sub-sequence at positions 10..15
+        let query_seq: Vec<Vec<f32>> = (10..15).map(|i| vectors[i].clone()).collect();
+        let results = hnsw.search_subsequence(&query_seq, 3, 100, 50);
+
+        // The top result should start at index 10
+        assert!(!results.is_empty(), "Should find at least one sub-sequence");
+        assert_eq!(results[0].0, 10, "Best sub-sequence should start at 10");
+        assert!(results[0].1 > 0.95, "Exact match should have high similarity");
+    }
+
+    #[test]
+    fn test_search_subsequence_empty() {
+        let hnsw = HNSW::new(16, 100, |_id| vec![0.0f32; 128]);
+
+        let query_seq: Vec<Vec<f32>> = vec![random_vector(128)];
+        let results = hnsw.search_subsequence(&query_seq, 5, 100, 0);
+        assert!(results.is_empty(), "Empty index should return no results");
     }
 }

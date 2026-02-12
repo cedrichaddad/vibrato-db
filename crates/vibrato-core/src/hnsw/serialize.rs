@@ -98,7 +98,7 @@ impl super::HNSW {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
     use crate::simd::l2_normalized;
     use tempfile::tempdir;
 
