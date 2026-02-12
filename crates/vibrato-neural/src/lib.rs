@@ -19,6 +19,7 @@
 
 pub mod decoder;
 pub mod inference;
+pub mod models;
 pub mod resampler;
 pub mod spectrogram;
 pub mod windowing;

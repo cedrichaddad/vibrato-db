@@ -207,7 +207,7 @@ async fn ingest(
             vec
         } else if let Some(path_str) = payload.audio_path {
             let path = std::path::Path::new(&path_str);
-            match state.inference.embed_audio_file(path) {
+            match state.inference.embed_audio_file(path).await {
                 Ok(vec) => vec,
                 Err(e) => return (
                     StatusCode::INTERNAL_SERVER_ERROR,

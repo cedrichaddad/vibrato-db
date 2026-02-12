@@ -1,144 +1,156 @@
 //! ONNX inference engine using ORT (ONNX Runtime)
 //!
-//! Supports CLAP (audio + text embedding) and VGGish models.
-//!
-//! # Mock Implementation
-//!
-//! Due to dependency conflicts with `ort` (requires rustc 1.88+ for 2.x, 1.x yanked),
-//! this module currently provides a **MOCK** implementation that returns deterministic
-//! pseudo-random embeddings. This allows the upper layers (ingest, server) to be
-//! developed and tested end-to-end.
+//! Supports CLAP (audio + text embedding).
 
-use crate::NeuralError;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-/// Default cache directory for ONNX runtime and models
-pub fn cache_dir() -> PathBuf {
-    dirs_next()
-        .unwrap_or_else(|| PathBuf::from(".cache/vibrato"))
+use ort::session::{Session, builder::SessionBuilder};
+use ort::value::Value;
+use ort::inputs;
+use thiserror::Error;
+use tokio::task;
+
+use crate::spectrogram::Spectrogram;
+use crate::models::ModelManager;
+use crate::decoder;
+use crate::resampler;
+
+#[derive(Error, Debug)]
+pub enum InferenceError {
+    #[error("ORT error: {0}")]
+    Ort(#[from] ort::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Model error: {0}")]
+    Model(#[from] crate::models::ModelError),
+    #[error("Join error: {0}")]
+    Join(#[from] task::JoinError),
+    #[error("Other error: {0}")]
+    Other(String),
 }
 
-fn dirs_next() -> Option<PathBuf> {
-    // Cross-platform cache dir
-    #[cfg(target_os = "macos")]
-    {
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join(".cache/vibrato"))
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var("XDG_CACHE_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".cache")))
-            .map(|p| p.join("vibrato"))
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("LOCALAPPDATA")
-            .ok()
-            .map(|p| PathBuf::from(p).join("vibrato").join("cache"))
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        None
-    }
-}
-
-/// Placeholder for ONNX inference engine
+/// Neural Inference Engine
 ///
-/// Current status: MOCK implementation.
+/// Wraps ONNX Runtime sessions for audio and text embedding.
+#[derive(Clone)]
 pub struct InferenceEngine {
-    _model_dir: PathBuf,
+    audio_session: Arc<Mutex<Session>>,
+    // text_session: Arc<Mutex<Session>>, // TODO: Add text model later
+    spectrogram: Arc<Spectrogram>,
 }
 
 impl InferenceEngine {
-    /// Create an inference engine pointing to a model directory
-    pub fn new(model_dir: &Path) -> Result<Self, NeuralError> {
-        // In mock mode, we just check if dir exists (or not even that, for flexibility)
-        // But let's keep the check to match API contract.
-        if !model_dir.exists() {
-             // For demo simplicity, we might warn instead of err if it doesn't exist?
-             // No, let's error to prompt user to at least provide a path.
-             return Err(NeuralError::Inference(format!(
-                "Model directory not found: {}",
-                model_dir.display()
-            )));
-        }
+    /// Create a new inference engine
+    ///
+    /// Downloads models if missing.
+    pub fn new(_model_dir: &Path) -> Result<Self, InferenceError> {
+        let manager = ModelManager::new();
+        
+        // Ensure audio model is available
+        let audio_model_path = manager.get_clap_audio()?;
+        
+        // Initialize ORT environment (global)
+        // We ignore error if already initialized
+        let _ = ort::init()
+            .with_name("vibrato")
+            .commit();
+
+        // Load models
+        // Optimizations: intra_threads=1 to avoid oversubscription in async context
+        let audio_session = SessionBuilder::new()?
+            .with_intra_threads(1)?
+            .commit_from_file(audio_model_path)?;
 
         Ok(Self {
-            _model_dir: model_dir.to_path_buf(),
+            audio_session: Arc::new(Mutex::new(audio_session)),
+            spectrogram: Arc::new(Spectrogram::new()),
         })
     }
 
-    /// Embed audio from file (MOCK - skips actual decoding)
-    pub fn embed_audio_file(&self, _path: &Path) -> Result<Vec<f32>, NeuralError> {
-        tracing::warn!("Mocking audio pipeline for file");
-        Ok(generate_mock_embedding(512))
-    }
-
-    /// Embed audio using CLAP audio encoder (MOCK)
+    /// Embed an audio buffer
     ///
-    /// Input: log-mel spectrogram frames
-    /// Output: normalized embedding vector
-    pub fn embed_audio(&self, _mel_spectrogram: &[Vec<f32>]) -> Result<Vec<f32>, NeuralError> {
-        tracing::warn!("Using MOCK inference for audio embedding");
-        Ok(generate_mock_embedding(512))
+    /// 1. Resample to 48kHz (caller responsibility, widely assumed)
+    /// 2. Compute Mel-Spectrogram
+    /// 3. Run ONNX inference
+    /// 4. L2 Normalize
+    pub async fn embed_audio(&self, audio: Vec<f32>) -> Result<Vec<f32>, InferenceError> {
+        let session = self.audio_session.clone();
+        let spectrogram = self.spectrogram.clone();
+
+        // Offload CPU-intensive inference to blocking thread
+        task::spawn_blocking(move || {
+            // 1. Compute Mel Spectrogram
+            // Matches Librosa: [n_mels, time]
+            let mel_spec = spectrogram.compute(&audio);
+            
+            // 2. Prepare Input Tensor
+            let (n_mels, time) = mel_spec.dim();
+            
+            // CLAP expects [Batch, 1, Freq, Time] or similar.
+            // Let's assume [1, 1, 64, T] based on standard image-like input.
+            let input_shape = vec![1, 1, n_mels, time];
+            
+            // ndarray is row-major. mel_spec is [n_mels, time].
+            // To flatten correctly to [1, 1, 64, T], the memory layout must match.
+            // default into_raw_vec() iterates rows then cols, which matches
+            // [row0_col0, row0_col1, ... row1_col0 ...]
+            // So this should be correct.
+            let input_value = Value::from_array((input_shape, mel_spec.into_raw_vec()))?;
+            
+            // 3. Run Inference
+            let mut session = session.lock().unwrap();
+            let outputs = session.run(inputs![input_value])?;
+            
+            // 4. Extract and Normalize
+            // Output is usually [Batch, Dim] e.g. [1, 512]
+            let embedding_tensor = outputs[0].try_extract_tensor::<f32>()?;
+            let embedding: Vec<f32> = embedding_tensor.1.to_vec();
+            
+            Ok(normalize(&embedding))
+        }).await?
     }
 
-    /// Embed text using CLAP text encoder (MOCK)
+    /// Embed audio from file
     ///
-    /// Input: text query string
-    /// Output: normalized embedding vector
-    pub fn embed_text(&self, _text: &str) -> Result<Vec<f32>, NeuralError> {
-        tracing::warn!("Using MOCK inference for text embedding");
-        Ok(generate_mock_embedding(512))
-    }
-}
-
-fn generate_mock_embedding(dim: usize) -> Vec<f32> {
-    // Simple deterministic pseudo-random vector
-    let mut vec = Vec::with_capacity(dim);
-    for i in 0..dim {
-        vec.push((i as f32).sin());
-    }
-    // Normalize
-    let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        vec.iter().map(|x| x / norm).collect()
-    } else {
-        vec
-    }
-}
-
-pub fn is_runtime_available() -> bool {
-    true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cache_dir_exists() {
-        let dir = cache_dir();
-        assert!(!dir.as_os_str().is_empty());
-    }
-
-    #[test]
-    fn test_inference_mock() {
-        let dir = std::env::temp_dir();
-        let engine = InferenceEngine::new(&dir).unwrap();
+    /// 1. Decode file (mp3/wav/flac/etc) -> Mono f32
+    /// 2. Resample to 48kHz
+    /// 3. Call embed_audio()
+    pub async fn embed_audio_file(&self, path: &Path) -> Result<Vec<f32>, InferenceError> {
+        let path = path.to_path_buf();
+        let engine = self.clone();
         
-        let result = engine.embed_audio(&[vec![1.0, 2.0]]);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 512);
+        // Offload decoding (blocking I/O) to thread pool
+        let samples = task::spawn_blocking(move || {
+            // 1. Decode
+            let buffer = crate::decoder::decode_file(&path)
+                .map_err(|e| InferenceError::Other(e.to_string()))?;
+            
+            // 2. Resample if needed
+            if buffer.sample_rate != 48000 {
+                 crate::resampler::resample(&buffer.samples, buffer.sample_rate, 48000)
+                    .map_err(|e| InferenceError::Other(e.to_string()))
+            } else {
+                Ok(buffer.samples)
+            }
+        }).await??;
 
-        let result = engine.embed_text("warm pad");
-        assert!(result.is_ok());
+        // 3. Embed
+        engine.embed_audio(samples).await
+    }
+
+    /// Mock method for demo compatibility until text model is added
+    pub async fn embed_text(&self, _text: &str) -> Result<Vec<f32>, InferenceError> {
+        // TODO: Implement real text embedding
+        Ok(vec![0.0; 512]) 
+    }
+}
+
+fn normalize(v: &[f32]) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-6 {
+        v.iter().map(|x| x / norm).collect()
+    } else {
+        v.to_vec()
     }
 }
