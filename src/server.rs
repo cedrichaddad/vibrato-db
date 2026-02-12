@@ -340,12 +340,11 @@ mod tests {
         writer.finish().unwrap();
 
         // Open store
-        let store = VectorStore::open(&vdb_path).unwrap();
+        let store = Arc::new(VectorStore::open(&vdb_path).unwrap());
 
         // Create index (need Arc for closure)
-        let vectors = Arc::new(vectors);
-        let vectors_clone = vectors.clone();
-        let mut hnsw = HNSW::new(16, 50, move |id| vectors_clone[id].clone());
+        let store_clone = store.clone();
+        let mut hnsw = HNSW::new(16, 50, move |id| store_clone.get(id).to_vec());
 
         for i in 0..num_vectors {
             hnsw.insert(i);
