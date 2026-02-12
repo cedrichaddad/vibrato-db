@@ -22,27 +22,6 @@ use super::node::Node;
 use super::visited::VisitedGuard;
 use crate::simd::dot_product;
 
-/// Software prefetch hint — starts loading data into L1 cache before
-/// it's needed, hiding memory latency during HNSW graph traversal.
-///
-/// This is a no-op if the platform doesn't support prefetch intrinsics.
-#[inline(always)]
-fn prefetch_read(ptr: *const u8) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        // PRFM PLDL1KEEP: prefetch into L1 data cache, temporal (keep)
-        // Uses inline asm since std::arch::aarch64::_prefetch is still unstable
-        std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nostack, preserves_flags));
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        let _ = ptr; // no-op on unsupported platforms
-    }
-}
 
 /// Candidate for search (min-heap)
 #[derive(Clone, Copy)]
@@ -401,23 +380,15 @@ impl HNSW {
 
             // Explore neighbors using O(1) HashMap lookup
             if let Some(node) = self.get_node(current.id) {
-                let neighbors = node.neighbors(layer);
-                for (i, &neighbor_id) in neighbors.iter().enumerate() {
+                // PERF NOTE: prefetching Node structs here is ineffective because
+                // Node contains Vec<Vec<usize>> — the actual neighbor data lives
+                // on the heap behind pointers, not inline in the struct.
+                // True fix: linearize the graph into a flat Vec<u32> (V3 scope).
+                for &neighbor_id in node.neighbors(layer) {
                     if visited.is_visited(neighbor_id) {
                         continue;
                     }
                     visited.visit(neighbor_id);
-
-                    // Prefetch the NEXT neighbor's node data to hide memory latency.
-                    // While we compute distance for neighbor_id, the CPU loads the
-                    // next neighbor's Node struct into L1 cache.
-                    if i + 1 < neighbors.len() {
-                        let next_id = neighbors[i + 1];
-                        if let Some(&next_idx) = self.id_to_index.get(&next_id) {
-                            let next_node_ptr = &self.nodes[next_idx] as *const Node as *const u8;
-                            prefetch_read(next_node_ptr);
-                        }
-                    }
 
                     let dist = self.distance(query, neighbor_id);
 

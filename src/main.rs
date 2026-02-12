@@ -21,8 +21,9 @@ use parking_lot::RwLock;
 use tracing_subscriber::EnvFilter;
 
 use vibrato_db::hnsw::HNSW;
-use vibrato_db::server::{serve, AppState};
+use vibrato_db::server::{serve, AppState, SearchRequest, SearchResponse};
 use vibrato_db::store::VectorStore;
+use vibrato_db::format_v2::VdbWriterV2;
 
 #[derive(Parser)]
 #[command(name = "vibrato-db")]
@@ -86,6 +87,38 @@ enum Commands {
         /// Path to .vdb or .idx file
         #[arg(short, long)]
         file: PathBuf,
+    },
+
+    /// Create a .vdb file from a JSON list of vectors
+    ///
+    /// Input format: JSON array of arrays [[0.1, ...], [0.2, ...]]
+    Ingest {
+        /// Input JSON file
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output .vdb file
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Search for nearest neighbors using the HTTP server
+    Search {
+        /// Server URL
+        #[arg(long, default_value = "http://localhost:8080")]
+        server: String,
+
+        /// Query vector (comma separated floats)
+        #[arg(short, long, value_parser = parse_vector)]
+        query: Vec<f32>,
+
+        /// Number of results
+        #[arg(short = 'k', long, default_value = "10")]
+        k: usize,
+
+        /// Search depth
+        #[arg(long, default_value = "50")]
+        ef: usize,
     },
 }
 
@@ -226,6 +259,56 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
+        Commands::Ingest { input, output } => {
+            tracing::info!("Reading vectors from {:?}", input);
+            let file = std::fs::File::open(&input)?;
+            let reader = std::io::BufReader::new(file);
+            let vectors: Vec<Vec<f32>> = serde_json::from_reader(reader)?;
+
+            if vectors.is_empty() {
+                anyhow::bail!("No vectors found in input");
+            }
+
+            let dim = vectors[0].len();
+            tracing::info!("Found {} vectors of dimension {}", vectors.len(), dim);
+
+            let mut writer = VdbWriterV2::new_raw(&output, dim)?;
+            for (i, vec) in vectors.iter().enumerate() {
+                if vec.len() != dim {
+                    anyhow::bail!("Vector {} has dimension {}, expected {}", i, vec.len(), dim);
+                }
+                writer.write_vector(vec)?;
+            }
+            writer.finish()?;
+            tracing::info!("Wrote .vdb file to {:?}", output);
+        }
+
+        Commands::Search { server, query, k, ef } => {
+            let client = reqwest::Client::new();
+            let url = format!("{}/search", server.trim_end_matches('/'));
+
+            let request = SearchRequest {
+                vector: query,
+                k,
+                ef,
+            };
+
+            let response = client.post(&url).json(&request).send().await?;
+
+            if !response.status().is_success() {
+                let error: serde_json::Value = response.json().await?;
+                eprintln!("Error: {}", error);
+                std::process::exit(1);
+            }
+
+            let result: SearchResponse = response.json().await?;
+            println!("Query time: {:.2}ms", result.query_time_ms);
+            println!("Results:");
+            for res in result.results {
+                println!("  ID: {}, Score: {:.4}", res.id, res.score);
+            }
+        }
     }
 
     Ok(())
@@ -268,4 +351,10 @@ fn build_index(
     }
 
     Ok(hnsw)
+}
+
+fn parse_vector(s: &str) -> Result<Vec<f32>, String> {
+    s.split(',')
+        .map(|v| v.trim().parse::<f32>().map_err(|e| e.to_string()))
+        .collect()
 }

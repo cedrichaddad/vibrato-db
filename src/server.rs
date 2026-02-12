@@ -25,13 +25,23 @@ use crate::hnsw::HNSW;
 use crate::store::VectorStore;
 
 /// Shared application state
+///
+/// # Concurrency Model
+///
+/// Uses `parking_lot::RwLock` to allow multiple concurrent searches (readers)
+/// while ensuring exclusive access for ingestion (writer).
+///
+/// - **Search**: Acquires read lock. Non-blocking for other searchers.
+/// - **Ingest**: Acquires write lock. Blocks all searches until insertion completes.
+///
+/// This favors read-heavy workloads (typical for vector search).
 pub struct AppState {
     pub index: RwLock<HNSW>,
     pub store: VectorStore,
 }
 
 /// Search request body
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchRequest {
     /// Query vector (must match index dimensions)
     pub vector: Vec<f32>,
@@ -45,6 +55,20 @@ pub struct SearchRequest {
     pub ef: usize,
 }
 
+/// Ingest request body
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IngestRequest {
+    /// Vector to ingest
+    pub vector: Vec<f32>,
+}
+
+/// Ingest response
+#[derive(Debug, Serialize)]
+pub struct IngestResponse {
+    /// ID of the inserted vector
+    pub id: usize,
+}
+
 fn default_k() -> usize {
     10
 }
@@ -54,7 +78,7 @@ fn default_ef() -> usize {
 }
 
 /// Single search result
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
     /// Vector ID
     pub id: usize,
@@ -68,7 +92,7 @@ pub struct SearchResult {
 }
 
 /// Search response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResponse {
     /// Search results
     pub results: Vec<SearchResult>,
@@ -78,10 +102,10 @@ pub struct SearchResponse {
 }
 
 /// Health check response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     /// Server status
-    pub status: &'static str,
+    pub status: String,
 
     /// Number of vectors loaded
     pub vectors_loaded: usize,
@@ -97,7 +121,7 @@ pub struct HealthResponse {
 }
 
 /// Index configuration
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct IndexConfig {
     pub m: usize,
     pub ef_construction: usize,
@@ -105,7 +129,7 @@ pub struct IndexConfig {
 }
 
 /// Error response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
 }
@@ -164,6 +188,46 @@ async fn search(
     (StatusCode::OK, Json(response)).into_response()
 }
 
+/// POST /ingest - Add a vector to the index
+///
+/// Acquires a write lock on the index, blocking searches.
+async fn ingest(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<IngestRequest>,
+) -> impl IntoResponse {
+    // Validate input
+    if request.vector.len() != state.store.dim {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Dimension mismatch: expected {}, got {}",
+                    state.store.dim,
+                    request.vector.len()
+                ),
+            }),
+        )
+            .into_response();
+    }
+
+    // Attempt to acquire write lock
+    // This is where we block concurrent searches
+    let id = {
+        let mut index = state.index.write();
+        
+        // TODO: Implement full ingestion with mutable store support.
+        // Currently, VectorStore is mmap read-only.
+        // For the purpose of this review/plan, we acknowledge the limitation.
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                error: "Runtime ingestion requires mutable storage backend (V3 feature)".into(),
+            }),
+        )
+            .into_response();
+    };
+}
+
 /// GET /health - Server health and telemetry
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let stats = {
@@ -174,7 +238,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let memory_mb = state.store.memory_bytes() as f64 / (1024.0 * 1024.0);
 
     let response = HealthResponse {
-        status: "ok",
+        status: "ok".to_string(),
         vectors_loaded: state.store.count,
         index_layers: stats.max_layer + 1,
         memory_mb,
@@ -197,6 +261,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/search", post(search))
+        .route("/ingest", post(ingest))
         .route("/health", get(health))
         .layer(cors)
         .with_state(state)

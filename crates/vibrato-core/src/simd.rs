@@ -92,7 +92,7 @@ unsafe fn l2_distance_squared_neon(a: &[f32], b: &[f32]) -> f32 {
 // x86_64 AVX2 intrinsics (runtime feature detection)
 // ============================================================================
 
-/// AVX2+FMA dot product: processes 8 floats per iteration
+/// AVX2+FMA dot product: processes 8 floats per iteration (unaligned load)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[inline]
@@ -133,7 +133,52 @@ unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-/// AVX2+FMA L2 distance squared: processes 8 floats per iteration
+/// AVX2+FMA dot product: processes 8 floats per iteration (aligned load)
+///
+/// CAUTION: Usage requires `a` and `b` to be 32-byte aligned AND the stride
+/// (vector length in bytes) to be a multiple of 32 if used in a loop over
+/// contiguous memory blocks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn dot_product_avx2_aligned(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let chunks = n / 8;
+    let remainder = n % 8;
+
+    let mut acc = _mm256_setzero_ps();
+
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+
+    for i in 0..chunks {
+        let va = _mm256_load_ps(a_ptr.add(i * 8));
+        let vb = _mm256_load_ps(b_ptr.add(i * 8));
+        acc = _mm256_fmadd_ps(va, vb, acc); // acc += va * vb
+    }
+
+    // Horizontal sum
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let result = _mm_add_ss(sums, shuf2);
+    let mut sum = _mm_cvtss_f32(result);
+
+    // Handle remainder
+    let tail_start = chunks * 8;
+    for i in 0..remainder {
+        sum += a[tail_start + i] * b[tail_start + i];
+    }
+
+    sum
+}
+
+/// AVX2+FMA L2 distance squared: processes 8 floats per iteration (unaligned)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[inline]
@@ -152,6 +197,48 @@ unsafe fn l2_distance_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
     for i in 0..chunks {
         let va = _mm256_loadu_ps(a_ptr.add(i * 8));
         let vb = _mm256_loadu_ps(b_ptr.add(i * 8));
+        let diff = _mm256_sub_ps(va, vb);
+        acc = _mm256_fmadd_ps(diff, diff, acc); // acc += diff * diff
+    }
+
+    // Horizontal sum
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let result = _mm_add_ss(sums, shuf2);
+    let mut sum = _mm_cvtss_f32(result);
+
+    let tail_start = chunks * 8;
+    for i in 0..remainder {
+        let d = a[tail_start + i] - b[tail_start + i];
+        sum += d * d;
+    }
+
+    sum
+}
+
+/// AVX2+FMA L2 distance squared: processes 8 floats per iteration (aligned)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn l2_distance_squared_avx2_aligned(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let chunks = n / 8;
+    let remainder = n % 8;
+
+    let mut acc = _mm256_setzero_ps();
+
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+
+    for i in 0..chunks {
+        let va = _mm256_load_ps(a_ptr.add(i * 8));
+        let vb = _mm256_load_ps(b_ptr.add(i * 8));
         let diff = _mm256_sub_ps(va, vb);
         acc = _mm256_fmadd_ps(diff, diff, acc); // acc += diff * diff
     }
@@ -203,14 +290,24 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // NEON is always available on aarch64
+        // NEON is always available on aarch64, handles aligned/unaligned well
         return unsafe { dot_product_neon(a, b) };
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { dot_product_avx2(a, b) };
+            // Check for 32-byte alignment of both pointers AND stride alignment
+            // (a.len() * 4) must be a multiple of 32 for stride to be aligned across vectors
+            let ptr_a = a.as_ptr() as usize;
+            let ptr_b = b.as_ptr() as usize;
+            let byte_len = a.len() * 4;
+            
+            if ptr_a % 32 == 0 && ptr_b % 32 == 0 && byte_len % 32 == 0 {
+                return unsafe { dot_product_avx2_aligned(a, b) };
+            } else {
+                return unsafe { dot_product_avx2(a, b) };
+            }
         }
     }
 
@@ -234,7 +331,16 @@ pub fn l2_distance_squared(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { l2_distance_squared_avx2(a, b) };
+             // Check for 32-byte alignment of both pointers AND stride alignment
+            let ptr_a = a.as_ptr() as usize;
+            let ptr_b = b.as_ptr() as usize;
+            let byte_len = a.len() * 4;
+
+            if ptr_a % 32 == 0 && ptr_b % 32 == 0 && byte_len % 32 == 0 {
+                return unsafe { l2_distance_squared_avx2_aligned(a, b) };
+            } else {
+                return unsafe { l2_distance_squared_avx2(a, b) };
+            }
         }
     }
 

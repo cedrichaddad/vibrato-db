@@ -7,6 +7,7 @@ pub mod server;
 
 // Re-export core types for backward compatibility
 pub use vibrato_core::format;
+pub use vibrato_core::format_v2; // New V2 format
 pub use vibrato_core::hnsw;
 pub use vibrato_core::simd;
 pub use vibrato_core::store;

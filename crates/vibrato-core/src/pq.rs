@@ -143,14 +143,32 @@ impl ProductQuantizer {
     /// Compute ADC distance between a query (via pre-computed table) and a PQ code
     ///
     /// This is the hot path — just 16 table lookups summed.
+    ///
+    /// # Safety invariants (enforced by assert):
+    /// - `table.len() >= num_subspaces * 256`
+    /// - `codes.len() >= num_subspaces`
+    ///
+    /// The compiler will hoist the bounds check out of the loop and elide
+    /// the `get_unchecked` bounds checks entirely.
     #[inline(always)]
     pub fn adc_distance(table: &[f32], codes: &[u8], num_subspaces: usize) -> f32 {
-        debug_assert_eq!(codes.len(), num_subspaces);
-        debug_assert_eq!(table.len(), num_subspaces * NUM_CENTROIDS);
+        // Release-mode safety: prevent segfault on malformed input.
+        // These fire in BOTH debug and release builds.
+        assert!(
+            table.len() >= num_subspaces * NUM_CENTROIDS,
+            "ADC table too small: need {} entries, got {}",
+            num_subspaces * NUM_CENTROIDS, table.len()
+        );
+        assert!(
+            codes.len() >= num_subspaces,
+            "PQ codes too short: need {} subspaces, got {}",
+            num_subspaces, codes.len()
+        );
 
         let mut distance = 0.0f32;
         for s in 0..num_subspaces {
-            // Safety: codes[s] is u8 (0..255), table offset is s*256 + code
+            // Safety: bounds verified by asserts above.
+            // codes[s] is u8 (0..255), table offset is s*256 + code.
             distance += unsafe {
                 *table.get_unchecked(s * NUM_CENTROIDS + *codes.get_unchecked(s) as usize)
             };

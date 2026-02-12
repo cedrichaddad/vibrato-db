@@ -13,11 +13,13 @@ vibrato-core = { path = "../vibrato-core" }
 vibrato-neural = { path = "../vibrato-neural" }
 
 # Python bindings
-pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+# Use abi3-py37 to support Python 3.7+ with a single wheel
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py37"], optional = true }
 
 # Utilities
 thiserror = "1.0"
 tracing = "0.1"
+parking_lot = "0.12"
 
 [features]
 default = []

@@ -31,11 +31,34 @@ pub enum MetadataError {
     IndexOutOfBounds { index: usize, count: usize },
 }
 
+/// Serialized size of one `MetadataEntry` on the wire (24 bytes).
+///
+/// **WARNING**: Do NOT use `std::mem::size_of::<MetadataEntry>()` for serialization.
+/// Rust may add internal padding, making the struct larger than the wire format.
+pub const ENTRY_WIRE_SIZE: usize = 24;
+
 /// Per-vector metadata entry (serialized as 24 bytes on wire)
 ///
 /// NOTE: This struct is NOT `#[repr(C, packed)]` because packed structs
 /// cause UB when taking field references (which `&entry.bpm` would do).
 /// Instead, fields are serialized/deserialized manually in the builder/reader.
+///
+/// # Wire Format (little-endian, 24 bytes total)
+///
+/// ```text
+/// Byte   Size  Type   Field
+/// ─────  ────  ─────  ──────────────────────
+///  0      4    u32    source_file_offset
+///  4      2    u16    source_file_len
+///  6      4    u32    start_time_ms
+/// 10      2    u16    duration_ms
+/// 12      4    f32    bpm (0.0 if unknown)
+/// 16      4    u32    tags_offset
+/// 20      2    u16    tags_len
+/// 22      2    u16    _reserved (must be 0)
+/// ─────
+/// 24 bytes total
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct MetadataEntry {
     /// Offset into UTF-8 string pool for source filename
@@ -106,9 +129,9 @@ impl MetadataBuilder {
 
     /// Serialize the metadata section to bytes
     pub fn build(&self) -> Vec<u8> {
-        let entry_size = std::mem::size_of::<MetadataEntry>();
+        // Use wire size, NOT mem::size_of (Rust struct may have padding)
         let header_size = 8; // entry_count (4) + string_pool_offset (4)
-        let entries_size = self.entries.len() * entry_size;
+        let entries_size = self.entries.len() * ENTRY_WIRE_SIZE;
         let string_pool_offset = (header_size + entries_size) as u32;
 
         let total_size = header_size + entries_size + self.string_pool.len();
@@ -178,7 +201,7 @@ pub struct VectorMetadata {
     pub tags: Vec<String>,
 }
 
-const ENTRY_WIRE_SIZE: usize = 24; // 4+2+4+2+4+4+2+2 = 24 bytes per entry
+
 
 impl<'a> MetadataReader<'a> {
     /// Create a reader over a metadata byte slice
