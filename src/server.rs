@@ -23,6 +23,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::hnsw::HNSW;
 use crate::store::VectorStore;
+use vibrato_neural::inference::InferenceEngine;
 
 /// Shared application state
 ///
@@ -37,7 +38,10 @@ use crate::store::VectorStore;
 /// This favors read-heavy workloads (typical for vector search).
 pub struct AppState {
     pub index: RwLock<HNSW>,
-    pub store: VectorStore,
+    pub store: Arc<VectorStore>,
+    // Dynamic ingestion support: in-memory buffer for new vectors
+    pub dynamic_store: Arc<RwLock<Vec<Vec<f32>>>>,
+    pub inference: Arc<InferenceEngine>,
 }
 
 /// Search request body
@@ -58,16 +62,16 @@ pub struct SearchRequest {
 /// Ingest request body
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IngestRequest {
-    /// Vector to ingest
-    pub vector: Vec<f32>,
+    pub vector: Option<Vec<f32>>,
+    pub audio_path: Option<String>,
 }
 
-/// Ingest response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct IngestResponse {
-    /// ID of the inserted vector
     pub id: usize,
+    pub vector_dim: usize,
 }
+
 
 fn default_k() -> usize {
     10
@@ -196,36 +200,58 @@ async fn ingest(
     Json(request): Json<IngestRequest>,
 ) -> impl IntoResponse {
     // Validate input
-    if request.vector.len() != state.store.dim {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!(
-                    "Dimension mismatch: expected {}, got {}",
-                    state.store.dim,
-                    request.vector.len()
-                ),
-            }),
-        )
-            .into_response();
-    }
+    // Ingest handler
+    let ingest = |State(state): State<Arc<AppState>>, Json(payload): Json<IngestRequest>| async move {
+        // 1. Get vector: either directly provided or via inference
+        let vector = if let Some(vec) = payload.vector {
+            vec
+        } else if let Some(path_str) = payload.audio_path {
+            let path = std::path::Path::new(&path_str);
+            match state.inference.embed_audio_file(path) {
+                Ok(vec) => vec,
+                Err(e) => return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(IngestResponse { id: 0, vector_dim: 0 }),
+                ).into_response(),
+            }
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(IngestResponse { id: 0, vector_dim: 0 }),
+            ).into_response();
+        };
 
-    // Attempt to acquire write lock
-    // This is where we block concurrent searches
-    let id = {
+        if vector.len() != state.store.dim {
+             return (
+                StatusCode::BAD_REQUEST,
+                Json(IngestResponse { id: 0, vector_dim: 0 }),
+            ).into_response();
+        }
+
+        let dim = vector.len();
+
+        // 2. Append to dynamic store (write lock)
+        let id_offset = state.store.count as usize;
+        let mut dynamic = state.dynamic_store.write();
+        let current_dynamic_count = dynamic.len();
+        let new_id = id_offset + current_dynamic_count;
+        dynamic.push(vector.clone()); // Store copy for retrieval
+        drop(dynamic); // Release lock quickly
+
+        // 3. Insert into HNSW (write lock)
         let mut index = state.index.write();
+        index.insert(new_id); // This will call the closure
         
-        // TODO: Implement full ingestion with mutable store support.
-        // Currently, VectorStore is mmap read-only.
-        // For the purpose of this review/plan, we acknowledge the limitation.
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(ErrorResponse {
-                error: "Runtime ingestion requires mutable storage backend (V3 feature)".into(),
+        (
+            StatusCode::CREATED,
+            Json(IngestResponse {
+                id: new_id,
+                vector_dim: dim,
             }),
-        )
-            .into_response();
+        ).into_response()
     };
+    
+    ingest(State(state), Json(request)).await
 }
 
 /// GET /health - Server health and telemetry
@@ -331,6 +357,8 @@ mod tests {
         Arc::new(AppState {
             index: RwLock::new(hnsw),
             store,
+            dynamic_store: Arc::new(RwLock::new(Vec::new())),
+            inference: Arc::new(InferenceEngine::new(std::path::Path::new(".")).unwrap()),
         })
     }
 

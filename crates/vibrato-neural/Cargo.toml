@@ -8,7 +8,7 @@ license = "MIT"
 [features]
 default = []
 transient_aware = []
-onnx = ["ort"]
+onnx = [] # ["ort"]
 
 [dependencies]
 vibrato-core = { path = "../vibrato-core" }
@@ -24,7 +24,12 @@ rustfft = "6.2"
 
 # ONNX inference — optional, requires rustc 1.88+ for ort 2.x
 # Enable with: cargo build --features onnx
-ort = { version = "2.0.0-rc.9", features = ["load-dynamic"], optional = true }
+# ONNX inference — optional, requires rustc 1.88+ for ort 2.x
+# Enable with: cargo build --features onnx
+# ONNX inference — optional, requires rustc 1.88+ for ort 2.x
+# Enable with: cargo build --features onnx
+# ort = { version = "1.14.8", features = ["load-dynamic"], optional = true }
+# ndarray = "0.15"
 
 # Utilities
 thiserror = "1.0"

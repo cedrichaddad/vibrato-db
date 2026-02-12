@@ -590,6 +590,18 @@ impl HNSW {
     /// - `ef`: Search depth
     /// - `total_vectors`: Total number of vectors in the store (for bounds checking)
     ///
+    /// # Invariants
+    ///
+    /// **CRITICAL**: This method assumes that vectors belonging to a temporal sequence (e.g., audio frames)
+    /// are stored with **contiguous, sequential IDs** in the `VectorStore`.
+    ///
+    /// The heuristic `start_id = anchor_id - salient_offset` relies on the assumption that if
+    /// a database vector at `anchor_id` matches the query vector at `salient_offset`, then the
+    /// preceding query vectors match `anchor_id - 1`, `anchor_id - 2`, etc.
+    ///
+    /// If your data is not stored sequentially (e.g. shuffled or random IDs), this method will return
+    /// incorrect or empty results.
+    ///
     /// # Returns
     /// Vector of (start_id, average_score) pairs for best matching sub-sequences
     pub fn search_subsequence(

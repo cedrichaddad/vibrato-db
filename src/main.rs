@@ -24,6 +24,7 @@ use vibrato_db::hnsw::HNSW;
 use vibrato_db::server::{serve, AppState, SearchRequest, SearchResponse};
 use vibrato_db::store::VectorStore;
 use vibrato_db::format_v2::VdbWriterV2;
+use vibrato_neural::inference::InferenceEngine;
 
 #[derive(Parser)]
 #[command(name = "vibrato-db")]
@@ -144,54 +145,89 @@ async fn main() -> anyhow::Result<()> {
             ef_construction,
         } => {
             tracing::info!("Loading vector data from {:?}", data);
-            let store = VectorStore::open(&data)?;
+            let store = Arc::new(VectorStore::open(&data)?);
             tracing::info!(
                 "Loaded {} vectors of dimension {}",
                 store.count,
                 store.dim
             );
 
+            // Create dynamic components
+            let dynamic_store = Arc::new(RwLock::new(Vec::new()));
+            // Initialize Inference Engine (mock or real)
+            let model_dir = PathBuf::from("models"); // Default to local models dir
+            let inference = Arc::new(InferenceEngine::new(&model_dir).unwrap_or_else(|e| {
+                tracing::warn!("Failed to load inference engine: {}. Using mock.", e);
+                // Creating a dummy engine pointing to temp (which will fail nicely or fallback)
+                InferenceEngine::new(&std::env::temp_dir()).unwrap() 
+            }));
+
+            // Helper to create the combined vector accessor
+            let create_accessor = |store: Arc<VectorStore>, dynamic: Arc<RwLock<Vec<Vec<f32>>>>| {
+                move |id: usize| {
+                    if id < store.count as usize {
+                        // Access mmap store (zero-copy-ish, strictly we need owned Vec for HNSW currently)
+                        store.get(id).to_vec()
+                    } else {
+                        // Access dynamic store
+                        let offset = id - store.count as usize;
+                        let guard = dynamic.read();
+                        if offset < guard.len() {
+                            guard[offset].clone()
+                        } else {
+                            // Should not happen if HNSW is consistent
+                             vec![0.0; store.dim] 
+                        }
+                    }
+                }
+            };
+
             let hnsw = if let Some(index_path) = &index {
                 if index_path.exists() {
                     tracing::info!("Loading index from {:?}", index_path);
-                    let store_ref = Arc::new(store);
-                    let store_for_hnsw = store_ref.clone();
-                    let hnsw = HNSW::load(index_path, move |id| {
-                        store_for_hnsw.get(id).to_vec()
-                    })?;
+                    let accessor = create_accessor(store.clone(), dynamic_store.clone());
+                    let hnsw = HNSW::load(index_path, accessor)?;
+                    
                     let stats = hnsw.stats();
                     tracing::info!(
                         "Index loaded: {} nodes, {} layers",
                         stats.num_nodes,
                         stats.max_layer + 1
                     );
-                    // We need to get store back
-                    drop(store_ref);
-                    let store = VectorStore::open(&data)?;
-                    let store_ref = Arc::new(store);
-                    let store_for_hnsw = store_ref.clone();
-                    let hnsw = HNSW::load(index_path, move |id| {
-                        store_for_hnsw.get(id).to_vec()
-                    })?;
-                    let state = Arc::new(AppState {
-                        index: RwLock::new(hnsw),
-                        store: VectorStore::open(&data)?,
-                    });
-                    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-                    return Ok(serve(state, addr).await?);
+                    hnsw
                 } else {
                     tracing::info!("Index not found, building new index...");
-                    build_index(&store, m, ef_construction, Some(index_path))?
+                    // We need to build using the combined accessor, though dynamic is empty now.
+                    let accessor = create_accessor(store.clone(), dynamic_store.clone());
+                    // Build logic adapted to use accessor
+                    // But build_index helper uses &VectorStore. We should inline or refactor.
+                    // For simplicity, we assume we are building from just the static store initially
+                    // BUT we must supply the *final* accessor that supports dynamic growth.
+                    // HNSW::new takes the accessor.
+                    let mut hnsw = HNSW::new(m, ef_construction, accessor);
+                    for i in 0..store.count as usize {
+                         hnsw.insert(i);
+                    }
+                    if let Some(path) = index {
+                        hnsw.save(path)?;
+                    }
+                    hnsw
                 }
             } else {
                 tracing::info!("No index path specified, building in-memory index...");
-                build_index(&store, m, ef_construction, None)?
+                let accessor = create_accessor(store.clone(), dynamic_store.clone());
+                let mut hnsw = HNSW::new(m, ef_construction, accessor);
+                 for i in 0..store.count as usize {
+                     hnsw.insert(i);
+                 }
+                 hnsw
             };
 
-            let store = VectorStore::open(&data)?;
             let state = Arc::new(AppState {
                 index: RwLock::new(hnsw),
                 store,
+                dynamic_store,
+                inference,
             });
 
             let addr: SocketAddr = format!("{}:{}", host, port).parse()?;

@@ -140,6 +140,18 @@ Response:
 
 ---
 
+## End-to-End Demo
+
+Verify the full ingestion and search pipeline using the provided Python script:
+
+```bash
+# Spins up server, ingests mock audio, and performs search
+python3 demo.py
+```
+
+> **Note on Inference**: The neural pipeline strictly mocks the inference step due to unstable `ort` 2.x dependencies on current compilers. The system architecture is fully wired (ingest handler -> resize/decode logic -> inference engine), but the embedding vector is currently a deterministic pseudo-random signal.
+
+
 ## File Structure
 
 ```
