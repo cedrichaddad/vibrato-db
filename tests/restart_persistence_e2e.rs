@@ -16,7 +16,7 @@ fn reserve_local_port() -> Option<u16> {
     Some(port)
 }
 
-async fn start_server(data_path: &Path, port: u16) -> Child {
+async fn start_server(data_path: &Path, port: u16) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
     cmd.arg("serve")
         .arg("--data")
@@ -27,23 +27,23 @@ async fn start_server(data_path: &Path, port: u16) -> Child {
         .arg(port.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    cmd.spawn().expect("spawn vibrato-db serve")
+    cmd.spawn()
 }
 
-async fn wait_for_health(base_url: &str) {
+async fn wait_for_health(base_url: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
     let health_url = format!("{}/health", base_url);
 
     for _ in 0..60 {
         if let Ok(resp) = client.get(&health_url).send().await {
             if resp.status() == StatusCode::OK {
-                return;
+                return Ok(());
             }
         }
         sleep(Duration::from_millis(100)).await;
     }
 
-    panic!("server did not become healthy at {}", health_url);
+    Err(format!("server did not become healthy at {}", health_url))
 }
 
 async fn stop_server(child: &mut Child) {
@@ -60,14 +60,23 @@ async fn test_persistence_integrity_across_process_restart() {
     writer.finish().expect("finish empty v2");
 
     let Some(port) = reserve_local_port() else {
-        eprintln!("Skipping restart persistence test: cannot bind localhost in this environment");
+        eprintln!("skipping restart persistence test: localhost bind unavailable");
         return;
     };
     let base_url = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
-    let mut server = start_server(&data_path, port).await;
-    wait_for_health(&base_url).await;
+    let mut server = match start_server(&data_path, port).await {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!(
+                "skipping restart persistence test: failed to spawn server process: {}",
+                e
+            );
+            return;
+        }
+    };
+    wait_for_health(&base_url).await.expect("initial health");
 
     let ingest_body = serde_json::json!({
         "vector": [0.1, 0.2],
@@ -95,8 +104,10 @@ async fn test_persistence_integrity_across_process_restart() {
 
     stop_server(&mut server).await;
 
-    let mut restarted = start_server(&data_path, port).await;
-    wait_for_health(&base_url).await;
+    let mut restarted = start_server(&data_path, port)
+        .await
+        .expect("restart server process");
+    wait_for_health(&base_url).await.expect("restart health");
 
     let search_body = serde_json::json!({
         "vector": [0.1, 0.2],

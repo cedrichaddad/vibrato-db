@@ -40,11 +40,14 @@ impl VibratoIndex {
         // Load index
         // Capture store in closure
         let store_clone = store.clone();
-        let index = HNSW::load(&index_path, move |id| {
-            store_clone.get(id).to_vec()
-        }).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to load index: {}", e))
-        })?;
+        let index =
+            HNSW::load_with_accessor(&index_path, move |id, sink| sink(store_clone.get(id)))
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                        "Failed to load index: {}",
+                        e
+                    ))
+                })?;
 
         Ok(VibratoIndex {
             index: Arc::new(RwLock::new(index)),
@@ -62,7 +65,13 @@ impl VibratoIndex {
     /// Returns:
     ///     List of (id, score) tuples
     #[pyo3(signature = (query, k=10, ef=50))]
-    pub fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize, ef: usize) -> PyResult<Vec<(usize, f32)>> {
+    pub fn search(
+        &self,
+        py: Python<'_>,
+        query: Vec<f32>,
+        k: usize,
+        ef: usize,
+    ) -> PyResult<Vec<(usize, f32)>> {
         // Validate dimensions
         if query.len() != self.store.dim {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
@@ -99,7 +108,7 @@ impl VibratoIndex {
         map.insert("total_edges".to_string(), stats.total_edges);
         map.insert("m".to_string(), stats.m);
         map.insert("ef_construction".to_string(), stats.ef_construction);
-        
+
         Ok(map)
     }
 }

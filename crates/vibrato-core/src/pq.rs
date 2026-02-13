@@ -157,12 +157,14 @@ impl ProductQuantizer {
         assert!(
             table.len() >= num_subspaces * NUM_CENTROIDS,
             "ADC table too small: need {} entries, got {}",
-            num_subspaces * NUM_CENTROIDS, table.len()
+            num_subspaces * NUM_CENTROIDS,
+            table.len()
         );
         assert!(
             codes.len() >= num_subspaces,
             "PQ codes too short: need {} subspaces, got {}",
-            num_subspaces, codes.len()
+            num_subspaces,
+            codes.len()
         );
 
         let mut distance = 0.0f32;
@@ -217,8 +219,8 @@ impl ProductQuantizer {
         num_subspaces: usize,
         bytes: &[u8],
     ) -> Result<Self, PqError> {
-        let codebook: &[f32] = bytemuck::try_cast_slice(bytes)
-            .map_err(|_| PqError::AlignmentError)?;
+        let codebook: &[f32] =
+            bytemuck::try_cast_slice(bytes).map_err(|_| PqError::AlignmentError)?;
         let sub_dimension = dimension / num_subspaces;
         let expected = num_subspaces * NUM_CENTROIDS * sub_dimension;
         if codebook.len() != expected {
@@ -269,7 +271,10 @@ mod tests {
         let original = pq.decode(&codes);
         let re_encoded = pq.encode(&original);
 
-        assert_eq!(re_encoded, codes, "Centroid vector should encode back to same codes");
+        assert_eq!(
+            re_encoded, codes,
+            "Centroid vector should encode back to same codes"
+        );
     }
 
     #[test]
@@ -314,7 +319,11 @@ mod tests {
         let table = pq.compute_distance_table(&query);
         let dist = ProductQuantizer::adc_distance(&table, &codes, nsub);
 
-        assert!(dist.abs() < 1e-5, "Self-distance should be ~0, got {}", dist);
+        assert!(
+            dist.abs() < 1e-5,
+            "Self-distance should be ~0, got {}",
+            dist
+        );
     }
 
     #[test]

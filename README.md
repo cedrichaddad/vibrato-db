@@ -91,6 +91,9 @@ Optional (for audio ingest with `audio_path`):
 cargo run --release -- setup-models --model-dir ./models
 ```
 
+`setup-models` now writes a local `model-manifest.json` with SHA-256 hashes and
+`serve` verifies model integrity against that manifest on startup.
+
 ### 2. CLI Tools
 
 The CLI includes built-in commands for data ingestion and search.
@@ -155,7 +158,7 @@ Verify the full ingestion and search pipeline using the provided Python script:
 python3 demo.py
 ```
 
-> **Note on Inference**: `serve` runs in search-only mode if model files are missing. Run `setup-models` first to enable `/ingest` with `audio_path`.
+> **Note on Inference**: `serve` runs in search-only mode if model files are missing or fail manifest verification. Run `setup-models` first to enable `/ingest` with `audio_path`.
 
 
 ## File Structure

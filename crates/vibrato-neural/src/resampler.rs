@@ -21,7 +21,9 @@ pub fn resample(
         return Ok(samples.to_vec());
     }
 
-    use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
+    use rubato::{
+        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    };
 
     let params = SincInterpolationParameters {
         sinc_len: 256,
@@ -35,11 +37,8 @@ pub fn resample(
     let chunk_size = 1024;
 
     let mut resampler = SincFixedIn::<f32>::new(
-        ratio,
-        2.0,  // max relative ratio
-        params,
-        chunk_size,
-        1,    // mono
+        ratio, 2.0, // max relative ratio
+        params, chunk_size, 1, // mono
     )
     .map_err(|e| NeuralError::Resampler(format!("Failed to create resampler: {}", e)))?;
 

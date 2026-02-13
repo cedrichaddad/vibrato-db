@@ -1,29 +1,29 @@
-use std::sync::Arc;
 use parking_lot::RwLock;
+use std::sync::Arc;
 
 use nih_plug::prelude::*;
-use nih_plug_egui::{create_egui_editor, EguiState};
+use nih_plug_egui::EguiState;
 
-use crossbeam_channel::{Sender, Receiver};
+use crossbeam_channel::{Receiver, Sender};
 
 mod commands;
 mod editor;
 mod worker;
 
-use commands::{GuiCommand, WorkerResponse, SearchResult};
-use worker::VibratoWorker;
+use commands::{GuiCommand, SearchResult, WorkerResponse};
 use rtrb::{Producer, RingBuffer};
+use worker::VibratoWorker;
 
 pub struct VibratoPlugin {
     params: Arc<VibratoParams>,
-    
+
     // Communication channels
     job_sender: Sender<GuiCommand>,
     result_receiver: Receiver<WorkerResponse>,
-    
+
     // Audio Capture
     audio_producer: Option<Producer<f32>>,
-    
+
     // UI State (Cached for immediate rendering)
     current_results: Arc<RwLock<Vec<SearchResult>>>,
     status_msg: Arc<RwLock<String>>,
@@ -47,12 +47,12 @@ impl Default for VibratoParams {
 
 impl Default for VibratoPlugin {
     fn default() -> Self {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let (res_tx, res_rx) = crossbeam_channel::unbounded();
-        
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let (_res_tx, res_rx) = crossbeam_channel::unbounded();
+
         // Default impl just creates dummy channels or holds them until init?
         // Ideally we don't spawn here.
-        
+
         Self {
             params: Arc::new(VibratoParams::default()),
             job_sender: tx,
@@ -110,21 +110,21 @@ impl Plugin for VibratoPlugin {
         // The worker needs `Receiver<GuiCommand>` and `Sender<WorkerResponse>`.
         // But `default()` returns `VibratoPlugin` which holds `Sender<GuiCommand>` and `Receiver<WorkerResponse>`.
         // So we need to store the *other ends* temporarily? Or just recreate channels here.
-        
+
         let (tx, rx) = crossbeam_channel::unbounded();
         let (res_tx, res_rx) = crossbeam_channel::unbounded();
-        
+
         // Ring Buffer (e.g., 2 seconds of mono audio at 48kHz for analysis)
         // 48000 * 2 = 96000
         let (prod, cons) = RingBuffer::new(96000);
-        
+
         let worker = VibratoWorker::new(rx, res_tx, cons);
         worker.spawn();
-        
+
         self.job_sender = tx;
         self.result_receiver = res_rx;
         self.audio_producer = Some(prod);
-        
+
         true
     }
 
@@ -136,48 +136,47 @@ impl Plugin for VibratoPlugin {
     ) -> ProcessStatus {
         // AUDIO THREAD - KEEP EMPTY (Passthrough)
         // We strictly do NOT touch the vector DB here.
-        
+
         // Simple passthrough since we are an instrument/effect but mostly a Librarian.
-        // Actually, if we are an instrument we output silence? 
+        // Actually, if we are an instrument we output silence?
         // If effect, we pass input to output.
         // For now, let's just make it silent/pass-through.
-        
+
         // Audio Capture for Search
         if let Some(producer) = &mut self.audio_producer {
-             for channel in buffer.as_slice() {
-                 // Interleave or just take first channel? 
-                 // Simple approach: Mix down or take left channel.
-                 // Let's take the first channel if available.
-                 if !channel.is_empty() {
-                     // Write chunk to ring buffer
-                     // Write chunk to ring buffer
-                     // Optimization: Use write_chunk if available. 
-                     // rtrb 0.3 should support write_chunk or push_chunk.
-                     // Review suggested write_chunk.
-                     // Optimization: Use write_chunk (init) to allow safe copy_from_slice
-                     if let Ok(mut chunk) = producer.write_chunk(channel.len()) {
-                         let (first, second) = chunk.as_mut_slices();
-                         // Copy to first
-                         let first_len = first.len();
-                         first.copy_from_slice(&channel[..first.len()]);
-                         // Copy to second if needed
-                         if !second.is_empty() {
-                             second.copy_from_slice(&channel[first.len()..]);
-                         }
-                     } else {
-                         // Full
-                     }
-                     // Note: If we are stereo, we might be pushing only Left.
-                     // If we overwrite, we might skip samples. 
-                     // For analysis, one channel is usually enough for rhythm/timbre.
-                     break; // Only capture first channel
-                 }
-             }
+            for channel in buffer.as_slice() {
+                // Interleave or just take first channel?
+                // Simple approach: Mix down or take left channel.
+                // Let's take the first channel if available.
+                if !channel.is_empty() {
+                    // Write chunk to ring buffer
+                    // Write chunk to ring buffer
+                    // Optimization: Use write_chunk if available.
+                    // rtrb 0.3 should support write_chunk or push_chunk.
+                    // Review suggested write_chunk.
+                    // Optimization: Use write_chunk (init) to allow safe copy_from_slice
+                    if let Ok(mut chunk) = producer.write_chunk(channel.len()) {
+                        let (first, second) = chunk.as_mut_slices();
+                        // Copy to first
+                        first.copy_from_slice(&channel[..first.len()]);
+                        // Copy to second if needed
+                        if !second.is_empty() {
+                            second.copy_from_slice(&channel[first.len()..]);
+                        }
+                    } else {
+                        // Full
+                    }
+                    // Note: If we are stereo, we might be pushing only Left.
+                    // If we overwrite, we might skip samples.
+                    // For analysis, one channel is usually enough for rhythm/timbre.
+                    break; // Only capture first channel
+                }
+            }
         }
-        
+
         ProcessStatus::Normal
     }
-    
+
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         // Spawns the Egui window
         editor::create_editor(
@@ -194,10 +193,8 @@ impl Plugin for VibratoPlugin {
 
 impl Vst3Plugin for VibratoPlugin {
     const VST3_CLASS_ID: [u8; 16] = *b"VibratoAIVectorD";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
-        Vst3SubCategory::Tools, 
-        Vst3SubCategory::Analyzer
-    ];
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
+        &[Vst3SubCategory::Tools, Vst3SubCategory::Analyzer];
 }
 
 impl ClapPlugin for VibratoPlugin {

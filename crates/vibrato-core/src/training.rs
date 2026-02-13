@@ -14,9 +14,9 @@
 //! - Early stopping when centroid movement < tolerance
 //! - Per-subspace independent training
 
-use rand::{Rng, SeedableRng};
-use crate::pq::{ProductQuantizer, PqError, NUM_CENTROIDS};
+use crate::pq::{PqError, ProductQuantizer, NUM_CENTROIDS};
 use crate::simd;
+use rand::{Rng, SeedableRng};
 
 /// Configuration for PQ training
 #[derive(Debug, Clone)]
@@ -102,23 +102,23 @@ pub fn train_pq(
         let offset = s * NUM_CENTROIDS * sub_dim;
         for c in 0..NUM_CENTROIDS {
             let dst = offset + c * sub_dim;
-            codebook[dst..dst + sub_dim].copy_from_slice(&centroids[c * sub_dim..(c + 1) * sub_dim]);
+            codebook[dst..dst + sub_dim]
+                .copy_from_slice(&centroids[c * sub_dim..(c + 1) * sub_dim]);
         }
     }
 
-    Ok(ProductQuantizer::new(dimension, config.num_subspaces, codebook))
+    Ok(ProductQuantizer::new(
+        dimension,
+        config.num_subspaces,
+        codebook,
+    ))
 }
 
 /// K-means++ initialization
 ///
 /// Selects initial centroids with probability proportional to squared distance
 /// from the nearest existing centroid.
-fn kmeans_plus_plus_init(
-    data: &[&[f32]],
-    dim: usize,
-    k: usize,
-    seed: Option<u64>,
-) -> Vec<f32> {
+fn kmeans_plus_plus_init(data: &[&[f32]], dim: usize, k: usize, seed: Option<u64>) -> Vec<f32> {
     let n = data.len();
     let mut rng = match seed {
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
@@ -312,8 +312,6 @@ impl PqLifecycle {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,10 +332,16 @@ mod tests {
             data.push(vec![rng.gen::<f32>() * 0.1, rng.gen::<f32>() * 0.1]); // cluster near (0,0)
         }
         for _ in 0..100 {
-            data.push(vec![5.0 + rng.gen::<f32>() * 0.1, 5.0 + rng.gen::<f32>() * 0.1]); // cluster near (5,5)
+            data.push(vec![
+                5.0 + rng.gen::<f32>() * 0.1,
+                5.0 + rng.gen::<f32>() * 0.1,
+            ]); // cluster near (5,5)
         }
         for _ in 0..100 {
-            data.push(vec![10.0 + rng.gen::<f32>() * 0.1, 0.0 + rng.gen::<f32>() * 0.1]); // cluster near (10,0)
+            data.push(vec![
+                10.0 + rng.gen::<f32>() * 0.1,
+                0.0 + rng.gen::<f32>() * 0.1,
+            ]); // cluster near (10,0)
         }
 
         let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
@@ -350,8 +354,14 @@ mod tests {
         centers.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
         assert!(centers[0].0.abs() < 0.5, "First cluster center near 0");
-        assert!((centers[1].0 - 5.0).abs() < 0.5, "Second cluster center near 5");
-        assert!((centers[2].0 - 10.0).abs() < 0.5, "Third cluster center near 10");
+        assert!(
+            (centers[1].0 - 5.0).abs() < 0.5,
+            "Second cluster center near 5"
+        );
+        assert!(
+            (centers[2].0 - 10.0).abs() < 0.5,
+            "Third cluster center near 10"
+        );
     }
 
     #[test]
@@ -443,8 +453,10 @@ mod tests {
         bf_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
         // Top-5 should have significant overlap (at least 3 common elements)
-        let adc_top5: std::collections::HashSet<usize> = adc_dists.iter().take(5).map(|x| x.0).collect();
-        let bf_top5: std::collections::HashSet<usize> = bf_dists.iter().take(5).map(|x| x.0).collect();
+        let adc_top5: std::collections::HashSet<usize> =
+            adc_dists.iter().take(5).map(|x| x.0).collect();
+        let bf_top5: std::collections::HashSet<usize> =
+            bf_dists.iter().take(5).map(|x| x.0).collect();
         let overlap = adc_top5.intersection(&bf_top5).count();
 
         assert!(

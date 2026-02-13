@@ -175,10 +175,10 @@ mod tests {
     #[test]
     fn test_visited_large_capacity() {
         let mut guard = VisitedGuard::new(100_000);
-        
+
         guard.visit(0);
         guard.visit(99_999);
-        
+
         assert!(guard.is_visited(0));
         assert!(guard.is_visited(99_999));
         assert!(!guard.is_visited(50_000));

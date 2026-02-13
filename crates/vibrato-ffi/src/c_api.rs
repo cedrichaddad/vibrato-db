@@ -78,7 +78,9 @@ pub unsafe extern "C" fn vibrato_open(path: *const c_char) -> *mut VibratoHandle
 pub unsafe extern "C" fn vibrato_close(handle: *mut VibratoHandle) {
     let _ = std::panic::catch_unwind(|| {
         if !handle.is_null() {
-            unsafe { drop(Box::from_raw(handle)); }
+            unsafe {
+                drop(Box::from_raw(handle));
+            }
         }
     });
 }
@@ -120,7 +122,9 @@ mod tests {
     #[test]
     fn test_close_null_handle() {
         // Should not crash
-        unsafe { vibrato_close(std::ptr::null_mut()); }
+        unsafe {
+            vibrato_close(std::ptr::null_mut());
+        }
     }
 
     #[test]
@@ -130,6 +134,8 @@ mod tests {
         let handle = unsafe { vibrato_open(path.as_ptr()) };
         // temp dir exists, so handle should be non-null
         assert!(!handle.is_null());
-        unsafe { vibrato_close(handle); }
+        unsafe {
+            vibrato_close(handle);
+        }
     }
 }

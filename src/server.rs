@@ -7,8 +7,9 @@
 //! - `POST /search` - Query for nearest neighbors
 //! - `GET /health` - Server health and telemetry
 
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::path::PathBuf;
 use std::time::Instant;
 
 use axum::{
@@ -24,9 +25,9 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::hnsw::HNSW;
 use crate::store::VectorStore;
-use vibrato_neural::inference::InferenceEngine;
 use vibrato_core::format_v2::VdbWriterV2;
 use vibrato_core::metadata::{MetadataReader, VectorMetadata};
+use vibrato_neural::inference::InferenceEngine;
 
 /// Thread-safe, swappable store handle
 pub type SharedStore = Arc<arc_swap::ArcSwap<VectorStore>>;
@@ -100,7 +101,6 @@ pub struct IngestResponse {
     pub id: usize,
     pub vector_dim: usize,
 }
-
 
 fn default_k() -> usize {
     10
@@ -220,10 +220,13 @@ async fn search(
             }
         } else {
             let offset = id.saturating_sub(persisted_count);
-            dynamic_metadata
-                .get(offset)
-                .cloned()
-                .and_then(|item| if item.is_empty() { None } else { Some(item) })
+            dynamic_metadata.get(offset).cloned().and_then(|item| {
+                if item.is_empty() {
+                    None
+                } else {
+                    Some(item)
+                }
+            })
         }
     };
 
@@ -297,7 +300,11 @@ async fn ingest(
             start_time_ms: m.start_time_ms,
             duration_ms: m.duration_ms,
             bpm: m.bpm,
-            tags: m.tags.into_iter().filter(|t| !t.trim().is_empty()).collect(),
+            tags: m
+                .tags
+                .into_iter()
+                .filter(|t| !t.trim().is_empty())
+                .collect(),
         })
         .unwrap_or_default();
 
@@ -364,7 +371,7 @@ async fn flush(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // 1. Acquire Locks (Global Flush Lock -> Dynamic -> Index -> Store)
     // We take flush_mutex (write) to ensure no ingests are running or starting.
     let _flush_guard = state.flush_mutex.write();
-    
+
     let index_guard = state.index.read(); // Read lock is enough for serialization
     let mut dynamic_guard = state.dynamic_store.write(); // Write lock to clear it later
     let mut dynamic_metadata_guard = state.dynamic_metadata.write();
@@ -393,14 +400,35 @@ async fn flush(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         &dynamic_guard,
         &merged_metadata,
         &index_guard,
-        &temp_path
+        &temp_path,
     ) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
     }
 
     // 3. Atomic Rename
     if let Err(e) = std::fs::rename(&temp_path, &state.data_path) {
-         return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if let Err(e) = sync_path_durable(&state.data_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Flush durability sync failed: {}", e),
+            }),
+        )
+            .into_response();
     }
 
     // 4. Hot Swap
@@ -409,14 +437,24 @@ async fn flush(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             let new_store_arc = Arc::new(new_store);
             state.store.store(new_store_arc.clone());
             state.persisted_metadata.store(Arc::new(merged_metadata));
-            
+
             // Clear dynamic store since everything is now on disk
             dynamic_guard.clear();
             dynamic_metadata_guard.clear();
-            
-            (StatusCode::OK, Json(serde_json::json!({ "status": "flushed", "vectors": new_store_arc.count }))).into_response()
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "flushed", "vectors": new_store_arc.count })),
+            )
+                .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -510,6 +548,21 @@ pub fn load_store_metadata(store: &VectorStore) -> Vec<VectorMetadata> {
     metadata
 }
 
+fn sync_path_durable(path: &Path) -> std::io::Result<()> {
+    // Sync file contents + metadata.
+    File::open(path)?.sync_all()?;
+
+    // Ensure directory entry durability after rename on POSIX filesystems.
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,18 +613,19 @@ mod tests {
 
         let accessor_store = shared_store.clone();
         let accessor_dynamic = dynamic_store.clone();
-        let mut hnsw = HNSW::new(16, 50, move |id| {
+        let mut hnsw = HNSW::new_with_accessor(16, 50, move |id, sink| {
             let store_guard = accessor_store.load();
             if id < store_guard.count {
-                store_guard.get(id).to_vec()
+                sink(store_guard.get(id));
             } else {
-                accessor_dynamic.read()[id - store_guard.count].clone()
+                let guard = accessor_dynamic.read();
+                sink(&guard[id - store_guard.count]);
             }
         });
         for i in 0..num_vectors {
             hnsw.insert(i);
         }
-        
+
         Arc::new(AppState {
             index: RwLock::new(hnsw),
             store: shared_store,

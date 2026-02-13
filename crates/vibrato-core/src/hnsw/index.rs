@@ -16,14 +16,13 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
+use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use rand::rngs::StdRng;
 
 use super::node::Node;
 use super::visited::VisitedGuard;
 use crate::simd::dot_product;
-
 
 /// Candidate for search (min-heap)
 #[derive(Clone, Copy)]
@@ -121,8 +120,10 @@ pub struct HNSW {
     rng: StdRng,
 }
 
-/// Type-erased vector accessor
-type VectorAccessor = Box<dyn Fn(usize) -> Vec<f32> + Send + Sync>;
+/// Type-erased vector accessor.
+///
+/// Callback style avoids allocating/cloning vectors on the hot search path.
+type VectorAccessor = Box<dyn Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync>;
 
 impl HNSW {
     /// Create a new HNSW index
@@ -143,6 +144,35 @@ impl HNSW {
     where
         F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
     {
+        Self::new_with_accessor_and_seed(
+            m,
+            ef_construction,
+            move |id, sink| {
+                let v = vector_fn(id);
+                sink(&v);
+            },
+            seed,
+        )
+    }
+
+    /// Create a new HNSW index with zero-copy accessor callback.
+    pub fn new_with_accessor<F>(m: usize, ef_construction: usize, vector_fn: F) -> Self
+    where
+        F: Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static,
+    {
+        Self::new_with_accessor_and_seed(m, ef_construction, vector_fn, rand::random())
+    }
+
+    /// Create a new HNSW index with zero-copy accessor callback and deterministic seed.
+    pub fn new_with_accessor_and_seed<F>(
+        m: usize,
+        ef_construction: usize,
+        vector_fn: F,
+        seed: u64,
+    ) -> Self
+    where
+        F: Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static,
+    {
         Self {
             nodes: Vec::new(),
             id_to_index: HashMap::new(),
@@ -157,8 +187,8 @@ impl HNSW {
         }
     }
 
-    /// Reconstruct an HNSW index from its parts (used by serialization)
-    pub(crate) fn from_parts<F>(
+    /// Reconstruct an HNSW index from its parts with zero-copy vector accessor.
+    pub(crate) fn from_parts_with_accessor<F>(
         nodes: Vec<Node>,
         entry_point: Option<usize>,
         max_layer: usize,
@@ -169,7 +199,7 @@ impl HNSW {
         vector_fn: F,
     ) -> Self
     where
-        F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
+        F: Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static,
     {
         // Build id_to_index map from existing nodes
         let id_to_index: HashMap<usize, usize> = nodes
@@ -204,30 +234,36 @@ impl HNSW {
         self.id_to_index.get(&id).map(|&idx| &self.nodes[idx])
     }
 
-    /// Get mutable node by ID (O(1) lookup)
-    #[inline]
-    fn get_node_mut(&mut self, id: usize) -> Option<&mut Node> {
-        if let Some(&idx) = self.id_to_index.get(&id) {
-            Some(&mut self.nodes[idx])
-        } else {
-            None
-        }
-    }
-
     /// Get vector for a node
     #[inline]
-    fn get_vector(&self, id: usize) -> Vec<f32> {
-        (self.vectors)(id)
+    fn with_vector(&self, id: usize, sink: &mut dyn FnMut(&[f32])) {
+        (self.vectors)(id, sink);
+    }
+
+    /// Get an owned vector copy.
+    ///
+    /// This is used only where a long-lived query buffer is required (e.g. insert).
+    #[inline]
+    fn get_vector_owned(&self, id: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        self.with_vector(id, &mut |v| {
+            out.reserve(v.len());
+            out.extend_from_slice(v);
+        });
+        out
     }
 
     /// Compute distance between query and node (dot product for normalized vectors)
     /// Returns negative dot product so smaller = more similar
     #[inline]
     fn distance(&self, query: &[f32], node_id: usize) -> f32 {
-        let node_vec = self.get_vector(node_id);
-        // For normalized vectors, higher dot product = more similar
-        // We return 1 - dot_product to convert to a distance metric
-        1.0 - dot_product(query, &node_vec)
+        let mut dist = 0.0f32;
+        self.with_vector(node_id, &mut |node_vec| {
+            // For normalized vectors, higher dot product = more similar.
+            // We return 1 - dot_product to convert to a distance metric.
+            dist = 1.0 - dot_product(query, node_vec);
+        });
+        dist
     }
 
     /// Assign a random layer based on exponential distribution
@@ -241,7 +277,7 @@ impl HNSW {
     /// # Parameters
     /// - `id`: Vector ID (index into VectorStore)
     pub fn insert(&mut self, id: usize) {
-        let query = self.get_vector(id);
+        let query = self.get_vector_owned(id);
         let node_layer = self.random_layer();
 
         // Create node
@@ -251,7 +287,7 @@ impl HNSW {
         if self.entry_point.is_none() {
             self.entry_point = Some(id);
             self.max_layer = node_layer;
-            self.id_to_index.insert(id, 0);  // First node always at index 0
+            self.id_to_index.insert(id, 0); // First node always at index 0
             self.nodes.push(node);
             return;
         }
@@ -271,7 +307,7 @@ impl HNSW {
         // Phase 2: Insert at layers from min(node_layer, max_layer) down to 0
         // We collect all the updates needed, then apply them
         let start_layer = node_layer.min(self.max_layer);
-        
+
         // Collect updates to apply: (node_index, layer, neighbor_id_to_add)
         let mut reverse_edges: Vec<(usize, usize, usize)> = Vec::new();
         // Collect pruning operations: (node_index, layer, new_neighbors)
@@ -281,7 +317,8 @@ impl HNSW {
             let m_layer = if layer == 0 { self.m0 } else { self.m };
 
             // Find candidates for this layer
-            let candidates = self.search_layer(&query, &[current_node], self.ef_construction, layer);
+            let candidates =
+                self.search_layer(&query, &[current_node], self.ef_construction, layer);
 
             // Select neighbors using the heuristic
             let neighbors = self.select_neighbors(&query, &candidates, m_layer);
@@ -293,25 +330,28 @@ impl HNSW {
                 // Find the node index for this neighbor using O(1) HashMap
                 if let Some(node_idx) = self.get_node_index(neighbor_id) {
                     reverse_edges.push((node_idx, layer, id));
-                    
+
                     // Check if pruning will be needed
                     let current_neighbors = self.nodes[node_idx].neighbors(layer);
                     if current_neighbors.len() >= m_layer {
                         // Will need pruning after adding new edge
-                        let neighbor_vec = self.get_vector(neighbor_id);
                         let mut all_neighbors: Vec<usize> = current_neighbors.to_vec();
                         all_neighbors.push(id);
-                        
-                        // Compute distances and select
-                        let neighbor_candidates: Vec<(usize, f32)> = all_neighbors
-                            .iter()
-                            .map(|&n| {
-                                let v = self.get_vector(n);
-                                (n, 1.0 - dot_product(&neighbor_vec, &v))
-                            })
-                            .collect();
-                        
-                        let pruned = self.select_neighbors(&neighbor_vec, &neighbor_candidates, m_layer);
+
+                        // Compute distances and select.
+                        let mut neighbor_candidates: Vec<(usize, f32)> =
+                            Vec::with_capacity(all_neighbors.len());
+                        self.with_vector(neighbor_id, &mut |neighbor_vec| {
+                            for &n in &all_neighbors {
+                                let mut dist = 0.0f32;
+                                self.with_vector(n, &mut |v| {
+                                    dist = 1.0 - dot_product(neighbor_vec, v);
+                                });
+                                neighbor_candidates.push((n, dist));
+                            }
+                        });
+
+                        let pruned = self.select_neighbors(&[], &neighbor_candidates, m_layer);
                         let pruned_ids: Vec<usize> = pruned.iter().map(|(id, _)| *id).collect();
                         prune_ops.push((node_idx, layer, pruned_ids));
                     }
@@ -325,9 +365,11 @@ impl HNSW {
         }
 
         // Apply reverse edges (avoiding those that will be overwritten by pruning)
-        let prune_targets: std::collections::HashSet<(usize, usize)> = 
-            prune_ops.iter().map(|(idx, layer, _)| (*idx, *layer)).collect();
-        
+        let prune_targets: std::collections::HashSet<(usize, usize)> = prune_ops
+            .iter()
+            .map(|(idx, layer, _)| (*idx, *layer))
+            .collect();
+
         for (node_idx, layer, neighbor_id) in reverse_edges {
             if !prune_targets.contains(&(node_idx, layer)) {
                 self.nodes[node_idx].add_neighbor(layer, neighbor_id);
@@ -378,8 +420,14 @@ impl HNSW {
             if !visited.is_visited(ep) {
                 visited.visit(ep);
                 let dist = self.distance(query, ep);
-                candidates.push(Candidate { id: ep, distance: dist });
-                results.push(SearchResult { id: ep, distance: dist });
+                candidates.push(Candidate {
+                    id: ep,
+                    distance: dist,
+                });
+                results.push(SearchResult {
+                    id: ep,
+                    distance: dist,
+                });
             }
         }
 
@@ -458,22 +506,23 @@ impl HNSW {
                 break;
             }
 
-            // Fetch candidate vector once (outside inner loop)
-            let candidate_vec = self.get_vector(candidate_id);
-
             // Check if candidate is closer to query than to any existing result
             let mut is_diverse = true;
-            for &(existing_id, _) in &result {
-                let existing_vec = self.get_vector(existing_id);
-                let dist_to_existing = 1.0 - dot_product(&candidate_vec, &existing_vec);
+            self.with_vector(candidate_id, &mut |candidate_vec| {
+                for &(existing_id, _) in &result {
+                    let mut dist_to_existing = 0.0f32;
+                    self.with_vector(existing_id, &mut |existing_vec| {
+                        dist_to_existing = 1.0 - dot_product(candidate_vec, existing_vec);
+                    });
 
-                if dist_to_existing < candidate_dist {
-                    // Candidate is closer to existing neighbor than to query
-                    // This means the existing neighbor "covers" this direction
-                    is_diverse = false;
-                    break;
+                    if dist_to_existing < candidate_dist {
+                        // Candidate is closer to existing neighbor than to query.
+                        // This means the existing neighbor "covers" this direction.
+                        is_diverse = false;
+                        break;
+                    }
                 }
-            }
+            });
 
             if is_diverse {
                 result.push((candidate_id, candidate_dist));
@@ -669,8 +718,9 @@ impl HNSW {
             let mut total_sim = 0.0f32;
             for (offset, query_vec) in query_sequence.iter().enumerate() {
                 let vec_id = start_id + offset;
-                let stored_vec = self.get_vector(vec_id);
-                total_sim += dot_product(query_vec, &stored_vec);
+                self.with_vector(vec_id, &mut |stored_vec| {
+                    total_sim += dot_product(query_vec, stored_vec);
+                });
             }
             let avg_sim = total_sim / seq_len as f32;
 
@@ -822,7 +872,11 @@ mod tests {
 
         let avg_recall = total_recall / num_queries as f64;
         println!("Average recall@{}: {:.2}%", k, avg_recall * 100.0);
-        assert!(avg_recall > 0.8, "Recall should be > 80%, got {:.2}%", avg_recall * 100.0);
+        assert!(
+            avg_recall > 0.8,
+            "Recall should be > 80%, got {:.2}%",
+            avg_recall * 100.0
+        );
     }
 
     // ============== Edge Case Tests ==============
@@ -832,23 +886,26 @@ mod tests {
         let hnsw = HNSW::new(16, 100, |_id| vec![0.0f32; 128]);
         let query = random_vector(128);
         let results = hnsw.search(&query, 5, 50);
-        assert!(results.is_empty(), "Search on empty index should return empty");
+        assert!(
+            results.is_empty(),
+            "Search on empty index should return empty"
+        );
     }
 
     #[test]
     fn test_search_k_greater_than_count() {
         let vectors: Vec<_> = (0..10).map(|_| random_vector(64)).collect();
         let vectors_clone = vectors.clone();
-        
+
         let mut hnsw = HNSW::new(8, 50, move |id| vectors_clone[id].clone());
         for i in 0..10 {
             hnsw.insert(i);
         }
-        
+
         // Request more results than exist
         let query = random_vector(64);
         let results = hnsw.search(&query, 100, 50);
-        
+
         // Should return all 10 vectors, not panic
         assert_eq!(results.len(), 10);
     }
@@ -857,15 +914,15 @@ mod tests {
     fn test_search_k_zero() {
         let vectors: Vec<_> = (0..10).map(|_| random_vector(64)).collect();
         let vectors_clone = vectors.clone();
-        
+
         let mut hnsw = HNSW::new(8, 50, move |id| vectors_clone[id].clone());
         for i in 0..10 {
             hnsw.insert(i);
         }
-        
+
         let query = random_vector(64);
         let results = hnsw.search(&query, 0, 50);
-        
+
         // k=0 should return empty
         assert!(results.is_empty());
     }
@@ -874,16 +931,16 @@ mod tests {
     fn test_large_ef_value() {
         let vectors: Vec<_> = (0..50).map(|_| random_vector(64)).collect();
         let vectors_clone = vectors.clone();
-        
+
         let mut hnsw = HNSW::new(8, 50, move |id| vectors_clone[id].clone());
         for i in 0..50 {
             hnsw.insert(i);
         }
-        
+
         // Very large ef should not panic
         let query = random_vector(64);
         let results = hnsw.search(&query, 5, 10000);
-        
+
         assert!(!results.is_empty());
     }
 
@@ -891,20 +948,20 @@ mod tests {
     fn test_id_to_index_consistency() {
         let vectors: Vec<_> = (0..100).map(|_| random_vector(64)).collect();
         let vectors_clone = vectors.clone();
-        
+
         let mut hnsw = HNSW::new(16, 50, move |id| vectors_clone[id].clone());
         for i in 0..100 {
             hnsw.insert(i);
         }
-        
+
         // Verify every node has correct id_to_index mapping
         for (idx, node) in hnsw.nodes.iter().enumerate() {
             let mapped_idx = hnsw.id_to_index.get(&node.id);
             assert_eq!(
-                mapped_idx, 
-                Some(&idx), 
-                "id_to_index mismatch for node {} at index {}", 
-                node.id, 
+                mapped_idx,
+                Some(&idx),
+                "id_to_index mismatch for node {} at index {}",
+                node.id,
                 idx
             );
         }
@@ -914,12 +971,12 @@ mod tests {
     fn test_stats_accuracy() {
         let vectors: Vec<_> = (0..100).map(|_| random_vector(64)).collect();
         let vectors_clone = vectors.clone();
-        
+
         let mut hnsw = HNSW::new(16, 50, move |id| vectors_clone[id].clone());
         for i in 0..100 {
             hnsw.insert(i);
         }
-        
+
         let stats = hnsw.stats();
         assert_eq!(stats.num_nodes, 100);
         assert_eq!(stats.m, 16);
@@ -933,12 +990,12 @@ mod tests {
         let vectors = vec![random_vector(64)];
         let query = vectors[0].clone();
         let vectors_clone = vectors.clone();
-        
+
         let mut hnsw = HNSW::new(8, 50, move |id| vectors_clone[id].clone());
         hnsw.insert(0);
-        
+
         let results = hnsw.search(&query, 5, 50);
-        
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 0);
         assert!((results[0].1 - 1.0).abs() < 0.001); // Exact match
@@ -949,17 +1006,21 @@ mod tests {
         // Test that vectors indexed can find themselves
         let vectors: Vec<_> = (0..20).map(|_| random_vector(128)).collect();
         let vectors_clone = vectors.clone();
-        
+
         let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
         for i in 0..20 {
             hnsw.insert(i);
         }
-        
+
         // Each vector should be its own top-1 result
         for i in 0..20 {
             let results = hnsw.search(&vectors[i], 1, 100);
             assert!(!results.is_empty(), "Should find at least one result");
-            assert_eq!(results[0].0, i, "Vector {} should find itself as top result", i);
+            assert_eq!(
+                results[0].0, i,
+                "Vector {} should find itself as top result",
+                i
+            );
         }
     }
 
@@ -969,21 +1030,21 @@ mod tests {
         let vectors: Vec<_> = (0..50).map(|_| random_vector(64)).collect();
         let vectors1 = vectors.clone();
         let vectors2 = vectors.clone();
-        
+
         let mut hnsw1 = HNSW::new(16, 50, move |id| vectors1[id].clone());
         let mut hnsw2 = HNSW::new(16, 50, move |id| vectors2[id].clone());
-        
+
         for i in 0..50 {
             hnsw1.insert(i);
             hnsw2.insert(i);
         }
-        
+
         // Note: Due to RNG in layer assignment, graphs may differ
         // But both should find the same vector given exact match query
         let query = vectors[25].clone();
         let results1 = hnsw1.search(&query, 1, 100);
         let results2 = hnsw2.search(&query, 1, 100);
-        
+
         assert_eq!(results1[0].0, 25);
         assert_eq!(results2[0].0, 25);
     }
@@ -1004,7 +1065,12 @@ mod tests {
 
         // All results should have even IDs
         for (id, _score) in &results {
-            assert_eq!(*id % 2, 0, "Filtered results should all be even, got {}", id);
+            assert_eq!(
+                *id % 2,
+                0,
+                "Filtered results should all be even, got {}",
+                id
+            );
         }
         // Vector 42 is even, so it should be the top result
         assert!(!results.is_empty());
@@ -1024,7 +1090,10 @@ mod tests {
         // Filter that rejects everything
         let query = random_vector(64);
         let results = hnsw.search_filtered(&query, 5, 100, |_| false);
-        assert!(results.is_empty(), "Should be empty when predicate rejects all");
+        assert!(
+            results.is_empty(),
+            "Should be empty when predicate rejects all"
+        );
     }
 
     #[test]
@@ -1045,7 +1114,10 @@ mod tests {
         // The top result should start at index 10
         assert!(!results.is_empty(), "Should find at least one sub-sequence");
         assert_eq!(results[0].0, 10, "Best sub-sequence should start at 10");
-        assert!(results[0].1 > 0.95, "Exact match should have high similarity");
+        assert!(
+            results[0].1 > 0.95,
+            "Exact match should have high similarity"
+        );
     }
 
     #[test]

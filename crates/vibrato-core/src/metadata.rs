@@ -99,7 +99,8 @@ impl MetadataBuilder {
     fn add_string(&mut self, s: &str) -> (u32, u16) {
         let offset = self.string_pool.len() as u32;
         let len = s.len().min(u16::MAX as usize) as u16;
-        self.string_pool.extend_from_slice(&s.as_bytes()[..len as usize]);
+        self.string_pool
+            .extend_from_slice(&s.as_bytes()[..len as usize]);
         (offset, len)
     }
 
@@ -225,8 +226,6 @@ impl Default for VectorMetadata {
     }
 }
 
-
-
 impl<'a> MetadataReader<'a> {
     /// Create a reader over a metadata byte slice
     pub fn new(data: &'a [u8]) -> Result<Self, MetadataError> {
@@ -284,18 +283,25 @@ impl<'a> MetadataReader<'a> {
         if source_file_offset + source_file_len > pool.len() {
             return Err(MetadataError::Invalid(format!(
                 "source_file string out of bounds: offset={} len={} pool_size={}",
-                source_file_offset, source_file_len, pool.len()
+                source_file_offset,
+                source_file_len,
+                pool.len()
             )));
         }
-        let source_file = std::str::from_utf8(&pool[source_file_offset..source_file_offset + source_file_len])
-            .map_err(|e| MetadataError::Invalid(format!("Invalid UTF-8 in source_file: {}", e)))?
-            .to_string();
+        let source_file =
+            std::str::from_utf8(&pool[source_file_offset..source_file_offset + source_file_len])
+                .map_err(|e| {
+                    MetadataError::Invalid(format!("Invalid UTF-8 in source_file: {}", e))
+                })?
+                .to_string();
 
         let tags = if tags_len > 0 {
             if tags_offset + tags_len > pool.len() {
                 return Err(MetadataError::Invalid(format!(
                     "tags string out of bounds: offset={} len={} pool_size={}",
-                    tags_offset, tags_len, pool.len()
+                    tags_offset,
+                    tags_len,
+                    pool.len()
                 )));
             }
             let tags_str = std::str::from_utf8(&pool[tags_offset..tags_offset + tags_len])
@@ -360,7 +366,10 @@ mod tests {
         let reader = MetadataReader::new(&data).unwrap();
 
         let result = reader.get(5);
-        assert!(matches!(result, Err(MetadataError::IndexOutOfBounds { .. })));
+        assert!(matches!(
+            result,
+            Err(MetadataError::IndexOutOfBounds { .. })
+        ));
     }
 
     #[test]

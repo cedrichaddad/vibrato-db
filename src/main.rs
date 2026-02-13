@@ -15,8 +15,8 @@
 //! vibrato-db setup-models --model-dir ./models
 //! ```
 
-use std::net::SocketAddr;
 use std::io::{BufReader, Read, Seek};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,10 +24,12 @@ use clap::{Parser, Subcommand};
 use parking_lot::RwLock;
 use tracing_subscriber::EnvFilter;
 
-use vibrato_db::hnsw::HNSW;
-use vibrato_db::server::{load_store_metadata, serve, AppState, SearchRequest, SearchResponse, SharedStore};
-use vibrato_db::store::VectorStore;
 use vibrato_db::format_v2::{VdbHeaderV2, VdbWriterV2};
+use vibrato_db::hnsw::HNSW;
+use vibrato_db::server::{
+    load_store_metadata, serve, AppState, SearchRequest, SearchResponse, SharedStore,
+};
+use vibrato_db::store::VectorStore;
 use vibrato_neural::inference::InferenceEngine;
 
 #[derive(Parser)]
@@ -139,8 +141,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -159,11 +160,7 @@ async fn main() -> anyhow::Result<()> {
             let store = Arc::new(VectorStore::open(&data)?);
             // Create SharedStore (Arc<RwLock<Arc<VectorStore>>>)
             let shared_store = Arc::new(arc_swap::ArcSwap::from(store.clone()));
-            tracing::info!(
-                "Loaded {} vectors of dimension {}",
-                store.count,
-                store.dim
-            );
+            tracing::info!("Loaded {} vectors of dimension {}", store.count, store.dim);
 
             // Create dynamic components
             let dynamic_store = Arc::new(RwLock::new(Vec::new()));
@@ -209,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
                 if index_path.exists() {
                     tracing::info!("Loading legacy index from {:?}", index_path);
                     let accessor = create_accessor(shared_store.clone(), dynamic_store.clone());
-                    let hnsw = HNSW::load(index_path, accessor)?;
+                    let hnsw = HNSW::load_with_accessor(index_path, accessor)?;
                     let stats = hnsw.stats();
                     tracing::info!(
                         "Legacy index loaded: {} nodes, {} layers",
@@ -220,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     tracing::info!("No persisted graph found, building index...");
                     let accessor = create_accessor(shared_store.clone(), dynamic_store.clone());
-                    let mut hnsw = HNSW::new(m, ef_construction, accessor);
+                    let mut hnsw = HNSW::new_with_accessor(m, ef_construction, accessor);
                     for i in 0..store.count as usize {
                         hnsw.insert(i);
                     }
@@ -229,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 tracing::info!("No persisted graph found, building index...");
                 let accessor = create_accessor(shared_store.clone(), dynamic_store.clone());
-                let mut hnsw = HNSW::new(m, ef_construction, accessor);
+                let mut hnsw = HNSW::new_with_accessor(m, ef_construction, accessor);
                 for i in 0..store.count as usize {
                     hnsw.insert(i);
                 }
@@ -272,11 +269,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             tracing::info!("Loading vector data from {:?}", data);
             let store = Arc::new(VectorStore::open(&data)?);
-            tracing::info!(
-                "Loaded {} vectors of dimension {}",
-                store.count,
-                store.dim
-            );
+            tracing::info!("Loaded {} vectors of dimension {}", store.count, store.dim);
 
             let hnsw = build_index(store, m, ef_construction, Some(&output))?;
             let stats = hnsw.stats();
@@ -350,7 +343,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Wrote .vdb file to {:?}", output);
         }
 
-        Commands::Search { server, query, k, ef } => {
+        Commands::Search {
+            server,
+            query,
+            k,
+            ef,
+        } => {
             let client = reqwest::Client::new();
             let url = format!("{}/search", server.trim_end_matches('/'));
 
@@ -389,16 +387,16 @@ async fn main() -> anyhow::Result<()> {
 fn create_accessor(
     store_handle: SharedStore,
     dynamic: Arc<RwLock<Vec<Vec<f32>>>>,
-) -> impl Fn(usize) -> Vec<f32> + Send + Sync + 'static {
-    move |id: usize| {
+) -> impl Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static {
+    move |id: usize, sink: &mut dyn FnMut(&[f32])| {
         let store_guard = store_handle.load();
         if id < store_guard.count {
-            store_guard.get(id).to_vec()
+            sink(store_guard.get(id));
         } else {
             let offset = id - store_guard.count;
             let guard = dynamic.read();
             if offset < guard.len() {
-                guard[offset].clone()
+                sink(&guard[offset]);
             } else {
                 tracing::error!(
                     "Vector ID {} out of bounds (store={}, dynamic={})",
@@ -406,22 +404,18 @@ fn create_accessor(
                     store_guard.count,
                     guard.len()
                 );
-                vec![0.0; store_guard.dim]
+                let fallback = vec![0.0; store_guard.dim];
+                sink(&fallback);
             }
         }
     }
 }
 
-fn build_hnsw_from_store<F>(
-    count: usize,
-    m: usize,
-    ef_construction: usize,
-    vector_fn: F,
-) -> HNSW
+fn build_hnsw_from_store<F>(count: usize, m: usize, ef_construction: usize, vector_fn: F) -> HNSW
 where
-    F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
+    F: Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static,
 {
-    let mut hnsw = HNSW::new(m, ef_construction, vector_fn);
+    let mut hnsw = HNSW::new_with_accessor(m, ef_construction, vector_fn);
     for i in 0..count {
         hnsw.insert(i);
     }
@@ -466,7 +460,7 @@ fn validate_graph_bounds(hnsw: &HNSW, max_id_exclusive: usize) -> anyhow::Result
 
 fn try_load_graph_from_vdb<F>(path: &PathBuf, vector_fn: F) -> anyhow::Result<Option<HNSW>>
 where
-    F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
+    F: Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static,
 {
     let mut file = std::fs::File::open(path)?;
     let mut header_bytes = [0u8; 64];
@@ -483,7 +477,7 @@ where
 
     file.seek(std::io::SeekFrom::Start(header.graph_offset))?;
     let mut reader = BufReader::new(file);
-    let hnsw = HNSW::load_from_reader(&mut reader, vector_fn)?;
+    let hnsw = HNSW::load_from_reader_with_accessor(&mut reader, vector_fn)?;
     Ok(Some(hnsw))
 }
 
@@ -494,7 +488,9 @@ fn build_index(
     save_path: Option<&PathBuf>,
 ) -> anyhow::Result<HNSW> {
     let store_for_hnsw = store.clone();
-    let mut hnsw = HNSW::new(m, ef_construction, move |id| store_for_hnsw.get(id).to_vec());
+    let mut hnsw = HNSW::new_with_accessor(m, ef_construction, move |id, sink| {
+        sink(store_for_hnsw.get(id))
+    });
 
     let total = store.count;
     let progress_interval = (total / 100).max(1);

@@ -60,22 +60,30 @@ impl VectorStore {
         let mmap = unsafe { Mmap::map(&file)? };
 
         // Check magic bytes to determine version
-        let (count, dim, data_offset, metadata_range) = if mmap.len() >= 8 && &mmap[0..8] == &MAGIC {
+        let (count, dim, data_offset, metadata_range) = if mmap.len() >= 8 && &mmap[0..8] == &MAGIC
+        {
             // V1
             let header = VdbHeader::from_bytes(&mmap)?;
-            (header.count as usize, header.dimensions as usize, HEADER_SIZE, None)
+            (
+                header.count as usize,
+                header.dimensions as usize,
+                HEADER_SIZE,
+                None,
+            )
         } else if mmap.len() >= 8 && &mmap[0..8] == &MAGIC_V2 {
             // V2
             let header = VdbHeaderV2::from_bytes(&mmap).map_err(|e| match e {
                 crate::format_v2::FormatV2Error::Io(io) => FormatError::Io(io),
-                crate::format_v2::FormatV2Error::DimensionMismatch { expected, actual } => FormatError::DimensionMismatch { expected, actual },
+                crate::format_v2::FormatV2Error::DimensionMismatch { expected, actual } => {
+                    FormatError::DimensionMismatch { expected, actual }
+                }
                 _ => FormatError::InvalidMagic, // Or wrap in IO error
             })?;
             if header.is_pq_enabled() {
                 // This store implementation expects raw f32 vectors
-                return Err(StoreError::Format(FormatError::DimensionMismatch { 
-                    expected: 0, 
-                    actual: 0 // TODO: Add specific error for PQ unsupported in raw store
+                return Err(StoreError::Format(FormatError::DimensionMismatch {
+                    expected: 0,
+                    actual: 0, // TODO: Add specific error for PQ unsupported in raw store
                 }));
             }
             let metadata_range = if header.has_metadata() && header.metadata_offset > 0 {
@@ -276,11 +284,7 @@ mod tests {
 
     #[test]
     fn test_iterator() {
-        let vectors = vec![
-            vec![1.0, 2.0],
-            vec![3.0, 4.0],
-            vec![5.0, 6.0],
-        ];
+        let vectors = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
         let dir = create_test_vdb(&vectors);
         let path = dir.path().join("test.vdb");
 
