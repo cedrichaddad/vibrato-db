@@ -1,33 +1,14 @@
 //! Vibrato-DB: A persistent, disk-backed vector search engine
 //!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                      HTTP API (axum)                        │
-//! │                    POST /search, GET /health                │
-//! └─────────────────────────────────────────────────────────────┘
-//!                              │
-//!                              ▼
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                    HNSW Indexing Engine                     │
-//! │         Hierarchical Navigable Small World Graph            │
-//! └─────────────────────────────────────────────────────────────┘
-//!                              │
-//!                              ▼
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                     VectorStore (mmap)                      │
-//! │              Zero-copy access to .vdb files                 │
-//! └─────────────────────────────────────────────────────────────┘
-//! ```
+//! This is the root binary crate. All core functionality lives in `vibrato-core`.
+//! The neural pipeline lives in `vibrato-neural`.
 
-pub mod format;
-pub mod hnsw;
 pub mod server;
-pub mod simd;
-pub mod store;
 
-pub use format::{VdbHeader, VdbWriter};
-pub use hnsw::HNSW;
-pub use simd::{dot_product, l2_distance};
-pub use store::VectorStore;
+// Re-export core types for backward compatibility
+pub use vibrato_core::format;
+pub use vibrato_core::format_v2; // New V2 format
+pub use vibrato_core::hnsw;
+pub use vibrato_core::simd;
+pub use vibrato_core::store;
+pub use vibrato_core::{dot_product, l2_distance, VdbHeader, VdbWriter, VectorStore, HNSW};

@@ -1,0 +1,26 @@
+[package]
+name = "vibrato-ffi"
+version = "0.2.0"
+edition = "2021"
+description = "Python (PyO3), C, and WASM bindings for Vibrato"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vibrato-core = { path = "../vibrato-core" }
+vibrato-neural = { path = "../vibrato-neural" }
+
+# Python bindings
+# Use abi3-py37 to support Python 3.7+ with a single wheel
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py37"], optional = true }
+
+# Utilities
+thiserror = "1.0"
+tracing = "0.1"
+parking_lot = "0.12"
+
+[features]
+default = []
+python = ["pyo3"]

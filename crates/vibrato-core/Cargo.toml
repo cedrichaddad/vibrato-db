@@ -1,0 +1,28 @@
+[package]
+name = "vibrato-core"
+version = "0.2.0"
+edition = "2021"
+description = "Storage engine, HNSW index, SIMD vector math, and Product Quantization"
+license = "MIT"
+
+[dependencies]
+# Storage & Zero-copy
+memmap2 = "0.9"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Serialization
+bincode = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+
+# Concurrency
+parking_lot = "0.12"
+fixedbitset = "0.5"
+
+# Utilities
+rand = "0.8"
+thiserror = "1.0"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }

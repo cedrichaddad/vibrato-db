@@ -13,7 +13,8 @@ use std::path::Path;
 use memmap2::Mmap;
 use thiserror::Error;
 
-use crate::format::{FormatError, VdbHeader, HEADER_SIZE};
+use crate::format::{FormatError, VdbHeader, HEADER_SIZE, MAGIC};
+use crate::format_v2::{VdbHeaderV2, MAGIC_V2};
 
 #[derive(Error, Debug)]
 pub enum StoreError {
@@ -33,11 +34,13 @@ pub enum StoreError {
 /// Memory-mapped vector store providing zero-copy access to .vdb files
 pub struct VectorStore {
     /// The memory-mapped file
-    mmap: Mmap,
+    pub(crate) mmap: Mmap,
     /// Number of vectors in the store
     pub count: usize,
     /// Dimensionality of each vector
     pub dim: usize,
+    /// Byte offset where vector data begins
+    pub(crate) data_offset: usize,
 }
 
 impl VectorStore {
@@ -54,17 +57,39 @@ impl VectorStore {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // Parse header
-        let header = VdbHeader::from_bytes(&mmap)?;
+        // Check magic bytes to determine version
+        let (count, dim, data_offset) = if mmap.len() >= 8 && &mmap[0..8] == &MAGIC {
+            // V1
+            let header = VdbHeader::from_bytes(&mmap)?;
+            (header.count as usize, header.dimensions as usize, HEADER_SIZE)
+        } else if mmap.len() >= 8 && &mmap[0..8] == &MAGIC_V2 {
+            // V2
+            let header = VdbHeaderV2::from_bytes(&mmap).map_err(|e| match e {
+                crate::format_v2::FormatV2Error::Io(io) => FormatError::Io(io),
+                crate::format_v2::FormatV2Error::DimensionMismatch { expected, actual } => FormatError::DimensionMismatch { expected, actual },
+                _ => FormatError::InvalidMagic, // Or wrap in IO error
+            })?;
+            if header.is_pq_enabled() {
+                // This store implementation expects raw f32 vectors
+                return Err(StoreError::Format(FormatError::DimensionMismatch { 
+                    expected: 0, 
+                    actual: 0 // TODO: Add specific error for PQ unsupported in raw store
+                }));
+            }
+            (header.count as usize, header.dimensions as usize, header.vectors_offset as usize)
+        } else {
+            return Err(StoreError::Format(FormatError::InvalidMagic));
+        };
 
         // Validate file size
-        let expected_size = header.file_size();
-        if mmap.len() < expected_size {
+        // Note: For V2, file might be larger (metadata/graph), so we just check it's *at least* big enough for vectors
+        let required_size = data_offset + (count * dim * std::mem::size_of::<f32>());
+        if mmap.len() < required_size {
             return Err(StoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
-                    "File truncated: expected {} bytes, got {}",
-                    expected_size,
+                    "File too small: expected at least {} bytes, got {}",
+                    required_size,
                     mmap.len()
                 ),
             )));
@@ -72,8 +97,9 @@ impl VectorStore {
 
         Ok(Self {
             mmap,
-            count: header.count as usize,
-            dim: header.dimensions as usize,
+            count,
+            dim,
+            data_offset,
         })
     }
 
@@ -102,7 +128,7 @@ impl VectorStore {
             });
         }
 
-        let start = HEADER_SIZE + (index * self.dim * std::mem::size_of::<f32>());
+        let start = self.data_offset + (index * self.dim * std::mem::size_of::<f32>());
         let end = start + (self.dim * std::mem::size_of::<f32>());
         let bytes = &self.mmap[start..end];
 

@@ -1,0 +1,47 @@
+[package]
+name = "vibrato-neural"
+version = "0.2.0"
+edition = "2021"
+description = "Audio ingestion, DSP, and ONNX inference engine"
+license = "MIT"
+
+[features]
+default = []
+transient_aware = []
+onnx = [] # ["ort"]
+
+[dependencies]
+vibrato-core = { path = "../vibrato-core" }
+
+# Audio decoding (pure Rust, no ffmpeg)
+symphonia = { version = "0.5", features = ["mp3", "isomp4", "aac", "flac", "ogg", "vorbis", "wav", "pcm"] }
+
+# Resampling
+rubato = "0.16"
+
+# FFT / Spectrogram
+rustfft = "6.2"
+
+# ONNX inference — optional, requires rustc 1.88+ for ort 2.x
+# Enable with: cargo build --features onnx
+# ONNX inference — optional, requires rustc 1.88+ for ort 2.x
+# Enable with: cargo build --features onnx
+# ONNX inference
+# We use load-dynamic to avoid static linking hell
+ort = { version = "2.0.0-rc.9", features = ["load-dynamic", "ndarray"] }
+ndarray = "0.15"
+tokenizers = "0.19"
+
+# Model Management & Security
+reqwest = { version = "0.11", features = ["blocking", "rustls-tls"] }
+directories = "5.0"
+sha2 = "0.10"
+hex = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# Utilities
+thiserror = "1.0"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
