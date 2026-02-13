@@ -18,7 +18,7 @@ async fn test_persistence_flow() {
     let vdb_path = dir.path().join("index.vdb");
     // let idx_path = ... removed
     // ...
-    let _guard = TestDirGuard::new(dir.path());
+    // let _guard = TestDirGuard::new(dir.path()); // Removed per review
 
     // 2. Create Initial Empty .vdb
     {
@@ -29,7 +29,7 @@ async fn test_persistence_flow() {
 
     // 3. Initialize Server State
     let store = Arc::new(VectorStore::open(&vdb_path).unwrap());
-    let shared_store = Arc::new(RwLock::new(store.clone()));
+    let shared_store = Arc::new(arc_swap::ArcSwap::from(store.clone()));
     let dynamic_store = Arc::new(RwLock::new(Vec::<Vec<f32>>::new()));
     
     // Empty HNSW
@@ -37,12 +37,11 @@ async fn test_persistence_flow() {
     let accessor_store = shared_store.clone();
     let accessor_dynamic = dynamic_store.clone();
     let accessor = move |id| {
-        let store = accessor_store.read();
-        let store_ref = store.as_ref();
-        if id < store_ref.count {
-            store_ref.get(id).to_vec()
+        let store_guard = accessor_store.load();
+        if id < store_guard.count {
+            store_guard.get(id).to_vec()
         } else {
-            let offset = id - store_ref.count;
+            let offset = id - store_guard.count;
             accessor_dynamic.read()[offset].clone()
         }
     };
@@ -57,6 +56,7 @@ async fn test_persistence_flow() {
         dynamic_store: dynamic_store.clone(),
         inference: None,
         flush_mutex: RwLock::new(()),
+        index_path: vdb_path.clone(),
     });
 
     let router = create_router(state.clone());
@@ -78,10 +78,11 @@ async fn test_persistence_flow() {
 
     // Verify it is in dynamic store
     assert_eq!(state.dynamic_store.read().len(), 1);
-    assert_eq!(state.store.read().count, 0);
+    // Note: Store count is handled via shared pointer, which we haven't swapped yet.
+    assert_eq!(state.store.load().count, 0);
 
     // 5. Flush
-    // This will write "index.vdb" in current directory (which is temp dir due to guard)
+    // This will write to vdb_path
     let req = Request::builder()
         .method("POST")
         .uri("/flush")
@@ -95,10 +96,10 @@ async fn test_persistence_flow() {
     // Dynamic store should be empty
     assert_eq!(state.dynamic_store.read().len(), 0);
     // Store should have 1 vector
-    assert_eq!(state.store.read().count, 1);
+    assert_eq!(state.store.load().count, 1);
     
     // Verify file content
-    let stored_vec = state.store.read().get(0).to_vec();
+    let stored_vec = state.store.load().get(0).to_vec();
     assert_eq!(stored_vec, vec![0.1, 0.2]);
 
     // 7. Restart / Reload HNSW (Simulate server restart)
@@ -121,18 +122,17 @@ async fn test_persistence_flow() {
     // But for test we reuse existing stores logic or create new ones?
     // Let's create new ones to be sure.
     let new_store = Arc::new(VectorStore::open(&vdb_path).unwrap());
-    let new_shared = Arc::new(RwLock::new(new_store.clone()));
+    let new_shared = Arc::new(arc_swap::ArcSwap::from(new_store.clone()));
     let new_dynamic = Arc::new(RwLock::new(Vec::<Vec<f32>>::new())); // Empty dynamically
     
     let new_accessor_store = new_shared.clone();
     let new_accessor_dynamic = new_dynamic.clone();
     let new_accessor = move |id| {
-        let store = new_accessor_store.read();
-        let store_ref = store.as_ref();
-        if id < store_ref.count {
-            store_ref.get(id).to_vec()
+        let store_guard = new_accessor_store.load();
+        if id < store_guard.count {
+            store_guard.get(id).to_vec()
         } else {
-            let offset = id - store_ref.count;
+            let offset = id - store_guard.count;
             new_accessor_dynamic.read()[offset].clone()
         }
     };
@@ -143,24 +143,4 @@ async fn test_persistence_flow() {
     let results = loaded_hnsw.search(&[0.1, 0.2], 1, 10);
     assert!(!results.is_empty());
     assert_eq!(results[0].0, 0); // ID 0 (was ingested first)
-    // Note: ID 0 in new store is the vector we ingested.
-    // Ingested ID was 0 because store was empty.
-}
-
-struct TestDirGuard {
-    original: std::path::PathBuf,
-}
-
-impl TestDirGuard {
-    fn new(path: &std::path::Path) -> Self {
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(path).unwrap();
-        Self { original }
-    }
-}
-
-impl Drop for TestDirGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
 }

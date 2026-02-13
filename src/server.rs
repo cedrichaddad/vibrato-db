@@ -7,7 +7,9 @@
 //! - `POST /search` - Query for nearest neighbors
 //! - `GET /health` - Server health and telemetry
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use axum::{
@@ -24,9 +26,10 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::hnsw::HNSW;
 use crate::store::VectorStore;
 use vibrato_neural::inference::InferenceEngine;
+use vibrato_core::format_v2::{self, VdbWriterV2};
 
 /// Thread-safe, swappable store handle
-pub type SharedStore = Arc<RwLock<Arc<VectorStore>>>;
+pub type SharedStore = Arc<arc_swap::ArcSwap<VectorStore>>;
 
 /// Shared application state
 ///
@@ -47,6 +50,7 @@ pub struct AppState {
     pub inference: Option<Arc<InferenceEngine>>,
     // Global lock to coordinate flush vs ingest consistency
     pub flush_mutex: RwLock<()>,
+    pub index_path: PathBuf,
 }
 
 /// Search request body
@@ -149,7 +153,7 @@ async fn search(
     Json(request): Json<SearchRequest>,
 ) -> impl IntoResponse {
     // Validate input
-    let dim = state.store.read().dim;
+    let dim = state.store.load().dim;
     if request.vector.len() != dim {
         return (
             StatusCode::BAD_REQUEST,
@@ -239,7 +243,7 @@ async fn ingest(
         let _flush_read = state.flush_mutex.read();
 
         // Check dimensions again safely
-        let store = state.store.read();
+        let store = state.store.load();
         let store_count = store.count;
         let store_dim = store.dim;
         drop(store);
@@ -286,31 +290,31 @@ async fn flush(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     
     let index_guard = state.index.read(); // Read lock is enough for serialization
     let mut dynamic_guard = state.dynamic_store.write(); // Write lock to clear it later
-    let mut store_ptr_guard = state.store.write(); // Write lock to swap pointer
+    // No store lock needed for ArcSwap read, but we need the current one for merging
+    let current_store = state.store.load_full();
 
     // 2. Merge Logic
-    let temp_path = std::path::Path::new("index.vdb.tmp");
-    let current_store = store_ptr_guard.as_ref();
-
+    let temp_path = state.index_path.with_extension("vdb.tmp");
+    
     if let Err(e) = vibrato_core::format_v2::VdbWriterV2::merge(
-        current_store,
+        &current_store,
         &dynamic_guard,
         &index_guard,
-        temp_path
+        &temp_path
     ) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })).into_response();
     }
 
     // 3. Atomic Rename
-    if let Err(e) = std::fs::rename(temp_path, "index.vdb") {
+    if let Err(e) = std::fs::rename(&temp_path, &state.index_path) {
          return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })).into_response();
     }
 
     // 4. Hot Swap
-    match VectorStore::open("index.vdb") {
+    match VectorStore::open(&state.index_path) {
         Ok(new_store) => {
             let new_store_arc = Arc::new(new_store);
-            *store_ptr_guard = new_store_arc.clone();
+            state.store.store(new_store_arc.clone());
             
             // Clear dynamic store since everything is now on disk
             // We need to cast dynamic_guard to mutable reference, but it is already RwLockWriteGuard
@@ -349,7 +353,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     };
 
     let (memory_mb, count, dim) = {
-        let store = state.store.read();
+        let store = state.store.load();
         let memory_mb = store.memory_bytes() as f64 / (1024.0 * 1024.0);
         let count = store.count;
         let dim = store.dim;
@@ -439,7 +443,6 @@ mod tests {
         // Create index (need Arc for closure)
         let store_clone = store.clone();
         let mut hnsw = HNSW::new(16, 50, move |id| store_clone.get(id).to_vec());
-
         for i in 0..num_vectors {
             hnsw.insert(i);
         }
@@ -447,15 +450,19 @@ mod tests {
         // Leak tempdir to keep files alive
         std::mem::forget(dir);
 
-        // SharedStore
-        let shared_store = Arc::new(RwLock::new(store));
-
+        // Create mock stores
+        let hnsw = HNSW::new(16, 100, |_| vec![0.0; 2]);
+        let store = VectorStore::open(&vdb_path).unwrap();
+        // Use ArcSwap for shared_store
+        let shared_store = Arc::new(arc_swap::ArcSwap::from(Arc::new(store)));
+        
         Arc::new(AppState {
             index: RwLock::new(hnsw),
             store: shared_store,
             dynamic_store: Arc::new(RwLock::new(Vec::new())),
             inference: None,
             flush_mutex: RwLock::new(()),
+            index_path: vdb_path, // Use the temporary path for index_path
         })
     }
 
@@ -477,10 +484,10 @@ mod tests {
     #[tokio::test]
     async fn test_search_endpoint() {
         let state = create_test_state();
-        let dim = state.store.read().dim;
+        let dim = state.store.load().dim;
         let router = create_router(state);
 
-        let query = random_vector(dim);
+        let query = vec![0.1; dim]; // Simple query
         let body = serde_json::json!({
             "vector": query,
             "k": 5

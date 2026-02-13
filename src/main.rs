@@ -19,6 +19,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use parking_lot::RwLock;
 use tracing_subscriber::EnvFilter;
+use arc_swap::ArcSwap;
 
 use vibrato_db::hnsw::HNSW;
 use vibrato_db::server::{serve, AppState, SearchRequest, SearchResponse, SharedStore};
@@ -147,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Loading vector data from {:?}", data);
             let store = Arc::new(VectorStore::open(&data)?);
             // Create SharedStore (Arc<RwLock<Arc<VectorStore>>>)
-            let shared_store = Arc::new(RwLock::new(store.clone()));
+            let shared_store = Arc::new(arc_swap::ArcSwap::from(store.clone()));
             tracing::info!(
                 "Loaded {} vectors of dimension {}",
                 store.count,
@@ -165,27 +166,29 @@ async fn main() -> anyhow::Result<()> {
             }));
 
             // Helper to create the combined vector accessor
-            let create_accessor = |store_handle: SharedStore, dynamic: Arc<RwLock<Vec<Vec<f32>>>>| {
+            fn create_accessor(
+                store_handle: SharedStore,
+                dynamic: Arc<RwLock<Vec<Vec<f32>>>>,
+            ) -> impl Fn(usize) -> Vec<f32> + Send + Sync + 'static {
                 move |id: usize| {
-                    // Acquire read lock on the pointer
-                    let store_guard = store_handle.read();
-                    let store = store_guard.as_ref();
+                    // optimized: wait-free read using ArcSwap
+                    let store_guard = store_handle.load();
                     
-                    if id < store.count as usize {
-                        store.get(id).to_vec()
+                    if id < store_guard.count {
+                        store_guard.get(id).to_vec()
                     } else {
-                        // Access dynamic store
-                        let offset = id - store.count as usize;
+                        let offset = id - store_guard.count;
                         let guard = dynamic.read();
                         if offset < guard.len() {
                             guard[offset].clone()
                         } else {
-                            // Should not happen if HNSW is consistent
-                             vec![0.0; store.dim] 
+                            // CRITICAL: Panic on data corruption
+                            panic!("CRITICAL: Vector ID {} is out of bounds (Store: {}, Dynamic: {})", 
+                                id, store_guard.count, guard.len());
                         }
                     }
                 }
-            };
+            }
 
             let hnsw = if let Some(index_path) = &index {
                 if index_path.exists() {
@@ -213,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
                     for i in 0..store.count as usize {
                          hnsw.insert(i);
                     }
-                    if let Some(path) = index {
+                    if let Some(path) = &index {
                         hnsw.save(path)?;
                     }
                     hnsw
@@ -228,12 +231,15 @@ async fn main() -> anyhow::Result<()> {
                  hnsw
             };
 
+            let effective_index_path = index.clone().unwrap_or_else(|| PathBuf::from("index.vdb"));
+
             let state = Arc::new(AppState {
                 index: RwLock::new(hnsw),
                 store: shared_store,
                 dynamic_store,
                 inference: Some(inference),
                 flush_mutex: RwLock::new(()),
+                index_path: effective_index_path,
             });
 
             let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
