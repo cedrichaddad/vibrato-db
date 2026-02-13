@@ -68,22 +68,14 @@ pub fn create_editor(
                     } else {
                         for result in results.iter() {
                             ui.group(|ui| {
-                                let label = ui.label(format!("Score: {:.2}", result.score));
-                                // Ghost Dragging implementation
-                                // We use dnd_drag_source with the path as payload
+                                let _label = ui.label(format!("Score: {:.2}", result.score));
+                                // Ghost Dragging removed in favor of reliable Copy Path
                                 if let Some(path_str) = result.path.to_str() {
-                                    let source_id = egui::Id::new(result.id);
-                                    let payload = path_str.to_string();
-                                    
-                                    ui.dnd_drag_source(source_id, payload, |ui| {
-                                        // The draggable item
-                                        if ui.button(format!("{:?}", result.path.file_name().unwrap_or_default()))
-                                            .on_hover_text("Drag to DAW")
-                                            .clicked() 
-                                        {
-                                            // Click handler (e.g. preview)
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{:?}", result.path.file_name().unwrap_or_default()));
+                                        if ui.button("Copy Path").clicked() {
+                                            ui.ctx().copy_text(path_str.to_string());
                                         }
-                                        ui.label(format!("Dragging {:?}", result.path.file_name().unwrap_or_default()));
                                     });
                                 }
                             });

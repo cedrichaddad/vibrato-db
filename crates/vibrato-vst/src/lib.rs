@@ -154,9 +154,16 @@ impl Plugin for VibratoPlugin {
                      // Optimization: Use write_chunk if available. 
                      // rtrb 0.3 should support write_chunk or push_chunk.
                      // Review suggested write_chunk.
-                     // Optimization: Use write_chunk_uninit if available. 
-                     if let Ok(mut chunk) = producer.write_chunk_uninit(channel.len()) {
-                         chunk.fill_from_iter(channel.iter().copied());
+                     // Optimization: Use write_chunk (init) to allow safe copy_from_slice
+                     if let Ok(mut chunk) = producer.write_chunk(channel.len()) {
+                         let (first, second) = chunk.as_mut_slices();
+                         // Copy to first
+                         let first_len = first.len();
+                         first.copy_from_slice(&channel[..first.len()]);
+                         // Copy to second if needed
+                         if !second.is_empty() {
+                             second.copy_from_slice(&channel[first.len()..]);
+                         }
                      } else {
                          // Full
                      }
