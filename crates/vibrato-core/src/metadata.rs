@@ -17,6 +17,7 @@
 
 use std::io::{self, Write};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -192,13 +193,36 @@ pub struct MetadataReader<'a> {
 }
 
 /// Parsed metadata for a single vector
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorMetadata {
     pub source_file: String,
     pub start_time_ms: u32,
     pub duration_ms: u16,
     pub bpm: f32,
     pub tags: Vec<String>,
+}
+
+impl VectorMetadata {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.source_file.is_empty()
+            && self.start_time_ms == 0
+            && self.duration_ms == 0
+            && self.bpm == 0.0
+            && self.tags.is_empty()
+    }
+}
+
+impl Default for VectorMetadata {
+    fn default() -> Self {
+        Self {
+            source_file: String::new(),
+            start_time_ms: 0,
+            duration_ms: 0,
+            bpm: 0.0,
+            tags: Vec::new(),
+        }
+    }
 }
 
 

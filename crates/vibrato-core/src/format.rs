@@ -100,6 +100,21 @@ pub struct VdbWriter {
 }
 
 impl VdbWriter {
+    #[inline]
+    fn write_f32_slice(writer: &mut impl Write, vector: &[f32]) -> Result<(), io::Error> {
+        #[cfg(target_endian = "little")]
+        {
+            writer.write_all(bytemuck::cast_slice(vector))
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            for &val in vector {
+                writer.write_all(&val.to_le_bytes())?;
+            }
+            Ok(())
+        }
+    }
+
     /// Create a new .vdb file writer
     pub fn new<P: AsRef<Path>>(path: P, dimensions: usize) -> Result<Self, FormatError> {
         let file = File::create(path)?;
@@ -128,10 +143,8 @@ impl VdbWriter {
             });
         }
 
-        // Write floats as little-endian bytes
-        for &val in vector {
-            self.writer.write_all(&val.to_le_bytes())?;
-        }
+        // Write full vector in one call (little-endian fast path on common targets)
+        Self::write_f32_slice(&mut self.writer, vector)?;
 
         self.count += 1;
         Ok(())

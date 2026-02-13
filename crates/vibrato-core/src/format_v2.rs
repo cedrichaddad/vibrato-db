@@ -29,6 +29,7 @@ use std::path::Path;
 
 use crate::store::VectorStore;
 use crate::hnsw::HNSW;
+use crate::metadata::{MetadataBuilder, VectorMetadata};
 
 use thiserror::Error;
 
@@ -65,6 +66,9 @@ pub enum FormatV2Error {
 
     #[error("Dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: usize, actual: usize },
+
+    #[error("Metadata count mismatch: expected {expected}, got {actual}")]
+    MetadataCountMismatch { expected: usize, actual: usize },
 
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
@@ -218,6 +222,21 @@ pub struct VdbWriterV2 {
 }
 
 impl VdbWriterV2 {
+    #[inline]
+    fn write_f32_slice(writer: &mut impl Write, vector: &[f32]) -> Result<(), io::Error> {
+        #[cfg(target_endian = "little")]
+        {
+            writer.write_all(bytemuck::cast_slice(vector))
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            for &val in vector {
+                writer.write_all(&val.to_le_bytes())?;
+            }
+            Ok(())
+        }
+    }
+
     /// Create a new V2 .vdb file writer for raw f32 vectors
     pub fn new_raw<P: AsRef<Path>>(path: P, dimensions: usize) -> Result<Self, FormatV2Error> {
         let file = File::create(path)?;
@@ -292,9 +311,7 @@ impl VdbWriterV2 {
             });
         }
 
-        for &val in vector {
-            self.writer.write_all(&val.to_le_bytes())?;
-        }
+        Self::write_f32_slice(&mut self.writer, vector)?;
         self.count += 1;
         Ok(())
     }
@@ -320,23 +337,40 @@ impl VdbWriterV2 {
     }
 
     /// Finalize the file, updating the header with actual counts
-    pub fn finish(mut self) -> Result<u32, FormatV2Error> {
+    pub fn finish(self) -> Result<u32, FormatV2Error> {
+        self.finish_with_sections(None, None)
+    }
+
+    /// Finalize the file with optional metadata and graph sections
+    pub fn finish_with_sections(
+        mut self,
+        metadata_offset: Option<u64>,
+        graph_offset: Option<u64>,
+    ) -> Result<u32, FormatV2Error> {
         self.writer.flush()?;
 
         // Seek back and rewrite header with final count
         let file = self.writer.get_mut();
         file.seek(io::SeekFrom::Start(0))?;
 
+        let mut flags = if self.pq_enabled { flags::PQ_ENABLED } else { 0 };
+        if metadata_offset.is_some() {
+            flags |= flags::HAS_METADATA;
+        }
+        if graph_offset.is_some() {
+            flags |= flags::HAS_GRAPH;
+        }
+
         let header = VdbHeaderV2 {
             version: 2,
-            flags: if self.pq_enabled { flags::PQ_ENABLED } else { 0 },
+            flags,
             count: self.count,
             dimensions: self.dimensions as u32,
             pq_subspaces: self.pq_subspaces,
             vectors_offset: HEADER_V2_SIZE as u64,
             codebook_offset: 0,
-            metadata_offset: 0,
-            graph_offset: 0,
+            metadata_offset: metadata_offset.unwrap_or(0),
+            graph_offset: graph_offset.unwrap_or(0),
         };
         file.write_all(&header.to_bytes())?;
         file.sync_all()?;
@@ -345,28 +379,8 @@ impl VdbWriterV2 {
     }
 
     /// Finalize the file with a graph section
-    pub fn finish_with_graph(mut self, graph_offset: u64) -> Result<u32, FormatV2Error> {
-        self.writer.flush()?;
-
-        // Seek back and rewrite header with final count
-        let file = self.writer.get_mut();
-        file.seek(io::SeekFrom::Start(0))?;
-
-        let header = VdbHeaderV2 {
-            version: 2,
-            flags: (if self.pq_enabled { flags::PQ_ENABLED } else { 0 }) | flags::HAS_GRAPH,
-            count: self.count,
-            dimensions: self.dimensions as u32,
-            pq_subspaces: self.pq_subspaces,
-            vectors_offset: HEADER_V2_SIZE as u64,
-            codebook_offset: 0,
-            metadata_offset: 0,
-            graph_offset,
-        };
-        file.write_all(&header.to_bytes())?;
-        file.sync_all()?;
-
-        Ok(self.count)
+    pub fn finish_with_graph(self, graph_offset: u64) -> Result<u32, FormatV2Error> {
+        self.finish_with_sections(None, Some(graph_offset))
     }
 
     /// Merge an existing Valid V2 store with new vectors and a graph
@@ -378,6 +392,27 @@ impl VdbWriterV2 {
         graph: &HNSW,
         path: &Path,
     ) -> Result<(), FormatV2Error> {
+        let metadata: Vec<VectorMetadata> =
+            vec![VectorMetadata::default(); base_store.count + new_vectors.len()];
+        Self::merge_with_metadata(base_store, new_vectors, &metadata, graph, path)
+    }
+
+    /// Merge an existing valid store with new vectors, metadata, and graph.
+    pub fn merge_with_metadata(
+        base_store: &VectorStore,
+        new_vectors: &[Vec<f32>],
+        metadata: &[VectorMetadata],
+        graph: &HNSW,
+        path: &Path,
+    ) -> Result<(), FormatV2Error> {
+        let expected_count = base_store.count + new_vectors.len();
+        if metadata.len() != expected_count {
+            return Err(FormatV2Error::MetadataCountMismatch {
+                expected: expected_count,
+                actual: metadata.len(),
+            });
+        }
+
         let mut writer = VdbWriterV2::new_raw(path, base_store.dim)?;
 
         // --- OPTIMIZATION: ZERO-COPY BLIT ---
@@ -395,12 +430,35 @@ impl VdbWriterV2 {
             writer.write_vector(vec)?;
         }
 
-        // 3. Serialize Graph
+        // 3. Serialize metadata section.
+        let mut metadata_builder = MetadataBuilder::new();
+        for item in metadata {
+            let tags: Vec<&str> = item.tags.iter().map(|s| s.as_str()).collect();
+            metadata_builder.add_entry(
+                &item.source_file,
+                item.start_time_ms,
+                item.duration_ms,
+                item.bpm,
+                &tags,
+            );
+        }
+
+        let metadata_offset = if metadata_builder.is_empty() {
+            None
+        } else {
+            let offset = writer.writer.stream_position()?;
+            metadata_builder
+                .write_to(&mut writer.writer)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Some(offset)
+        };
+
+        // 4. Serialize graph.
         let graph_offset = writer.writer.stream_position()?;
         graph.serialize(&mut writer.writer)?;
 
-        // 4. Finish (Updates Header with offsets)
-        writer.finish_with_graph(graph_offset)?;
+        // 5. Finish (updates header with section offsets)
+        writer.finish_with_sections(metadata_offset, Some(graph_offset))?;
         Ok(())
     }
 }

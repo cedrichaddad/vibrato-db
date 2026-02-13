@@ -4,13 +4,14 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use std::sync::Arc;
 use std::time::Duration;
 use vibrato_db::hnsw::HNSW;
 use vibrato_db::simd::l2_normalized;
 
-fn random_vector(dim: usize) -> Vec<f32> {
-    let mut rng = rand::thread_rng();
+fn random_vector(dim: usize, rng: &mut StdRng) -> Vec<f32> {
     let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect();
     l2_normalized(&v)
 }
@@ -24,7 +25,8 @@ fn bench_insert(c: &mut Criterion) {
 
     // Only test smaller sizes for insert (each iteration rebuilds index)
     for num_vectors in [100, 500, 1000] {
-        let vectors: Vec<_> = (0..num_vectors).map(|_| random_vector(128)).collect();
+        let mut rng = StdRng::seed_from_u64(1000 + num_vectors as u64);
+        let vectors: Vec<_> = (0..num_vectors).map(|_| random_vector(128, &mut rng)).collect();
         let vectors = Arc::new(vectors);
 
         group.bench_with_input(
@@ -33,7 +35,7 @@ fn bench_insert(c: &mut Criterion) {
             |b, &n| {
                 b.iter(|| {
                     let vectors = vectors.clone();
-                    let mut hnsw = HNSW::new(16, 100, move |id| vectors[id].clone());
+                    let mut hnsw = HNSW::new_with_seed(16, 100, move |id| vectors[id].clone(), 42);
                     for i in 0..n {
                         hnsw.insert(i);
                     }
@@ -49,11 +51,12 @@ fn bench_insert(c: &mut Criterion) {
 fn bench_search(c: &mut Criterion) {
     // Build index once (use smaller index for faster setup)
     let num_vectors = 5000;
-    let vectors: Vec<_> = (0..num_vectors).map(|_| random_vector(128)).collect();
+    let mut rng = StdRng::seed_from_u64(4242);
+    let vectors: Vec<_> = (0..num_vectors).map(|_| random_vector(128, &mut rng)).collect();
     let vectors = Arc::new(vectors);
 
     let vectors_clone = vectors.clone();
-    let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
+    let mut hnsw = HNSW::new_with_seed(16, 100, move |id| vectors_clone[id].clone(), 42);
     for i in 0..num_vectors {
         hnsw.insert(i);
     }
@@ -63,7 +66,8 @@ fn bench_search(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     for ef in [20, 50, 100] {
-        let query = random_vector(128);
+        let mut query_rng = StdRng::seed_from_u64(ef as u64 + 5000);
+        let query = random_vector(128, &mut query_rng);
 
         group.bench_with_input(BenchmarkId::from_parameter(ef), &ef, |b, &ef| {
             b.iter(|| black_box(hnsw.search(&query, 10, ef)))
@@ -75,4 +79,3 @@ fn bench_search(c: &mut Criterion) {
 
 criterion_group!(benches, bench_insert, bench_search);
 criterion_main!(benches);
-

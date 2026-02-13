@@ -41,16 +41,16 @@ pub struct InferenceEngine {
 }
 
 impl InferenceEngine {
-    /// Create a new inference engine
+    /// Create a new inference engine from pre-downloaded local model files.
     ///
-    /// Downloads models if missing.
-    pub fn new(_model_dir: &Path) -> Result<Self, InferenceError> {
-        let manager = ModelManager::new();
-        
-        // Ensure audio model is available
-        let audio_model_path = manager.get_clap_audio()?;
-        let text_model_path = manager.get_clap_text()?;
-        let tokenizer_path = manager.get_tokenizer()?;
+    /// This method is intentionally offline-only. Use `setup_models()` first.
+    pub fn new(model_dir: &Path) -> Result<Self, InferenceError> {
+        let manager = ModelManager::from_dir(model_dir.to_path_buf());
+
+        // Resolve artifacts without network side effects.
+        let audio_model_path = manager.get_clap_audio_offline()?;
+        let text_model_path = manager.get_clap_text_offline()?;
+        let tokenizer_path = manager.get_tokenizer_offline()?;
         
         // Initialize ORT environment (global)
         // We ignore error if already initialized
@@ -77,6 +77,13 @@ impl InferenceEngine {
             tokenizer: Arc::new(tokenizer),
             spectrogram: Arc::new(Spectrogram::new()),
         })
+    }
+
+    /// Explicitly download and stage all model artifacts in `model_dir`.
+    pub fn setup_models(model_dir: &Path) -> Result<(), InferenceError> {
+        let manager = ModelManager::from_dir(model_dir.to_path_buf());
+        manager.setup_models()?;
+        Ok(())
     }
 
     /// Embed an audio buffer

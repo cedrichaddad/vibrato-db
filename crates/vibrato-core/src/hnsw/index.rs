@@ -17,6 +17,8 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
 use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 use super::node::Node;
 use super::visited::VisitedGuard;
@@ -114,6 +116,9 @@ pub struct HNSW {
 
     /// Vector accessor function
     vectors: VectorAccessor,
+
+    /// RNG for layer assignment (stored to avoid per-insert thread RNG overhead)
+    rng: StdRng,
 }
 
 /// Type-erased vector accessor
@@ -130,6 +135,14 @@ impl HNSW {
     where
         F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
     {
+        Self::new_with_seed(m, ef_construction, vector_fn, rand::random())
+    }
+
+    /// Create a new HNSW index with deterministic RNG seed.
+    pub fn new_with_seed<F>(m: usize, ef_construction: usize, vector_fn: F, seed: u64) -> Self
+    where
+        F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
+    {
         Self {
             nodes: Vec::new(),
             id_to_index: HashMap::new(),
@@ -140,6 +153,7 @@ impl HNSW {
             ml: 1.0 / (m as f64).ln(),
             ef_construction,
             vectors: Box::new(vector_fn),
+            rng: StdRng::seed_from_u64(seed),
         }
     }
 
@@ -174,6 +188,7 @@ impl HNSW {
             ml,
             ef_construction,
             vectors: Box::new(vector_fn),
+            rng: StdRng::seed_from_u64(rand::random()),
         }
     }
 
@@ -216,9 +231,8 @@ impl HNSW {
     }
 
     /// Assign a random layer based on exponential distribution
-    fn random_layer(&self) -> usize {
-        let mut rng = rand::thread_rng();
-        let r: f64 = rng.gen();
+    fn random_layer(&mut self) -> usize {
+        let r: f64 = self.rng.gen();
         (-r.ln() * self.ml).floor() as usize
     }
 

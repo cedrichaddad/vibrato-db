@@ -11,7 +11,6 @@ import urllib.error
 SERVER_PORT = 8081
 DATA_DIR = "demo_data"
 VDB_FILE = os.path.join(DATA_DIR, "demo.vdb")
-IDX_FILE = os.path.join(DATA_DIR, "demo.idx")
 
 def setup():
     if not os.path.exists(DATA_DIR):
@@ -37,7 +36,6 @@ def start_server():
     proc = subprocess.Popen([
         "cargo", "run", "--quiet", "--release", "--", "serve",
         "--data", VDB_FILE,
-        "--index", IDX_FILE,
         "--port", str(SERVER_PORT),
         "--m", "16",
         "--ef-construction", "100"
@@ -74,14 +72,15 @@ def run_demo():
         if not wait_for_health(server_proc):
             return
             
-        # 1. Ingest Audio (Mock)
-        print("\n=== Ingesting Mock Audio ===")
-        dummy_audio = os.path.join(DATA_DIR, "track1.wav")
-        with open(dummy_audio, "w") as f:
-            f.write("dummy audio content")
-            
+        # 1. Ingest Vector
+        print("\n=== Ingesting Vector ===")
         ingest_payload = json.dumps({
-            "audio_path": dummy_audio
+            "vector": [0.1] * 512,
+            "metadata": {
+                "source_file": "demo_data/track1.wav",
+                "bpm": 120.0,
+                "tags": ["demo"]
+            }
         }).encode('utf-8')
         
         req = urllib.request.Request(

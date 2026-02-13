@@ -24,6 +24,8 @@ pub enum ModelError {
     ChecksumMismatch(PathBuf),
     #[error("Model directory not found")]
     DirectoryNotFound,
+    #[error("Required model file missing: {0}")]
+    ModelMissing(PathBuf),
 }
 
 pub struct ModelManager {
@@ -31,29 +33,46 @@ pub struct ModelManager {
 }
 
 impl ModelManager {
+    pub fn from_dir(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        fs::create_dir_all(&root).ok();
+        Self { root }
+    }
+
     pub fn new() -> Self {
         // 1. Check Env Var Override (Air-Gap Support)
         if let Ok(p) = std::env::var("VIBRATO_MODEL_DIR") {
-            return Self { root: PathBuf::from(p) };
+            return Self::from_dir(PathBuf::from(p));
         }
         
         // 2. Default to XDG Cache
         if let Some(dirs) = ProjectDirs::from("com", "vibrato", "vibrato") {
-            let root = dirs.cache_dir().join("models");
-            fs::create_dir_all(&root).ok();
-            Self { root }
+            Self::from_dir(dirs.cache_dir().join("models"))
         } else {
             // Fallback for weird systems
-            let root = PathBuf::from(".vibrato/models");
-            fs::create_dir_all(&root).ok();
-            Self { root }
+            Self::from_dir(PathBuf::from(".vibrato/models"))
         }
+    }
+
+    #[inline]
+    fn clap_audio_path(&self) -> PathBuf {
+        self.root.join("clap_audio.onnx")
+    }
+
+    #[inline]
+    fn clap_text_path(&self) -> PathBuf {
+        self.root.join("text_model.onnx")
+    }
+
+    #[inline]
+    fn tokenizer_path(&self) -> PathBuf {
+        self.root.join("tokenizer.json")
     }
 
     /// Ensure the CLAP Audio model exists and is verified.
     /// Returns the path to the model file.
     pub fn get_clap_audio(&self) -> Result<PathBuf, ModelError> {
-        let path = self.root.join("clap_audio.onnx");
+        let path = self.clap_audio_path();
         
         if path.exists() {
             tracing::info!("Found existing model at {:?}", path);
@@ -73,9 +92,19 @@ impl ModelManager {
         Ok(path)
     }
 
+    /// Return CLAP audio model path without network side effects.
+    pub fn get_clap_audio_offline(&self) -> Result<PathBuf, ModelError> {
+        let path = self.clap_audio_path();
+        if path.exists() {
+            Ok(path)
+        } else {
+            Err(ModelError::ModelMissing(path))
+        }
+    }
+
     /// Ensure the CLAP Text model exists.
     pub fn get_clap_text(&self) -> Result<PathBuf, ModelError> {
-        let path = self.root.join("text_model.onnx");
+        let path = self.clap_text_path();
         if path.exists() { return Ok(path); }
         
         tracing::info!("Downloading CLAP Text model to {:?}", path);
@@ -83,14 +112,42 @@ impl ModelManager {
         Ok(path)
     }
 
+    /// Return CLAP text model path without network side effects.
+    pub fn get_clap_text_offline(&self) -> Result<PathBuf, ModelError> {
+        let path = self.clap_text_path();
+        if path.exists() {
+            Ok(path)
+        } else {
+            Err(ModelError::ModelMissing(path))
+        }
+    }
+
     /// Ensure the Tokenizer exists.
     pub fn get_tokenizer(&self) -> Result<PathBuf, ModelError> {
-        let path = self.root.join("tokenizer.json");
+        let path = self.tokenizer_path();
         if path.exists() { return Ok(path); }
         
         tracing::info!("Downloading Tokenizer to {:?}", path);
         self.download_file(TOKENIZER_URL, &path)?;
         Ok(path)
+    }
+
+    /// Return tokenizer path without network side effects.
+    pub fn get_tokenizer_offline(&self) -> Result<PathBuf, ModelError> {
+        let path = self.tokenizer_path();
+        if path.exists() {
+            Ok(path)
+        } else {
+            Err(ModelError::ModelMissing(path))
+        }
+    }
+
+    /// Download and stage all required model artifacts.
+    pub fn setup_models(&self) -> Result<(), ModelError> {
+        let _ = self.get_clap_audio()?;
+        let _ = self.get_clap_text()?;
+        let _ = self.get_tokenizer()?;
+        Ok(())
     }
 
     fn download_file(&self, url: &str, dest: &Path) -> Result<(), ModelError> {
@@ -99,7 +156,7 @@ impl ModelManager {
              .build()
              .map_err(reqwest::Error::from)?;
              
-         let mut response = client.get(url).send()?;
+         let mut response = client.get(url).send()?.error_for_status()?;
          let mut file = File::create(dest)?;
          response.copy_to(&mut file)?;
          Ok(())

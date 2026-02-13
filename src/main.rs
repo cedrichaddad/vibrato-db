@@ -6,25 +6,28 @@
 //!
 //! ```bash
 //! # Start the server
-//! vibrato-db serve --data data.vdb --index index.idx --port 8080
+//! vibrato-db serve --data data.vdb --port 8080
 //!
 //! # Build an index from a .vdb file
 //! vibrato-db build --data data.vdb --output index.idx --m 16 --ef 100
+//!
+//! # Download inference models for /ingest audio_path
+//! vibrato-db setup-models --model-dir ./models
 //! ```
 
 use std::net::SocketAddr;
+use std::io::{BufReader, Read, Seek};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use parking_lot::RwLock;
 use tracing_subscriber::EnvFilter;
-use arc_swap::ArcSwap;
 
 use vibrato_db::hnsw::HNSW;
-use vibrato_db::server::{serve, AppState, SearchRequest, SearchResponse, SharedStore};
+use vibrato_db::server::{load_store_metadata, serve, AppState, SearchRequest, SearchResponse, SharedStore};
 use vibrato_db::store::VectorStore;
-use vibrato_db::format_v2::VdbWriterV2;
+use vibrato_db::format_v2::{VdbHeaderV2, VdbWriterV2};
 use vibrato_neural::inference::InferenceEngine;
 
 #[derive(Parser)]
@@ -122,6 +125,13 @@ enum Commands {
         #[arg(long, default_value = "50")]
         ef: usize,
     },
+
+    /// Download and verify inference models ahead of serving
+    SetupModels {
+        /// Model directory (defaults to ./models)
+        #[arg(long, default_value = "models")]
+        model_dir: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -157,89 +167,97 @@ async fn main() -> anyhow::Result<()> {
 
             // Create dynamic components
             let dynamic_store = Arc::new(RwLock::new(Vec::new()));
-            // Initialize Inference Engine (mock or real)
-            let model_dir = PathBuf::from("models"); // Default to local models dir
-            let inference = Arc::new(InferenceEngine::new(&model_dir).unwrap_or_else(|e| {
-                tracing::warn!("Failed to load inference engine: {}. Using mock.", e);
-                // Creating a dummy engine pointing to temp (which will fail nicely or fallback)
-                InferenceEngine::new(&std::env::temp_dir()).unwrap() 
-            }));
+            let dynamic_metadata = Arc::new(RwLock::new(Vec::new()));
+            let persisted_metadata = Arc::new(arc_swap::ArcSwap::from(Arc::new(
+                load_store_metadata(&store),
+            )));
 
-            // Helper to create the combined vector accessor
-            fn create_accessor(
-                store_handle: SharedStore,
-                dynamic: Arc<RwLock<Vec<Vec<f32>>>>,
-            ) -> impl Fn(usize) -> Vec<f32> + Send + Sync + 'static {
-                move |id: usize| {
-                    // optimized: wait-free read using ArcSwap
-                    let store_guard = store_handle.load();
-                    
-                    if id < store_guard.count {
-                        store_guard.get(id).to_vec()
-                    } else {
-                        let offset = id - store_guard.count;
-                        let guard = dynamic.read();
-                        if offset < guard.len() {
-                            guard[offset].clone()
-                        } else {
-                            // CRITICAL: Panic on data corruption
-                            panic!("CRITICAL: Vector ID {} is out of bounds (Store: {}, Dynamic: {})", 
-                                id, store_guard.count, guard.len());
-                        }
-                    }
-                }
+            if index.is_some() {
+                tracing::warn!(
+                    "`--index` is deprecated. Use a single .vdb at `--data`; `--index` is used only as fallback input."
+                );
             }
 
-            let hnsw = if let Some(index_path) = &index {
+            // Initialize Inference Engine. Startup stays online for search even if models are missing.
+            let model_dir = PathBuf::from("models"); // Default to local models dir
+            let inference = match InferenceEngine::new(&model_dir) {
+                Ok(engine) => {
+                    tracing::info!("Inference engine loaded from {:?}", model_dir);
+                    Some(Arc::new(engine))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Inference engine unavailable: {}. Server will run in search-only mode.",
+                        e
+                    );
+                    None
+                }
+            };
+
+            let mut hnsw = if let Some(hnsw) = try_load_graph_from_vdb(
+                &data,
+                create_accessor(shared_store.clone(), dynamic_store.clone()),
+            )? {
+                let stats = hnsw.stats();
+                tracing::info!(
+                    "Loaded graph from V2 container: {} nodes, {} layers",
+                    stats.num_nodes,
+                    stats.max_layer + 1
+                );
+                hnsw
+            } else if let Some(index_path) = &index {
                 if index_path.exists() {
-                    tracing::info!("Loading index from {:?}", index_path);
+                    tracing::info!("Loading legacy index from {:?}", index_path);
                     let accessor = create_accessor(shared_store.clone(), dynamic_store.clone());
                     let hnsw = HNSW::load(index_path, accessor)?;
-                    
                     let stats = hnsw.stats();
                     tracing::info!(
-                        "Index loaded: {} nodes, {} layers",
+                        "Legacy index loaded: {} nodes, {} layers",
                         stats.num_nodes,
                         stats.max_layer + 1
                     );
                     hnsw
                 } else {
-                    tracing::info!("Index not found, building new index...");
-                    // We need to build using the combined accessor, though dynamic is empty now.
+                    tracing::info!("No persisted graph found, building index...");
                     let accessor = create_accessor(shared_store.clone(), dynamic_store.clone());
-                    // Build logic adapted to use accessor
-                    // But build_index helper uses &VectorStore. We should inline or refactor.
-                    // For simplicity, we assume we are building from just the static store initially
-                    // BUT we must supply the *final* accessor that supports dynamic growth.
-                    // HNSW::new takes the accessor.
                     let mut hnsw = HNSW::new(m, ef_construction, accessor);
                     for i in 0..store.count as usize {
-                         hnsw.insert(i);
-                    }
-                    if let Some(path) = &index {
-                        hnsw.save(path)?;
+                        hnsw.insert(i);
                     }
                     hnsw
                 }
             } else {
-                tracing::info!("No index path specified, building in-memory index...");
+                tracing::info!("No persisted graph found, building index...");
                 let accessor = create_accessor(shared_store.clone(), dynamic_store.clone());
                 let mut hnsw = HNSW::new(m, ef_construction, accessor);
-                 for i in 0..store.count as usize {
-                     hnsw.insert(i);
-                 }
-                 hnsw
+                for i in 0..store.count as usize {
+                    hnsw.insert(i);
+                }
+                hnsw
             };
 
-            let effective_index_path = index.clone().unwrap_or_else(|| PathBuf::from("index.vdb"));
+            if let Err(err) = validate_graph_bounds(&hnsw, store.count) {
+                tracing::warn!(
+                    "Persisted graph failed integrity check ({}). Rebuilding from vectors.",
+                    err
+                );
+                hnsw = build_hnsw_from_store(
+                    store.count,
+                    m,
+                    ef_construction,
+                    create_accessor(shared_store.clone(), dynamic_store.clone()),
+                );
+            }
 
             let state = Arc::new(AppState {
                 index: RwLock::new(hnsw),
                 store: shared_store,
                 dynamic_store,
-                inference: Some(inference),
+                persisted_metadata,
+                dynamic_metadata,
+                inference,
                 flush_mutex: RwLock::new(()),
-                index_path: effective_index_path,
+                data_path: data.clone(),
             });
 
             let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
@@ -253,14 +271,14 @@ async fn main() -> anyhow::Result<()> {
             ef_construction,
         } => {
             tracing::info!("Loading vector data from {:?}", data);
-            let store = VectorStore::open(&data)?;
+            let store = Arc::new(VectorStore::open(&data)?);
             tracing::info!(
                 "Loaded {} vectors of dimension {}",
                 store.count,
                 store.dim
             );
 
-            let hnsw = build_index(&store, m, ef_construction, Some(&output))?;
+            let hnsw = build_index(store, m, ef_construction, Some(&output))?;
             let stats = hnsw.stats();
             tracing::info!(
                 "Index built: {} nodes, {} layers, {} edges",
@@ -357,29 +375,126 @@ async fn main() -> anyhow::Result<()> {
                 println!("  ID: {}, Score: {:.4}", res.id, res.score);
             }
         }
+
+        Commands::SetupModels { model_dir } => {
+            tracing::info!("Setting up models in {:?}", model_dir);
+            InferenceEngine::setup_models(&model_dir)?;
+            println!("Models downloaded and verified in {:?}", model_dir);
+        }
     }
 
     Ok(())
 }
 
+fn create_accessor(
+    store_handle: SharedStore,
+    dynamic: Arc<RwLock<Vec<Vec<f32>>>>,
+) -> impl Fn(usize) -> Vec<f32> + Send + Sync + 'static {
+    move |id: usize| {
+        let store_guard = store_handle.load();
+        if id < store_guard.count {
+            store_guard.get(id).to_vec()
+        } else {
+            let offset = id - store_guard.count;
+            let guard = dynamic.read();
+            if offset < guard.len() {
+                guard[offset].clone()
+            } else {
+                tracing::error!(
+                    "Vector ID {} out of bounds (store={}, dynamic={})",
+                    id,
+                    store_guard.count,
+                    guard.len()
+                );
+                vec![0.0; store_guard.dim]
+            }
+        }
+    }
+}
+
+fn build_hnsw_from_store<F>(
+    count: usize,
+    m: usize,
+    ef_construction: usize,
+    vector_fn: F,
+) -> HNSW
+where
+    F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
+{
+    let mut hnsw = HNSW::new(m, ef_construction, vector_fn);
+    for i in 0..count {
+        hnsw.insert(i);
+    }
+    hnsw
+}
+
+fn validate_graph_bounds(hnsw: &HNSW, max_id_exclusive: usize) -> anyhow::Result<()> {
+    if let Some(entry) = hnsw.entry_point {
+        if entry >= max_id_exclusive {
+            anyhow::bail!(
+                "entry_point {} out of bounds for {} vectors",
+                entry,
+                max_id_exclusive
+            );
+        }
+    }
+
+    for node in &hnsw.nodes {
+        if node.id >= max_id_exclusive {
+            anyhow::bail!(
+                "node id {} out of bounds for {} vectors",
+                node.id,
+                max_id_exclusive
+            );
+        }
+
+        for neighbors in &node.layers {
+            for &neighbor in neighbors {
+                if neighbor >= max_id_exclusive {
+                    anyhow::bail!(
+                        "neighbor id {} out of bounds for {} vectors",
+                        neighbor,
+                        max_id_exclusive
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn try_load_graph_from_vdb<F>(path: &PathBuf, vector_fn: F) -> anyhow::Result<Option<HNSW>>
+where
+    F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
+{
+    let mut file = std::fs::File::open(path)?;
+    let mut header_bytes = [0u8; 64];
+    if file.read_exact(&mut header_bytes).is_err() {
+        return Ok(None);
+    }
+
+    let Ok(header) = VdbHeaderV2::from_bytes(&header_bytes) else {
+        return Ok(None);
+    };
+    if !header.has_graph() || header.graph_offset == 0 {
+        return Ok(None);
+    }
+
+    file.seek(std::io::SeekFrom::Start(header.graph_offset))?;
+    let mut reader = BufReader::new(file);
+    let hnsw = HNSW::load_from_reader(&mut reader, vector_fn)?;
+    Ok(Some(hnsw))
+}
+
 fn build_index(
-    store: &VectorStore,
+    store: Arc<VectorStore>,
     m: usize,
     ef_construction: usize,
     save_path: Option<&PathBuf>,
 ) -> anyhow::Result<HNSW> {
-    // We need to copy vectors to a Vec since HNSW needs owned vectors
-    // In a real implementation, you'd use Arc<VectorStore> or similar
-    let vectors: Vec<Vec<f32>> = (0..store.count)
-        .map(|i| store.get(i).to_vec())
-        .collect();
-
-    let vectors = Arc::new(vectors);
-    let vectors_for_hnsw = vectors.clone();
-
-    let mut hnsw = HNSW::new(m, ef_construction, move |id| {
-        vectors_for_hnsw[id].clone()
-    });
+    let store_for_hnsw = store.clone();
+    let mut hnsw = HNSW::new(m, ef_construction, move |id| store_for_hnsw.get(id).to_vec());
 
     let total = store.count;
     let progress_interval = (total / 100).max(1);
