@@ -109,14 +109,15 @@ impl InferenceEngine {
             // So this should be correct.
             let input_value = Value::from_array((input_shape, mel_spec.into_raw_vec()))?;
             
-            // 3. Run Inference
-            let mut session = session.lock().unwrap();
-            let outputs = session.run(inputs![input_value])?;
-            
-            // 4. Extract and Normalize
-            // Output is usually [Batch, Dim] e.g. [1, 512]
-            let embedding_tensor = outputs[0].try_extract_tensor::<f32>()?;
-            let embedding: Vec<f32> = embedding_tensor.1.to_vec();
+            // 3. Inference with Panic Safety
+            // If the model crashes (e.g. shape mismatch), we don't want to kill the worker thread.
+            let embedding = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut session = session.lock().unwrap();
+                let outputs = session.run(inputs![input_value])?;
+                let embedding_tensor = outputs[0].try_extract_tensor::<f32>()?;
+                Ok::<Vec<f32>, InferenceError>(embedding_tensor.1.to_vec())
+            }))
+            .map_err(|_| InferenceError::Other("Inference panicked".to_string()))??;
             
             Ok(normalize(&embedding))
         }).await?
@@ -170,13 +171,14 @@ impl InferenceEngine {
             let input_ids_val = Value::from_array((shape.clone(), input_ids))?;
             let attention_mask_val = Value::from_array((shape, attention_mask))?;
 
-            // 2. Inference
-            let mut session = session.lock().unwrap();
-            let outputs = session.run(inputs![input_ids_val, attention_mask_val])?;
-
-            // 3. Extract & Normalize
-            let embedding_tensor = outputs[0].try_extract_tensor::<f32>()?;
-            let embedding: Vec<f32> = embedding_tensor.1.to_vec();
+            // 2. Inference with Panic Safety
+            let embedding = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut session = session.lock().unwrap();
+                let outputs = session.run(inputs![input_ids_val, attention_mask_val])?;
+                let embedding_tensor = outputs[0].try_extract_tensor::<f32>()?;
+                Ok::<Vec<f32>, InferenceError>(embedding_tensor.1.to_vec())
+            }))
+            .map_err(|_| InferenceError::Other("Inference panicked".to_string()))??;
             
             Ok(normalize(&embedding))
         }).await?

@@ -27,6 +27,9 @@ use std::fs::File;
 use std::io::{self, BufWriter, Seek, Write};
 use std::path::Path;
 
+use crate::store::VectorStore;
+use crate::hnsw::HNSW;
+
 use thiserror::Error;
 
 /// Magic bytes identifying a V2 .vdb file: "VIBDB002"
@@ -339,6 +342,66 @@ impl VdbWriterV2 {
         file.sync_all()?;
 
         Ok(self.count)
+    }
+
+    /// Finalize the file with a graph section
+    pub fn finish_with_graph(mut self, graph_offset: u64) -> Result<u32, FormatV2Error> {
+        self.writer.flush()?;
+
+        // Seek back and rewrite header with final count
+        let file = self.writer.get_mut();
+        file.seek(io::SeekFrom::Start(0))?;
+
+        let header = VdbHeaderV2 {
+            version: 2,
+            flags: (if self.pq_enabled { flags::PQ_ENABLED } else { 0 }) | flags::HAS_GRAPH,
+            count: self.count,
+            dimensions: self.dimensions as u32,
+            pq_subspaces: self.pq_subspaces,
+            vectors_offset: HEADER_V2_SIZE as u64,
+            codebook_offset: 0,
+            metadata_offset: 0,
+            graph_offset,
+        };
+        file.write_all(&header.to_bytes())?;
+        file.sync_all()?;
+
+        Ok(self.count)
+    }
+
+    /// Merge an existing Valid V2 store with new vectors and a graph
+    ///
+    /// This performs a ZERO-COPY blit of the old vectors.
+    pub fn merge(
+        base_store: &VectorStore,
+        new_vectors: &[Vec<f32>],
+        graph: &HNSW,
+        path: &Path,
+    ) -> Result<(), FormatV2Error> {
+        let mut writer = VdbWriterV2::new_raw(path, base_store.dim)?;
+
+        // --- OPTIMIZATION: ZERO-COPY BLIT ---
+        // 1. Copy old vectors directly from raw mmap bytes
+        // We trust the base_store is valid.
+        let old_vector_bytes_len = base_store.count * base_store.dim * std::mem::size_of::<f32>();
+        let old_bytes_slice = &base_store.mmap[
+            base_store.data_offset .. base_store.data_offset + old_vector_bytes_len
+        ];
+        writer.writer.write_all(old_bytes_slice)?;
+        writer.count += base_store.count as u32;
+
+        // 2. Append new vectors
+        for vec in new_vectors {
+            writer.write_vector(vec)?;
+        }
+
+        // 3. Serialize Graph
+        let graph_offset = writer.writer.stream_position()?;
+        graph.serialize(&mut writer.writer)?;
+
+        // 4. Finish (Updates Header with offsets)
+        writer.finish_with_graph(graph_offset)?;
+        Ok(())
     }
 }
 

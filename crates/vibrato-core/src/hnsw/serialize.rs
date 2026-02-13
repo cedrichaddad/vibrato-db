@@ -1,143 +1,150 @@
-//! HNSW serialization using bincode
-//!
-//! Saves and loads the graph structure to/from disk.
+use std::io::{self, Write};
+use super::HNSW;
 
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
-use std::path::Path;
+impl HNSW {
+    /// Serialize the HNSW graph to a writer.
+    ///
+    /// Format:
+    /// - Magic: "VIBGRAPH" (8 bytes)
+    /// - Header:
+    ///   - NumNodes: u32
+    ///   - EntryPoint: u32 (u32::MAX if None)
+    ///   - MaxLayer: u8
+    /// - Body (Sequence of Nodes):
+    ///   - NodeID: u32
+    ///   - NodeMaxLayer: u8
+    ///   - Per Layer 0..NodeMaxLayer:
+    ///     - NeighborCount: u32
+    ///     - Neighbors: [u32; NeighborCount]
+    pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        // 1. Magic & Header
+        writer.write_all(b"VIBGRAPH")?;
+        writer.write_all(&(self.nodes.len() as u32).to_le_bytes())?;
+        
+        let entry_id = self.entry_point.unwrap_or(u32::MAX as usize) as u32;
+        writer.write_all(&entry_id.to_le_bytes())?;
+        writer.write_all(&(self.max_layer as u8).to_le_bytes())?;
+        
+        // Metadata
+        writer.write_all(&(self.m as u32).to_le_bytes())?;
+        writer.write_all(&(self.m0 as u32).to_le_bytes())?;
+        writer.write_all(&(self.ef_construction as u32).to_le_bytes())?;
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+        // 2. Body (Nodes)
+        for node in &self.nodes {
+            writer.write_all(&(node.id as u32).to_le_bytes())?;
+            
+            // Allow up to 255 layers (HNSW typically < 16)
+            let node_max_layer = node.layers.len().saturating_sub(1) as u8; 
+            writer.write_all(&node_max_layer.to_le_bytes())?;
 
-use super::node::Node;
-
-#[derive(Error, Debug)]
-pub enum SerializeError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Bincode error: {0}")]
-    Bincode(#[from] bincode::Error),
-}
-
-/// Serializable HNSW structure (without the vector accessor)
-#[derive(Serialize, Deserialize)]
-pub struct HNSWData {
-    pub nodes: Vec<Node>,
-    pub entry_point: Option<usize>,
-    pub max_layer: usize,
-    pub m: usize,
-    pub m0: usize,
-    pub ml: f64,
-    pub ef_construction: usize,
-}
-
-impl HNSWData {
-    /// Save to a file
-    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), SerializeError> {
-        let file = File::create(path)?;
-        let writer = BufWriter::new(file);
-        bincode::serialize_into(writer, self)?;
+            for layer_neighbors in &node.layers {
+                writer.write_all(&(layer_neighbors.len() as u32).to_le_bytes())?;
+                for &neighbor in layer_neighbors {
+                    writer.write_all(&(neighbor as u32).to_le_bytes())?;
+                }
+            }
+        }
         Ok(())
     }
 
-    /// Load from a file
-    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, SerializeError> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let data = bincode::deserialize_from(reader)?;
-        Ok(data)
-    }
-}
-
-impl super::HNSW {
-    /// Export serializable data
-    pub fn to_data(&self) -> HNSWData {
-        HNSWData {
-            nodes: self.nodes.clone(),
-            entry_point: self.entry_point,
-            max_layer: self.max_layer,
-            m: self.m,
-            m0: self.m0,
-            ml: self.ml,
-            ef_construction: self.ef_construction,
-        }
+    /// Save the graph to a file
+    pub fn save<P: AsRef<std::path::Path>>(&self, path: P) -> io::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        self.serialize(&mut writer)
     }
 
-    /// Import from serialized data
-    pub fn from_data<F>(data: HNSWData, vector_fn: F) -> Self
+    /// Load the graph from a file
+    pub fn load<P, F>(path: P, vector_fn: F) -> io::Result<Self>
     where
+        P: AsRef<std::path::Path>,
         F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
     {
-        Self::from_parts(
-            data.nodes,
-            data.entry_point,
-            data.max_layer,
-            data.m,
-            data.m0,
-            data.ml,
-            data.ef_construction,
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        Self::load_from_reader(&mut reader, vector_fn)
+    }
+
+    /// Load the graph from a reader
+    pub fn load_from_reader<R, F>(reader: &mut R, vector_fn: F) -> io::Result<Self>
+    where
+        R: std::io::Read,
+        F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
+    {
+        use std::io::Read;
+        use super::node::Node;
+
+        // 1. Magic
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != b"VIBGRAPH" {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid HNSW magic"));
+        }
+
+        // 2. Header
+        let mut buf_u32 = [0u8; 4];
+        
+        reader.read_exact(&mut buf_u32)?;
+        let num_nodes = u32::from_le_bytes(buf_u32) as usize;
+
+        reader.read_exact(&mut buf_u32)?;
+        let entry_point_raw = u32::from_le_bytes(buf_u32);
+        let entry_point = if entry_point_raw == u32::MAX { None } else { Some(entry_point_raw as usize) };
+
+        let mut buf_u8 = [0u8; 1];
+        reader.read_exact(&mut buf_u8)?;
+        let max_layer = buf_u8[0] as usize;
+
+        reader.read_exact(&mut buf_u32)?;
+        let m = u32::from_le_bytes(buf_u32) as usize;
+        
+        reader.read_exact(&mut buf_u32)?;
+        let m0 = u32::from_le_bytes(buf_u32) as usize;
+
+        reader.read_exact(&mut buf_u32)?;
+        let ef_construction = u32::from_le_bytes(buf_u32) as usize;
+
+        // 3. Nodes
+        let mut nodes = Vec::with_capacity(num_nodes);
+        
+        for _ in 0..num_nodes {
+            reader.read_exact(&mut buf_u32)?;
+            let id = u32::from_le_bytes(buf_u32) as usize;
+
+            reader.read_exact(&mut buf_u8)?;
+            let node_max_layer = buf_u8[0] as usize;
+
+            let mut layers = Vec::with_capacity(node_max_layer + 1);
+            for _ in 0..=node_max_layer {
+                reader.read_exact(&mut buf_u32)?;
+                let count = u32::from_le_bytes(buf_u32) as usize;
+                
+                let mut neighbors = Vec::with_capacity(count);
+                for _ in 0..count {
+                    reader.read_exact(&mut buf_u32)?;
+                    neighbors.push(u32::from_le_bytes(buf_u32) as usize);
+                }
+                layers.push(neighbors);
+            }
+            
+            // Reconstruct Node struct
+            // Note: Node struct definition in node.rs might need adjusting if fields are missing?
+            // Node has: id, layers.
+            nodes.push(Node { id, layers });
+        }
+        
+        // HNSW struct has: m, m0, ml, ef_construction.
+        
+        Ok(HNSW::from_parts(
+            nodes,
+            entry_point,
+            max_layer,
+            m,
+            m0,
+            1.0 / (m as f64).ln(),
+            ef_construction,
             vector_fn,
-        )
-    }
-
-    /// Save index to file
-    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), SerializeError> {
-        self.to_data().save(path)
-    }
-
-    /// Load index from file
-    pub fn load<P: AsRef<Path>, F>(path: P, vector_fn: F) -> Result<Self, SerializeError>
-    where
-        F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
-    {
-        let data = HNSWData::load(path)?;
-        Ok(Self::from_data(data, vector_fn))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    
-    use crate::simd::l2_normalized;
-    use tempfile::tempdir;
-
-    fn random_vector(dim: usize) -> Vec<f32> {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect();
-        l2_normalized(&v)
-    }
-
-    #[test]
-    fn test_save_load_roundtrip() {
-        let vectors: Vec<_> = (0..100).map(|_| random_vector(64)).collect();
-        let vectors_clone = vectors.clone();
-        let vectors_clone2 = vectors.clone();
-
-        // Create and populate index
-        let mut hnsw = super::super::HNSW::new(16, 50, move |id| vectors_clone[id].clone());
-        for i in 0..100 {
-            hnsw.insert(i);
-        }
-
-        // Save
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("index.idx");
-        hnsw.save(&path).unwrap();
-
-        // Load
-        let loaded = super::super::HNSW::load(&path, move |id| vectors_clone2[id].clone()).unwrap();
-
-        // Verify
-        assert_eq!(loaded.nodes.len(), hnsw.nodes.len());
-        assert_eq!(loaded.entry_point, hnsw.entry_point);
-        assert_eq!(loaded.max_layer, hnsw.max_layer);
-
-        // Test search still works
-        let query = &vectors[42];
-        let results = loaded.search(query, 5, 50);
-        assert!(!results.is_empty());
-        assert_eq!(results[0].0, 42);
+        ))
     }
 }

@@ -21,7 +21,7 @@ use parking_lot::RwLock;
 use tracing_subscriber::EnvFilter;
 
 use vibrato_db::hnsw::HNSW;
-use vibrato_db::server::{serve, AppState, SearchRequest, SearchResponse};
+use vibrato_db::server::{serve, AppState, SearchRequest, SearchResponse, SharedStore};
 use vibrato_db::store::VectorStore;
 use vibrato_db::format_v2::VdbWriterV2;
 use vibrato_neural::inference::InferenceEngine;
@@ -146,6 +146,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             tracing::info!("Loading vector data from {:?}", data);
             let store = Arc::new(VectorStore::open(&data)?);
+            // Create SharedStore (Arc<RwLock<Arc<VectorStore>>>)
+            let shared_store = Arc::new(RwLock::new(store.clone()));
             tracing::info!(
                 "Loaded {} vectors of dimension {}",
                 store.count,
@@ -163,10 +165,13 @@ async fn main() -> anyhow::Result<()> {
             }));
 
             // Helper to create the combined vector accessor
-            let create_accessor = |store: Arc<VectorStore>, dynamic: Arc<RwLock<Vec<Vec<f32>>>>| {
+            let create_accessor = |store_handle: SharedStore, dynamic: Arc<RwLock<Vec<Vec<f32>>>>| {
                 move |id: usize| {
+                    // Acquire read lock on the pointer
+                    let store_guard = store_handle.read();
+                    let store = store_guard.as_ref();
+                    
                     if id < store.count as usize {
-                        // Access mmap store (zero-copy-ish, strictly we need owned Vec for HNSW currently)
                         store.get(id).to_vec()
                     } else {
                         // Access dynamic store
@@ -185,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
             let hnsw = if let Some(index_path) = &index {
                 if index_path.exists() {
                     tracing::info!("Loading index from {:?}", index_path);
-                    let accessor = create_accessor(store.clone(), dynamic_store.clone());
+                    let accessor = create_accessor(shared_store.clone(), dynamic_store.clone());
                     let hnsw = HNSW::load(index_path, accessor)?;
                     
                     let stats = hnsw.stats();
@@ -198,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     tracing::info!("Index not found, building new index...");
                     // We need to build using the combined accessor, though dynamic is empty now.
-                    let accessor = create_accessor(store.clone(), dynamic_store.clone());
+                    let accessor = create_accessor(shared_store.clone(), dynamic_store.clone());
                     // Build logic adapted to use accessor
                     // But build_index helper uses &VectorStore. We should inline or refactor.
                     // For simplicity, we assume we are building from just the static store initially
@@ -215,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             } else {
                 tracing::info!("No index path specified, building in-memory index...");
-                let accessor = create_accessor(store.clone(), dynamic_store.clone());
+                let accessor = create_accessor(shared_store.clone(), dynamic_store.clone());
                 let mut hnsw = HNSW::new(m, ef_construction, accessor);
                  for i in 0..store.count as usize {
                      hnsw.insert(i);
@@ -225,9 +230,10 @@ async fn main() -> anyhow::Result<()> {
 
             let state = Arc::new(AppState {
                 index: RwLock::new(hnsw),
-                store,
+                store: shared_store,
                 dynamic_store,
-                inference,
+                inference: Some(inference),
+                flush_mutex: RwLock::new(()),
             });
 
             let addr: SocketAddr = format!("{}:{}", host, port).parse()?;

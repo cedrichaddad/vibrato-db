@@ -94,10 +94,15 @@ impl ModelManager {
     }
 
     fn download_file(&self, url: &str, dest: &Path) -> Result<(), ModelError> {
-        let mut response = reqwest::blocking::get(url)?;
-        let mut file = File::create(dest)?;
-        response.copy_to(&mut file)?;
-        Ok(())
+         let client = reqwest::blocking::Client::builder()
+             .timeout(std::time::Duration::from_secs(30))
+             .build()
+             .map_err(reqwest::Error::from)?;
+             
+         let mut response = client.get(url).send()?;
+         let mut file = File::create(dest)?;
+         response.copy_to(&mut file)?;
+         Ok(())
     }
 
     pub fn verify_hash(path: &Path, expected: &str) -> Result<bool, ModelError> {

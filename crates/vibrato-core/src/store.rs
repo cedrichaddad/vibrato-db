@@ -34,13 +34,13 @@ pub enum StoreError {
 /// Memory-mapped vector store providing zero-copy access to .vdb files
 pub struct VectorStore {
     /// The memory-mapped file
-    mmap: Mmap,
+    pub(crate) mmap: Mmap,
     /// Number of vectors in the store
     pub count: usize,
     /// Dimensionality of each vector
     pub dim: usize,
     /// Byte offset where vector data begins
-    data_offset: usize,
+    pub(crate) data_offset: usize,
 }
 
 impl VectorStore {

@@ -25,6 +25,9 @@ use crate::hnsw::HNSW;
 use crate::store::VectorStore;
 use vibrato_neural::inference::InferenceEngine;
 
+/// Thread-safe, swappable store handle
+pub type SharedStore = Arc<RwLock<Arc<VectorStore>>>;
+
 /// Shared application state
 ///
 /// # Concurrency Model
@@ -38,10 +41,12 @@ use vibrato_neural::inference::InferenceEngine;
 /// This favors read-heavy workloads (typical for vector search).
 pub struct AppState {
     pub index: RwLock<HNSW>,
-    pub store: Arc<VectorStore>,
+    pub store: SharedStore,
     // Dynamic ingestion support: in-memory buffer for new vectors
     pub dynamic_store: Arc<RwLock<Vec<Vec<f32>>>>,
-    pub inference: Arc<InferenceEngine>,
+    pub inference: Option<Arc<InferenceEngine>>,
+    // Global lock to coordinate flush vs ingest consistency
+    pub flush_mutex: RwLock<()>,
 }
 
 /// Search request body
@@ -144,13 +149,14 @@ async fn search(
     Json(request): Json<SearchRequest>,
 ) -> impl IntoResponse {
     // Validate input
-    if request.vector.len() != state.store.dim {
+    let dim = state.store.read().dim;
+    if request.vector.len() != dim {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: format!(
                     "Dimension mismatch: expected {}, got {}",
-                    state.store.dim,
+                    dim,
                     request.vector.len()
                 ),
             }),
@@ -206,13 +212,20 @@ async fn ingest(
         let vector = if let Some(vec) = payload.vector {
             vec
         } else if let Some(path_str) = payload.audio_path {
-            let path = std::path::Path::new(&path_str);
-            match state.inference.embed_audio_file(path).await {
-                Ok(vec) => vec,
-                Err(e) => return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+            if let Some(inference) = &state.inference {
+                let path = std::path::Path::new(&path_str);
+                match inference.embed_audio_file(path).await {
+                    Ok(vec) => vec,
+                    Err(e) => return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(IngestResponse { id: 0, vector_dim: 0 }),
+                    ).into_response(),
+                }
+            } else {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
                     Json(IngestResponse { id: 0, vector_dim: 0 }),
-                ).into_response(),
+                ).into_response();
             }
         } else {
             return (
@@ -221,17 +234,24 @@ async fn ingest(
             ).into_response();
         };
 
-        if vector.len() != state.store.dim {
+        // 2. Append to dynamic store (write lock)
+        // Ensure consistency with flush: if flush is running, we wait.
+        let _flush_read = state.flush_mutex.read();
+
+        // Check dimensions again safely
+        let store = state.store.read();
+        let store_count = store.count;
+        let store_dim = store.dim;
+        drop(store);
+
+        if vector.len() != store_dim {
              return (
                 StatusCode::BAD_REQUEST,
                 Json(IngestResponse { id: 0, vector_dim: 0 }),
             ).into_response();
         }
 
-        let dim = vector.len();
-
-        // 2. Append to dynamic store (write lock)
-        let id_offset = state.store.count as usize;
+        let id_offset = store_count as usize;
         let mut dynamic = state.dynamic_store.write();
         let current_dynamic_count = dynamic.len();
         let new_id = id_offset + current_dynamic_count;
@@ -246,12 +266,79 @@ async fn ingest(
             StatusCode::CREATED,
             Json(IngestResponse {
                 id: new_id,
-                vector_dim: dim,
+                vector_dim: store_dim,
             }),
         ).into_response()
     };
     
     ingest(State(state), Json(request)).await
+}
+
+/// POST /flush - Persist in-memory index to disk
+///
+/// 1. Takes write locks to stop the world.
+/// 2. Merges static + dynamic stores to new file.
+/// 3. Atomically swaps file and reloads store.
+async fn flush(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // 1. Acquire Locks (Global Flush Lock -> Dynamic -> Index -> Store)
+    // We take flush_mutex (write) to ensure no ingests are running or starting.
+    let _flush_guard = state.flush_mutex.write();
+    
+    let index_guard = state.index.read(); // Read lock is enough for serialization
+    let mut dynamic_guard = state.dynamic_store.write(); // Write lock to clear it later
+    let mut store_ptr_guard = state.store.write(); // Write lock to swap pointer
+
+    // 2. Merge Logic
+    let temp_path = std::path::Path::new("index.vdb.tmp");
+    let current_store = store_ptr_guard.as_ref();
+
+    if let Err(e) = vibrato_core::format_v2::VdbWriterV2::merge(
+        current_store,
+        &dynamic_guard,
+        &index_guard,
+        temp_path
+    ) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })).into_response();
+    }
+
+    // 3. Atomic Rename
+    if let Err(e) = std::fs::rename(temp_path, "index.vdb") {
+         return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })).into_response();
+    }
+
+    // 4. Hot Swap
+    match VectorStore::open("index.vdb") {
+        Ok(new_store) => {
+            let new_store_arc = Arc::new(new_store);
+            *store_ptr_guard = new_store_arc.clone();
+            
+            // Clear dynamic store since everything is now on disk
+            // We need to cast dynamic_guard to mutable reference, but it is already RwLockWriteGuard
+            // But wait, dynamic_guard is immutable binding.
+            // Wait, clear() requires mutable access.
+            // dynamic_guard implements DerefMut.
+            // So we need `let mut dynamic_guard = ...`
+            // But I used `let dynamic_guard`.
+            // I need to fix that line in Step 1.
+            
+            // Actually, since I can't edit previous lines in this tool call easily without context overlap, 
+            // I'll rely on Rust's mutability rules or fix it below.
+            // Rust: RwLockWriteGuard implies mutable access to inner. 
+            // `dynamic_store.write()` returns guard. The guard itself doesn't need to be mut binding to call methods on inner? 
+            // Yes it does: `impl DerefMut for RwLockWriteGuard`. `Vec::clear` takes `&mut self`.
+            // So `*dynamic_guard` yields `&mut Vec`.
+            // `dynamic_guard` variable binding needs to serve `DerefMut`.
+            // `let mut dynamic` is strictly correct but often `dynamic.clear()` works if method receiver takes strict `&mut`.
+            // But `DerefMut` requires `&mut self` on guard? No, `offset` method on pointer.
+            // `WriteGuard` implements `DerefMut`. You can call mutable methods on the data it protects.
+            // You only need `mut guard` if you want to mutate the guard itself (e.g. swap it).
+            // Calling `clear` on the Vec inside doesn't require `mut guard`.
+            dynamic_guard.clear();
+            
+            (StatusCode::OK, Json(serde_json::json!({ "status": "flushed", "vectors": new_store_arc.count }))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })).into_response(),
+    }
 }
 
 /// GET /health - Server health and telemetry
@@ -261,17 +348,23 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         index.stats()
     };
 
-    let memory_mb = state.store.memory_bytes() as f64 / (1024.0 * 1024.0);
+    let (memory_mb, count, dim) = {
+        let store = state.store.read();
+        let memory_mb = store.memory_bytes() as f64 / (1024.0 * 1024.0);
+        let count = store.count;
+        let dim = store.dim;
+        (memory_mb, count, dim)
+    };
 
     let response = HealthResponse {
         status: "ok".to_string(),
-        vectors_loaded: state.store.count,
+        vectors_loaded: count,
         index_layers: stats.max_layer + 1,
         memory_mb,
         config: IndexConfig {
             m: stats.m,
             ef_construction: stats.ef_construction,
-            dimensions: state.store.dim,
+            dimensions: dim,
         },
     };
 
@@ -288,6 +381,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/search", post(search))
         .route("/ingest", post(ingest))
+        .route("/flush", post(flush))
         .route("/health", get(health))
         .layer(cors)
         .with_state(state)
@@ -353,11 +447,15 @@ mod tests {
         // Leak tempdir to keep files alive
         std::mem::forget(dir);
 
+        // SharedStore
+        let shared_store = Arc::new(RwLock::new(store));
+
         Arc::new(AppState {
             index: RwLock::new(hnsw),
-            store,
+            store: shared_store,
             dynamic_store: Arc::new(RwLock::new(Vec::new())),
-            inference: Arc::new(InferenceEngine::new(std::path::Path::new(".")).unwrap()),
+            inference: None,
+            flush_mutex: RwLock::new(()),
         })
     }
 
@@ -379,7 +477,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_endpoint() {
         let state = create_test_state();
-        let dim = state.store.dim;
+        let dim = state.store.read().dim;
         let router = create_router(state);
 
         let query = random_vector(dim);
