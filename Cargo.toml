@@ -4,6 +4,7 @@ members = [
     "crates/vibrato-core",
     "crates/vibrato-neural",
     "crates/vibrato-ffi",
+    "crates/vibrato-vst",
 ]
 
 [workspace.package]

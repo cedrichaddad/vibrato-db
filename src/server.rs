@@ -221,7 +221,7 @@ async fn ingest(
                 match inference.embed_audio_file(path).await {
                     Ok(vec) => vec,
                     Err(e) => return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        StatusCode::UNPROCESSABLE_ENTITY, // 422 for bad audio/inference failure
                         Json(IngestResponse { id: 0, vector_dim: 0 }),
                     ).into_response(),
                 }
@@ -317,26 +317,6 @@ async fn flush(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             state.store.store(new_store_arc.clone());
             
             // Clear dynamic store since everything is now on disk
-            // We need to cast dynamic_guard to mutable reference, but it is already RwLockWriteGuard
-            // But wait, dynamic_guard is immutable binding.
-            // Wait, clear() requires mutable access.
-            // dynamic_guard implements DerefMut.
-            // So we need `let mut dynamic_guard = ...`
-            // But I used `let dynamic_guard`.
-            // I need to fix that line in Step 1.
-            
-            // Actually, since I can't edit previous lines in this tool call easily without context overlap, 
-            // I'll rely on Rust's mutability rules or fix it below.
-            // Rust: RwLockWriteGuard implies mutable access to inner. 
-            // `dynamic_store.write()` returns guard. The guard itself doesn't need to be mut binding to call methods on inner? 
-            // Yes it does: `impl DerefMut for RwLockWriteGuard`. `Vec::clear` takes `&mut self`.
-            // So `*dynamic_guard` yields `&mut Vec`.
-            // `dynamic_guard` variable binding needs to serve `DerefMut`.
-            // `let mut dynamic` is strictly correct but often `dynamic.clear()` works if method receiver takes strict `&mut`.
-            // But `DerefMut` requires `&mut self` on guard? No, `offset` method on pointer.
-            // `WriteGuard` implements `DerefMut`. You can call mutable methods on the data it protects.
-            // You only need `mut guard` if you want to mutate the guard itself (e.g. swap it).
-            // Calling `clear` on the Vec inside doesn't require `mut guard`.
             dynamic_guard.clear();
             
             (StatusCode::OK, Json(serde_json::json!({ "status": "flushed", "vectors": new_store_arc.count }))).into_response()
