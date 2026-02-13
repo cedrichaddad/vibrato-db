@@ -7,6 +7,8 @@ use directories::ProjectDirs;
 use std::sync::Arc;
 use rtrb::Consumer;
 use std::time::Duration;
+use std::collections::HashMap;
+use std::fs::File;
 
 use crate::commands::{GuiCommand, WorkerResponse, SearchResult};
 
@@ -16,11 +18,12 @@ pub struct VibratoWorker {
     audio_consumer: Consumer<f32>,
     engine: Option<InferenceEngine>, 
     searcher: Option<(Arc<VectorStore>, HNSW)>,
+    metadata: HashMap<usize, PathBuf>,
 }
 
 impl VibratoWorker {
     pub fn new(rx: Receiver<GuiCommand>, tx: Sender<WorkerResponse>, audio_consumer: Consumer<f32>) -> Self {
-        Self { receiver: rx, sender: tx, audio_consumer, engine: None, searcher: None }
+        Self { receiver: rx, sender: tx, audio_consumer, engine: None, searcher: None, metadata: HashMap::new() }
     }
 
     pub fn spawn(self) {
@@ -101,14 +104,30 @@ impl VibratoWorker {
             match InferenceEngine::new(&model_dir) {
                 Ok(engine) => {
                     self.engine = Some(engine);
-                    self.report_progress(1.0);
+                    self.report_progress(0.8);
                 }
                  Err(e) => {
                      // Non-fatal, we just can't do inference
                      self.report_status(&format!("AI Error: {}", e));
                  }
             }
-    
+
+            // Load Metadata
+            self.report_status("Loading Metadata...");
+            let meta_path = data_dir.join("metadata.json");
+            if let Ok(file) = File::open(&meta_path) {
+                if let Ok(meta) = serde_json::from_reader(file) {
+                    self.metadata = meta;
+                }
+            }
+            // Populate mock metadata if empty (for demo/testing)
+            if self.metadata.is_empty() {
+                 self.metadata.insert(0, PathBuf::from("/mock/snare_01.wav"));
+                 self.metadata.insert(1, PathBuf::from("/mock/kick_02.wav"));
+                 self.metadata.insert(2, PathBuf::from("/mock/hat_03.wav"));
+            }
+            self.report_progress(1.0);
+
             self.report_status("Ready");
             
             // 2. Event Loop
@@ -161,8 +180,10 @@ impl VibratoWorker {
                     let results = hnsw.search(&vec, 10, 64); // k=10, ef=64
                     
                     let mapped_results: Vec<SearchResult> = results.into_iter().map(|(id, score)| {
-                         // Mocking path retrieval for now as I need to verify Store API
-                         let path = PathBuf::from(format!("/mock/result_{}.wav", id));
+                         // Use Metadata Store
+                         let path = self.metadata.get(&id).cloned().unwrap_or_else(|| {
+                             PathBuf::from(format!("/unknown/id_{}", id))
+                         });
                          SearchResult { id, path, score }
                     }).collect();
                     

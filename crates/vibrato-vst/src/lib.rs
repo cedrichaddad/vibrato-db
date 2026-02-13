@@ -28,6 +28,7 @@ pub struct VibratoPlugin {
     current_results: Arc<RwLock<Vec<SearchResult>>>,
     status_msg: Arc<RwLock<String>>,
     progress: Arc<RwLock<f32>>,
+    search_text: Arc<RwLock<String>>,
 }
 
 #[derive(Params)]
@@ -60,6 +61,7 @@ impl Default for VibratoPlugin {
             current_results: Arc::new(RwLock::new(Vec::new())),
             status_msg: Arc::new(RwLock::new("Initializing...".to_string())),
             progress: Arc::new(RwLock::new(0.0)),
+            search_text: Arc::new(RwLock::new(String::new())),
         }
     }
 }
@@ -148,10 +150,15 @@ impl Plugin for VibratoPlugin {
                  // Let's take the first channel if available.
                  if !channel.is_empty() {
                      // Write chunk to ring buffer
-                     // push_chunk fails to compile, using simple loop for scaffolding
-                     for sample in channel.iter() {
-                         if producer.is_full() { break; }
-                         let _ = producer.push(*sample);
+                     // Write chunk to ring buffer
+                     // Optimization: Use write_chunk if available. 
+                     // rtrb 0.3 should support write_chunk or push_chunk.
+                     // Review suggested write_chunk.
+                     // Optimization: Use write_chunk_uninit if available. 
+                     if let Ok(mut chunk) = producer.write_chunk_uninit(channel.len()) {
+                         chunk.fill_from_iter(channel.iter().copied());
+                     } else {
+                         // Full
                      }
                      // Note: If we are stereo, we might be pushing only Left.
                      // If we overwrite, we might skip samples. 
@@ -171,6 +178,7 @@ impl Plugin for VibratoPlugin {
             self.current_results.clone(),
             self.status_msg.clone(),
             self.progress.clone(),
+            self.search_text.clone(),
             self.job_sender.clone(),
             self.result_receiver.clone(),
         )

@@ -12,6 +12,7 @@ pub fn create_editor(
     current_results: Arc<RwLock<Vec<SearchResult>>>,
     status_msg: Arc<RwLock<String>>,
     progress: Arc<RwLock<f32>>,
+    search_text: Arc<RwLock<String>>,
     job_sender: Sender<GuiCommand>,
     result_receiver: Receiver<WorkerResponse>,
 ) -> Option<Box<dyn Editor>> {
@@ -46,24 +47,15 @@ pub fn create_editor(
 
                 // Search Bar
                 ui.horizontal(|ui| {
-                     // We need a place to store the search text. 
-                     // Since this closure is called every frame, we can't store it here easily 
-                     // unless we use egui's memory or move a mutable string into the closure.
-                     // But the closure is `FnMut`, so we can capture a RefCell or similar?
-                     // Or just use a static/global for now, or use `ui.data()`
-                     // A simple hack for now: Use `egui::TextEdit` with a persistent ID string?
-                     // "SearchText" is the ID.
-                     let mut search_text = ui.memory(|mem| mem.data.get_temp::<String>(egui::Id::new("search_text"))).unwrap_or_default();
+                     let mut text = search_text.write();
                      
-                     if ui.text_edit_singleline(&mut search_text).lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                         job_sender.send(GuiCommand::SearchText(search_text.clone())).ok();
+                     if ui.text_edit_singleline(&mut *text).lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                         job_sender.send(GuiCommand::SearchText(text.clone())).ok();
                      }
                      
                      if ui.button("Search").clicked() {
-                         job_sender.send(GuiCommand::SearchText(search_text.clone())).ok();
+                         job_sender.send(GuiCommand::SearchText(text.clone())).ok();
                      }
-                     
-                     ui.memory_mut(|mem| mem.data.insert_temp(egui::Id::new("search_text"), search_text));
                 });
                 
                 ui.separator();
