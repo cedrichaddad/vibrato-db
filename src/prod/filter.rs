@@ -342,19 +342,32 @@ impl BitmapSet {
 
 #[derive(Debug, Clone, Default)]
 pub struct FilterIndex {
-    pub tags: HashMap<String, BitmapSet>,
+    pub tag_ids: HashMap<String, u32>,
+    pub tag_bitmaps: HashMap<u32, BitmapSet>,
+    pub next_tag_id: u32,
     pub bpm_buckets: BTreeMap<i32, BitmapSet>,
     pub bpm_values: HashMap<usize, f32>,
 }
 
 impl FilterIndex {
+    fn intern_tag(&mut self, tag: &str) -> u32 {
+        if let Some(existing) = self.tag_ids.get(tag) {
+            return *existing;
+        }
+        let id = self.next_tag_id;
+        self.next_tag_id = self.next_tag_id.saturating_add(1);
+        self.tag_ids.insert(tag.to_string(), id);
+        id
+    }
+
     pub fn add(&mut self, vector_id: usize, metadata: &VectorMetadata) {
         for tag in &metadata.tags {
             let key = tag.trim().to_ascii_lowercase();
             if key.is_empty() {
                 continue;
             }
-            let entry = self.tags.entry(key).or_default();
+            let tag_id = self.intern_tag(&key);
+            let entry = self.tag_bitmaps.entry(tag_id).or_default();
             entry.insert(vector_id);
         }
 
@@ -372,7 +385,12 @@ impl FilterIndex {
         if !filter.tags_all.is_empty() {
             for tag in &filter.tags_all {
                 let t = tag.trim().to_ascii_lowercase();
-                let bm = self.tags.get(&t).cloned().unwrap_or_default();
+                let bm = self
+                    .tag_ids
+                    .get(&t)
+                    .and_then(|id| self.tag_bitmaps.get(id))
+                    .cloned()
+                    .unwrap_or_default();
                 allow = Some(match allow {
                     Some(curr) => curr.intersect(&bm),
                     None => bm,
@@ -384,8 +402,10 @@ impl FilterIndex {
             let mut any_union = BitmapSet::default();
             for tag in &filter.tags_any {
                 let t = tag.trim().to_ascii_lowercase();
-                if let Some(bm) = self.tags.get(&t) {
-                    any_union.union_with(bm);
+                if let Some(tag_id) = self.tag_ids.get(&t) {
+                    if let Some(bm) = self.tag_bitmaps.get(tag_id) {
+                        any_union.union_with(bm);
+                    }
                 }
             }
             allow = Some(match allow {

@@ -238,3 +238,97 @@ fn compaction_activation_is_atomic_for_output_and_inputs() {
         1
     );
 }
+
+#[test]
+fn pending_wal_replay_is_lsn_ordered() {
+    let dir = tempdir().expect("tempdir");
+    let config = test_config(dir.path().join("catalog_protocol_lsn"));
+    bootstrap_data_dirs(&config).expect("bootstrap dirs");
+
+    let catalog = SqliteCatalog::open(&config.catalog_path()).expect("open catalog");
+    let collection = catalog
+        .ensure_collection(&config.collection_name, config.dim)
+        .expect("ensure collection");
+
+    for i in 0..8usize {
+        let meta = VectorMetadata {
+            source_file: format!("lsn-{}.wav", i),
+            start_time_ms: i as u32,
+            duration_ms: 100,
+            bpm: 100.0 + i as f32,
+            tags: vec!["order".to_string()],
+        };
+        catalog
+            .ingest_wal(
+                &collection.id,
+                i,
+                &[i as f32, 1.0 - (i as f32 / 10.0)],
+                &meta,
+                Some(&format!("lsn-key-{}", i)),
+            )
+            .expect("ingest wal");
+    }
+
+    let pending = catalog
+        .pending_wal_after_lsn(&collection.id, 0)
+        .expect("pending wal");
+    assert!(pending.len() >= 8);
+    for pair in pending.windows(2) {
+        assert!(
+            pair[0].lsn <= pair[1].lsn,
+            "WAL replay order must be monotonic by lsn"
+        );
+    }
+}
+
+#[test]
+fn ingest_transaction_rolls_back_on_constraint_failure() {
+    let dir = tempdir().expect("tempdir");
+    let config = test_config(dir.path().join("catalog_protocol_atomic"));
+    bootstrap_data_dirs(&config).expect("bootstrap dirs");
+
+    let catalog = SqliteCatalog::open(&config.catalog_path()).expect("open catalog");
+    let collection = catalog
+        .ensure_collection(&config.collection_name, config.dim)
+        .expect("ensure collection");
+
+    let first = VectorMetadata {
+        source_file: "first.wav".to_string(),
+        start_time_ms: 0,
+        duration_ms: 100,
+        bpm: 120.0,
+        tags: vec!["drums".to_string()],
+    };
+    catalog
+        .ingest_wal(&collection.id, 7, &[0.1, 0.2], &first, Some("atomic-1"))
+        .expect("first ingest");
+
+    let second = VectorMetadata {
+        source_file: "second.wav".to_string(),
+        start_time_ms: 10,
+        duration_ms: 120,
+        bpm: 121.0,
+        tags: vec!["snare".to_string()],
+    };
+    let err = catalog
+        .ingest_wal(&collection.id, 7, &[0.3, 0.4], &second, Some("atomic-2"))
+        .expect_err("duplicate vector_id should fail");
+    assert!(
+        err.to_string().to_ascii_lowercase().contains("constraint"),
+        "expected constraint error, got: {err}"
+    );
+
+    let wal = catalog
+        .pending_wal_after_lsn(&collection.id, 0)
+        .expect("pending wal");
+    assert_eq!(wal.len(), 1, "failed ingest must not append WAL row");
+    assert_eq!(wal[0].vector_id, 7);
+    assert_eq!(wal[0].metadata.source_file, "first.wav");
+
+    let metadata = catalog
+        .fetch_all_metadata(&collection.id)
+        .expect("fetch all metadata");
+    assert_eq!(metadata.len(), 1, "failed ingest must not write metadata");
+    assert_eq!(metadata[0].0, 7);
+    assert_eq!(metadata[0].1.source_file, "first.wav");
+}

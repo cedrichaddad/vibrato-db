@@ -76,20 +76,15 @@ async fn v2_ingest(
             resp
         }
         Err(e) => {
-            let resp = error_response(
-                StatusCode::BAD_REQUEST,
-                &request_id,
-                "bad_request",
-                e.to_string(),
-                None,
-            );
+            let (status, code) = classify_ingest_error(&e);
+            let resp = error_response(status, &request_id, code, e.to_string(), None);
             audit_best_effort(
                 &state,
                 &request_id,
                 auth.as_deref(),
                 "/v2/vectors",
                 "ingest",
-                400,
+                status.as_u16(),
                 started.elapsed().as_secs_f64() * 1000.0,
                 serde_json::json!({"error": e.to_string()}),
             );
@@ -139,20 +134,15 @@ async fn v2_query(
             resp
         }
         Err(e) => {
-            let resp = error_response(
-                StatusCode::BAD_REQUEST,
-                &request_id,
-                "bad_request",
-                e.to_string(),
-                None,
-            );
+            let (status, code) = classify_query_error(&e);
+            let resp = error_response(status, &request_id, code, e.to_string(), None);
             audit_best_effort(
                 &state,
                 &request_id,
                 auth.as_deref(),
                 "/v2/query",
                 "query",
-                400,
+                status.as_u16(),
                 started.elapsed().as_secs_f64() * 1000.0,
                 serde_json::json!({"error": e.to_string()}),
             );
@@ -629,6 +619,33 @@ fn error_response(
         details,
     };
     json_response(status, request_id, &payload)
+}
+
+fn classify_ingest_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
+    let msg = err.to_string();
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("dimension mismatch") {
+        return (StatusCode::BAD_REQUEST, "bad_request");
+    }
+    if lower.contains("unique constraint failed") || lower.contains("constraint failed") {
+        return (StatusCode::CONFLICT, "conflict");
+    }
+    if lower.contains("sqlite query failed") || lower.contains("sqlite exec failed") {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "storage_error");
+    }
+    (StatusCode::BAD_REQUEST, "bad_request")
+}
+
+fn classify_query_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
+    let msg = err.to_string();
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("dimension mismatch") {
+        return (StatusCode::BAD_REQUEST, "bad_request");
+    }
+    if lower.contains("sqlite query failed") || lower.contains("sqlite exec failed") {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "storage_error");
+    }
+    (StatusCode::BAD_REQUEST, "bad_request")
 }
 
 fn new_request_id() -> String {

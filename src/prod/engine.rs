@@ -96,6 +96,7 @@ pub struct ProductionState {
 
     pub hot_vectors: Arc<RwLock<HashMap<usize, Vec<f32>>>>,
     pub hot_index: Arc<RwLock<HNSW>>,
+    pub metadata_cache: Arc<RwLock<HashMap<usize, VectorMetadata>>>,
     pub segments: ArcSwap<Vec<Arc<SegmentHandle>>>,
     pub archive_segments: ArcSwap<Vec<Arc<ArchivePqSegment>>>,
     pub filter_index: Arc<RwLock<FilterIndex>>,
@@ -155,6 +156,7 @@ impl ProductionState {
             config.hnsw_ef_construction,
             hot_accessor,
         )));
+        let metadata_cache = Arc::new(RwLock::new(HashMap::new()));
         let (audit_tx, audit_rx) = sync_channel(4096);
         let available = std::thread::available_parallelism()
             .map(|v| v.get())
@@ -177,6 +179,7 @@ impl ProductionState {
             recovery_report: RwLock::new("initializing".to_string()),
             hot_vectors,
             hot_index,
+            metadata_cache,
             segments: ArcSwap::from_pointee(Vec::new()),
             archive_segments: ArcSwap::from_pointee(Vec::new()),
             filter_index: Arc::new(RwLock::new(FilterIndex::default())),
@@ -227,6 +230,9 @@ impl ProductionState {
     pub fn insert_hot_vector(&self, vector_id: usize, vector: Vec<f32>, metadata: VectorMetadata) {
         self.hot_vectors.write().insert(vector_id, vector);
         self.hot_index.write().insert(vector_id);
+        self.metadata_cache
+            .write()
+            .insert(vector_id, metadata.clone());
         self.filter_index.write().add(vector_id, &metadata);
     }
 
@@ -244,40 +250,19 @@ impl ProductionState {
             ));
         }
 
-        let mut last_conflict: Option<anyhow::Error> = None;
-        for _ in 0..8 {
-            let next_id = self.catalog.next_vector_id(&self.collection.id)?;
-            match self.catalog.ingest_wal(
-                &self.collection.id,
-                next_id,
-                vector,
-                metadata,
-                idempotency_key,
-            ) {
-                Ok(ingest) => {
-                    if ingest.created {
-                        self.insert_hot_vector(ingest.vector_id, vector.to_vec(), metadata.clone());
-                        self.metrics
-                            .ingest_total
-                            .fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    return Ok((ingest.vector_id, ingest.created));
-                }
-                Err(err) if is_vector_id_conflict(&err) => {
-                    last_conflict = Some(err);
-                    continue;
-                }
-                Err(err) => return Err(err),
-            }
+        let ingest = self.catalog.ingest_wal_atomic(
+            &self.collection.id,
+            vector,
+            metadata,
+            idempotency_key,
+        )?;
+        if ingest.created {
+            self.insert_hot_vector(ingest.vector_id, vector.to_vec(), metadata.clone());
+            self.metrics
+                .ingest_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
         }
-
-        let conflict = last_conflict
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown conflict".to_string());
-        Err(anyhow!(
-            "ingest failed after vector_id contention retries: {}",
-            conflict
-        ))
+        Ok((ingest.vector_id, ingest.created))
     }
 
     pub fn query(&self, request: &QueryRequestV2) -> Result<QueryResponseV2> {
@@ -366,13 +351,52 @@ impl ProductionState {
             }
         }
 
-        let mut merged: Vec<(usize, f32)> = best.into_iter().collect();
+        #[derive(Clone, Copy)]
+        struct MinScore {
+            id: usize,
+            score: f32,
+        }
+        impl PartialEq for MinScore {
+            fn eq(&self, other: &Self) -> bool {
+                self.score == other.score
+            }
+        }
+        impl Eq for MinScore {}
+        impl PartialOrd for MinScore {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for MinScore {
+            fn cmp(&self, other: &Self) -> Ordering {
+                // Reverse for min-heap behavior.
+                other
+                    .score
+                    .partial_cmp(&self.score)
+                    .unwrap_or(Ordering::Equal)
+            }
+        }
+
+        let mut heap = std::collections::BinaryHeap::with_capacity(request.k + 1);
+        for (id, score) in best {
+            if heap.len() < request.k {
+                heap.push(MinScore { id, score });
+            } else if let Some(worst) = heap.peek() {
+                if score > worst.score {
+                    heap.pop();
+                    heap.push(MinScore { id, score });
+                }
+            }
+        }
+
+        let mut merged = Vec::with_capacity(heap.len());
+        while let Some(entry) = heap.pop() {
+            merged.push((entry.id, entry.score));
+        }
         merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-        merged.truncate(request.k);
 
         let metadata_map = if request.include_metadata {
-            self.catalog
-                .fetch_metadata(&merged.iter().map(|(id, _)| *id).collect::<Vec<_>>())?
+            self.metadata_for_ids(&merged.iter().map(|(id, _)| *id).collect::<Vec<_>>())?
         } else {
             HashMap::new()
         };
@@ -497,7 +521,9 @@ impl ProductionState {
     pub fn checkpoint_once(&self) -> Result<JobResponseV2> {
         let _guard = self.checkpoint_lock.lock().unwrap();
         let job_id = make_id("chk");
-        let pending = self.catalog.pending_wal(&self.collection.id, 50_000)?;
+        let mut pending = self.catalog.pending_wal(&self.collection.id, 50_000)?;
+        // Deterministic replay/build order across restarts.
+        pending.sort_by_key(|e| e.lsn);
         if pending.is_empty() {
             return Ok(JobResponseV2 {
                 job_id,
@@ -906,7 +932,9 @@ impl ProductionState {
     }
 
     pub fn rebuild_hot_from_pending(&self) -> Result<()> {
-        let pending = self.catalog.pending_wal_after_lsn(&self.collection.id, 0)?;
+        let mut pending = self.catalog.pending_wal_after_lsn(&self.collection.id, 0)?;
+        // Enforce LSN order even if upstream query ordering changes.
+        pending.sort_by_key(|e| e.lsn);
         {
             let mut hv = self.hot_vectors.write();
             hv.clear();
@@ -933,11 +961,48 @@ impl ProductionState {
     pub fn rebuild_filter_index(&self) -> Result<()> {
         let entries = self.catalog.fetch_all_metadata(&self.collection.id)?;
         let mut index = FilterIndex::default();
+        let mut metadata_cache = HashMap::with_capacity(entries.len());
         for (id, meta) in entries {
             index.add(id, &meta);
+            metadata_cache.insert(id, meta);
         }
         *self.filter_index.write() = index;
+        *self.metadata_cache.write() = metadata_cache;
         Ok(())
+    }
+
+    fn metadata_for_ids(&self, ids: &[usize]) -> Result<HashMap<usize, VectorMetadata>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut out = HashMap::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        {
+            let cache = self.metadata_cache.read();
+            for id in ids {
+                if let Some(meta) = cache.get(id) {
+                    out.insert(*id, meta.clone());
+                } else {
+                    missing.push(*id);
+                }
+            }
+        }
+
+        if !missing.is_empty() {
+            let fetched = self.catalog.fetch_metadata(&missing)?;
+            if !fetched.is_empty() {
+                let mut cache = self.metadata_cache.write();
+                for (id, meta) in &fetched {
+                    cache.insert(*id, meta.clone());
+                }
+            }
+            for (id, meta) in fetched {
+                out.insert(id, meta);
+            }
+        }
+
+        Ok(out)
     }
 
     pub fn gc_obsolete_segment_files(&self) -> Result<usize> {
@@ -1650,13 +1715,6 @@ fn current_unix_ts() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn is_vector_id_conflict(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("UNIQUE constraint failed")
-        && (msg.contains("wal_entries.collection_id, wal_entries.vector_id")
-            || msg.contains("vector_metadata.vector_id"))
 }
 
 #[cfg(test)]

@@ -52,14 +52,9 @@ pub fn create_snapshot(
     let snapshot_segments_dir = snapshot_dir.join("segments");
     std::fs::create_dir_all(&snapshot_segments_dir)?;
 
-    let catalog_src = config.catalog_path();
     let catalog_dst = snapshot_dir.join("catalog.sqlite3");
-    std::fs::copy(&catalog_src, &catalog_dst).with_context(|| {
-        format!(
-            "copying catalog snapshot from {:?} to {:?}",
-            catalog_src, catalog_dst
-        )
-    })?;
+    // Use SQLite-native snapshot to avoid torn copies under WAL mode.
+    catalog.vacuum_into(&catalog_dst)?;
 
     let mut segments_out = Vec::new();
     let segments = catalog

@@ -137,6 +137,13 @@ pub trait CatalogStore: Send + Sync {
         metadata: &VectorMetadata,
         idempotency_key: Option<&str>,
     ) -> Result<WalIngestResult>;
+    fn ingest_wal_atomic(
+        &self,
+        collection_id: &str,
+        vector: &[f32],
+        metadata: &VectorMetadata,
+        idempotency_key: Option<&str>,
+    ) -> Result<WalIngestResult>;
 
     fn pending_wal(&self, collection_id: &str, limit: usize) -> Result<Vec<WalEntry>>;
     fn pending_wal_after_lsn(
@@ -220,6 +227,7 @@ pub trait CatalogStore: Send + Sync {
     fn quarantine_gc(&self, ttl_secs: i64) -> Result<Vec<PathBuf>>;
 
     fn total_vectors(&self, collection_id: &str) -> Result<usize>;
+    fn vacuum_into(&self, output_path: &Path) -> Result<()>;
     fn audit_event(
         &self,
         request_id: &str,
@@ -245,7 +253,6 @@ impl SqliteCatalog {
         let catalog = Self {
             path: path.to_path_buf(),
         };
-
         catalog.exec("PRAGMA journal_mode=WAL;")?;
         catalog.exec("PRAGMA synchronous=FULL;")?;
         catalog.exec("PRAGMA foreign_keys=ON;")?;
@@ -459,71 +466,23 @@ impl CatalogStore for SqliteCatalog {
         metadata: &VectorMetadata,
         idempotency_key: Option<&str>,
     ) -> Result<WalIngestResult> {
-        if let Some(key) = idempotency_key {
-            if !key.trim().is_empty() {
-                let rows = self.query_json(&format!(
-                    "SELECT vector_id FROM wal_entries WHERE collection_id='{}' AND idempotency_key='{}' LIMIT 1;",
-                    sql_quote(collection_id),
-                    sql_quote(key)
-                ))?;
-                if let Some(row) = rows.first() {
-                    return Ok(WalIngestResult {
-                        vector_id: row["vector_id"].as_i64().unwrap_or_default() as usize,
-                        created: false,
-                        lsn: None,
-                    });
-                }
-            }
-        }
+        self.ingest_wal_internal(
+            collection_id,
+            Some(vector_id),
+            vector,
+            metadata,
+            idempotency_key,
+        )
+    }
 
-        let vector_json = serde_json::to_string(vector)?;
-        let metadata_json = serde_json::to_string(metadata)?;
-        let tags_json = serde_json::to_string(&metadata.tags)?;
-
-        self.exec(&format!(
-            "BEGIN IMMEDIATE;
-             INSERT INTO wal_entries(collection_id, vector_id, vector_json, metadata_json, idempotency_key, checkpointed_at, created_at)
-             VALUES ('{}', {}, '{}', '{}', {}, NULL, {});
-             INSERT OR REPLACE INTO vector_metadata(vector_id, collection_id, source_file, start_time_ms, duration_ms, bpm, tags_json, created_at)
-             VALUES ({}, '{}', '{}', {}, {}, {}, '{}', {});
-             COMMIT;",
-            sql_quote(collection_id),
-            vector_id,
-            sql_quote(&vector_json),
-            sql_quote(&metadata_json),
-            idempotency_key
-                .map(|k| format!("'{}'", sql_quote(k)))
-                .unwrap_or_else(|| "NULL".to_string()),
-            now_unix_ts(),
-            vector_id,
-            sql_quote(collection_id),
-            sql_quote(&metadata.source_file),
-            metadata.start_time_ms,
-            metadata.duration_ms,
-            metadata.bpm,
-            sql_quote(&tags_json),
-            now_unix_ts()
-        ))?;
-
-        let lsn_rows = self.query_json(&format!(
-            "SELECT lsn FROM wal_entries WHERE collection_id='{}' AND vector_id={} ORDER BY lsn DESC LIMIT 1;",
-            sql_quote(collection_id),
-            vector_id
-        ))?;
-        let lsn = lsn_rows
-            .first()
-            .and_then(|r| {
-                r["lsn"]
-                    .as_i64()
-                    .or_else(|| r["lsn"].as_str().and_then(|s| s.parse::<i64>().ok()))
-            })
-            .unwrap_or_default() as u64;
-
-        Ok(WalIngestResult {
-            vector_id,
-            created: true,
-            lsn: Some(lsn),
-        })
+    fn ingest_wal_atomic(
+        &self,
+        collection_id: &str,
+        vector: &[f32],
+        metadata: &VectorMetadata,
+        idempotency_key: Option<&str>,
+    ) -> Result<WalIngestResult> {
+        self.ingest_wal_internal(collection_id, None, vector, metadata, idempotency_key)
     }
 
     fn pending_wal(&self, collection_id: &str, limit: usize) -> Result<Vec<WalEntry>> {
@@ -934,15 +893,19 @@ impl CatalogStore for SqliteCatalog {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-
         let rows = self.query_json(&format!(
-            "SELECT vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json FROM vector_metadata WHERE vector_id IN ({}) ORDER BY vector_id ASC;",
+            "SELECT vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json
+             FROM vector_metadata
+             WHERE vector_id IN ({})
+             ORDER BY vector_id ASC;",
             in_clause
         ))?;
 
         let mut out = HashMap::with_capacity(rows.len());
         for row in rows {
             let id = row["vector_id"].as_i64().unwrap_or_default() as usize;
+            let tags: Vec<String> =
+                serde_json::from_str(row["tags_json"].as_str().unwrap_or("[]"))?;
             out.insert(
                 id,
                 VectorMetadata {
@@ -950,7 +913,7 @@ impl CatalogStore for SqliteCatalog {
                     start_time_ms: row["start_time_ms"].as_i64().unwrap_or_default() as u32,
                     duration_ms: row["duration_ms"].as_i64().unwrap_or_default() as u16,
                     bpm: row["bpm"].as_f64().unwrap_or_default() as f32,
-                    tags: serde_json::from_str(row["tags_json"].as_str().unwrap_or("[]"))?,
+                    tags,
                 },
             );
         }
@@ -959,12 +922,17 @@ impl CatalogStore for SqliteCatalog {
 
     fn fetch_all_metadata(&self, collection_id: &str) -> Result<Vec<(usize, VectorMetadata)>> {
         let rows = self.query_json(&format!(
-            "SELECT vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json FROM vector_metadata WHERE collection_id='{}' ORDER BY vector_id ASC;",
+            "SELECT vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json
+             FROM vector_metadata
+             WHERE collection_id='{}'
+             ORDER BY vector_id ASC;",
             sql_quote(collection_id)
         ))?;
 
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(rows.len());
         for row in rows {
+            let tags: Vec<String> =
+                serde_json::from_str(row["tags_json"].as_str().unwrap_or("[]"))?;
             out.push((
                 row["vector_id"].as_i64().unwrap_or_default() as usize,
                 VectorMetadata {
@@ -972,7 +940,7 @@ impl CatalogStore for SqliteCatalog {
                     start_time_ms: row["start_time_ms"].as_i64().unwrap_or_default() as u32,
                     duration_ms: row["duration_ms"].as_i64().unwrap_or_default() as u16,
                     bpm: row["bpm"].as_f64().unwrap_or_default() as f32,
-                    tags: serde_json::from_str(row["tags_json"].as_str().unwrap_or("[]"))?,
+                    tags,
                 },
             ));
         }
@@ -1031,6 +999,21 @@ impl CatalogStore for SqliteCatalog {
             .unwrap_or_default() as usize)
     }
 
+    fn vacuum_into(&self, output_path: &Path) -> Result<()> {
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if output_path.exists() {
+            std::fs::remove_file(output_path)
+                .with_context(|| format!("removing stale snapshot {:?}", output_path))?;
+        }
+        self.exec(&format!(
+            "VACUUM INTO '{}';",
+            sql_quote(&output_path.to_string_lossy())
+        ))
+        .with_context(|| format!("vacuum into {:?}", output_path))
+    }
+
     fn audit_event(
         &self,
         request_id: &str,
@@ -1062,18 +1045,123 @@ impl SqliteCatalog {
         let rows = self.query_json(sql)?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
+            let lsn = row["lsn"].as_i64().unwrap_or_default() as u64;
+            let vector_id = row["vector_id"].as_i64().unwrap_or_default() as usize;
             let vector: Vec<f32> =
                 serde_json::from_str(row["vector_json"].as_str().unwrap_or("[]"))?;
             let metadata: VectorMetadata =
                 serde_json::from_str(row["metadata_json"].as_str().unwrap_or("{}"))?;
             out.push(WalEntry {
-                lsn: row["lsn"].as_i64().unwrap_or_default() as u64,
-                vector_id: row["vector_id"].as_i64().unwrap_or_default() as usize,
+                lsn,
+                vector_id,
                 vector,
                 metadata,
             });
         }
         Ok(out)
+    }
+
+    fn ingest_wal_internal(
+        &self,
+        collection_id: &str,
+        vector_id: Option<usize>,
+        vector: &[f32],
+        metadata: &VectorMetadata,
+        idempotency_key: Option<&str>,
+    ) -> Result<WalIngestResult> {
+        let normalized_key = idempotency_key.and_then(|k| {
+            let trimmed = k.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        let now = now_unix_ts();
+        let collection = sql_quote(collection_id);
+        let vector_json = sql_quote(&serde_json::to_string(vector)?);
+        let metadata_json = sql_quote(&serde_json::to_string(metadata)?);
+        let source_file = sql_quote(&metadata.source_file);
+        let tags_json = sql_quote(&serde_json::to_string(&metadata.tags)?);
+
+        let key_sql = normalized_key
+            .as_ref()
+            .map(|k| format!("'{}'", sql_quote(k)))
+            .unwrap_or_else(|| "NULL".to_string());
+
+        let idempotency_lookup = if let Some(key) = &normalized_key {
+            format!(
+                "INSERT INTO _ingest_res(vector_id, created, lsn)
+                 SELECT vector_id, 0, NULL
+                 FROM wal_entries
+                 WHERE collection_id='{}' AND idempotency_key='{}'
+                 LIMIT 1;",
+                collection,
+                sql_quote(key)
+            )
+        } else {
+            String::new()
+        };
+
+        let assigned_vector_id_expr = match vector_id {
+            Some(v) => v.to_string(),
+            None => format!(
+                "COALESCE((SELECT MAX(vector_id) + 1 FROM vector_metadata WHERE collection_id='{}'), 0)",
+                collection
+            ),
+        };
+
+        let sql = format!(
+            "BEGIN IMMEDIATE;
+             CREATE TEMP TABLE IF NOT EXISTS _ingest_res(
+               vector_id INTEGER NOT NULL,
+               created INTEGER NOT NULL,
+               lsn INTEGER
+             );
+             DELETE FROM _ingest_res;
+             {}
+             INSERT INTO wal_entries(collection_id, vector_id, vector_json, metadata_json, idempotency_key, checkpointed_at, created_at)
+             SELECT '{}', {}, '{}', '{}', {}, NULL, {}
+             WHERE NOT EXISTS (SELECT 1 FROM _ingest_res);
+             INSERT INTO _ingest_res(vector_id, created, lsn)
+             SELECT vector_id, 1, lsn
+             FROM wal_entries
+             WHERE lsn = last_insert_rowid()
+               AND changes() > 0
+               AND NOT EXISTS (SELECT 1 FROM _ingest_res);
+             INSERT OR REPLACE INTO vector_metadata(vector_id, collection_id, source_file, start_time_ms, duration_ms, bpm, tags_json, created_at)
+             SELECT vector_id, '{}', '{}', {}, {}, {}, '{}', {}
+             FROM _ingest_res
+             WHERE created = 1;
+             SELECT vector_id, created, lsn FROM _ingest_res LIMIT 1;
+             COMMIT;",
+            idempotency_lookup,
+            collection,
+            assigned_vector_id_expr,
+            vector_json,
+            metadata_json,
+            key_sql,
+            now,
+            collection,
+            source_file,
+            metadata.start_time_ms,
+            metadata.duration_ms,
+            metadata.bpm,
+            tags_json,
+            now
+        );
+
+        let rows = self.query_json(&sql)?;
+        let Some(row) = rows.first() else {
+            return Err(anyhow!("ingest transaction produced no result row"));
+        };
+
+        Ok(WalIngestResult {
+            vector_id: row["vector_id"].as_i64().unwrap_or_default() as usize,
+            created: row["created"].as_i64().unwrap_or_default() != 0,
+            lsn: row["lsn"].as_i64().map(|v| v as u64),
+        })
     }
 }
 
