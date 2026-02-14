@@ -555,4 +555,86 @@ mod tests {
         assert!(!allow.contains(1), "119.9 must be excluded by exact bounds");
         assert!(!allow.contains(2), "120.2 must be excluded by exact bounds");
     }
+
+    #[test]
+    fn filter_combines_tags_and_bpm_with_expected_set_algebra() {
+        let mut index = FilterIndex::default();
+
+        index.add(
+            10,
+            &VectorMetadata {
+                source_file: "kick.wav".to_string(),
+                start_time_ms: 0,
+                duration_ms: 100,
+                bpm: 120.0,
+                tags: vec!["Drums".to_string(), "kick".to_string()],
+            },
+        );
+        index.add(
+            11,
+            &VectorMetadata {
+                source_file: "snare.wav".to_string(),
+                start_time_ms: 0,
+                duration_ms: 100,
+                bpm: 124.0,
+                tags: vec!["drums".to_string(), "snare".to_string()],
+            },
+        );
+        index.add(
+            12,
+            &VectorMetadata {
+                source_file: "bass.wav".to_string(),
+                start_time_ms: 0,
+                duration_ms: 100,
+                bpm: 124.0,
+                tags: vec!["bass".to_string()],
+            },
+        );
+
+        let filter = QueryFilter {
+            tags_all: vec!["drums".to_string()],
+            tags_any: vec!["snare".to_string(), "kick".to_string()],
+            bpm_gte: Some(123.0),
+            bpm_lte: Some(125.0),
+        };
+        let allow = index
+            .build_allow_set(&filter)
+            .expect("expected allow set for combined filter");
+
+        assert!(!allow.contains(10), "kick should be excluded by bpm range");
+        assert!(allow.contains(11), "snare should pass all clauses");
+        assert!(!allow.contains(12), "bass should be excluded by tags_all");
+    }
+
+    #[test]
+    fn unknown_tags_any_returns_empty_allow_set() {
+        let mut index = FilterIndex::default();
+        index.add(
+            7,
+            &VectorMetadata {
+                source_file: "known.wav".to_string(),
+                start_time_ms: 0,
+                duration_ms: 100,
+                bpm: 120.0,
+                tags: vec!["drums".to_string()],
+            },
+        );
+
+        let filter = QueryFilter {
+            tags_any: vec!["missing".to_string()],
+            ..Default::default()
+        };
+        let allow = index
+            .build_allow_set(&filter)
+            .expect("tags_any should produce an allow set");
+        assert_eq!(allow.cardinality(), 0);
+    }
+
+    #[test]
+    fn dictionary_normalization_is_lowercase_and_trimmed() {
+        let mut dict = HashMap::new();
+        dict.insert(" Drums ".to_string(), 3u32);
+        let index = FilterIndex::with_dictionary(dict);
+        assert_eq!(index.tag_ids.get("drums"), Some(&3u32));
+    }
 }

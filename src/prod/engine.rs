@@ -73,6 +73,8 @@ pub struct Metrics {
     pub checkpoint_total: AtomicU64,
     pub compaction_total: AtomicU64,
     pub obsolete_files_deleted_total: AtomicU64,
+    pub query_latency_count: AtomicU64,
+    pub query_latency_us_sum: AtomicU64,
     pub query_latency_us_le_10: AtomicU64,
     pub query_latency_us_le_25: AtomicU64,
     pub query_latency_us_le_50: AtomicU64,
@@ -231,6 +233,12 @@ impl ProductionState {
 
     fn observe_query_latency_us(&self, us: u64) {
         let bucket = &self.metrics;
+        bucket
+            .query_latency_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        bucket
+            .query_latency_us_sum
+            .fetch_add(us, AtomicOrdering::Relaxed);
         if us <= 10 {
             bucket
                 .query_latency_us_le_10
@@ -522,79 +530,105 @@ impl ProductionState {
         let seq_len = request.vectors.len();
         let mut best: HashMap<usize, f32> = HashMap::new();
 
-        let hot_bounds = {
-            let hot = self.hot_vectors.read();
-            if hot.is_empty() {
-                None
-            } else {
-                let mut min_id = usize::MAX;
-                let mut max_id = 0usize;
-                for id in hot.keys().copied() {
-                    min_id = min_id.min(id);
-                    max_id = max_id.max(id);
-                }
-                Some((min_id, max_id))
-            }
+        let raw_tier_allowed = |level: i64| match request.search_tier {
+            SearchTier::Active => level <= 1,
+            SearchTier::All => true,
+            SearchTier::Archive => false,
         };
 
-        if let Some((min_id, max_id)) = hot_bounds {
-            let total_vectors = max_id.saturating_add(1);
-            let results = {
-                let index = self.hot_index.read();
-                index.search_subsequence(
-                    &request.vectors,
-                    request.k,
-                    request.ef.max(request.k),
-                    total_vectors,
-                )
+        if !matches!(request.search_tier, SearchTier::Archive) {
+            let hot_bounds = {
+                let hot = self.hot_vectors.read();
+                if hot.is_empty() {
+                    None
+                } else {
+                    let mut min_id = usize::MAX;
+                    let mut max_id = 0usize;
+                    for id in hot.keys().copied() {
+                        min_id = min_id.min(id);
+                        max_id = max_id.max(id);
+                    }
+                    Some((min_id, max_id))
+                }
             };
-            let hot = self.hot_vectors.read();
-            for (start_id, score) in results {
-                if start_id < min_id || start_id.saturating_add(seq_len) > total_vectors {
-                    continue;
+
+            if let Some((min_id, max_id)) = hot_bounds {
+                let total_vectors = max_id.saturating_add(1);
+                let results = {
+                    let index = self.hot_index.read();
+                    index.search_subsequence(
+                        &request.vectors,
+                        request.k,
+                        request.ef.max(request.k),
+                        total_vectors,
+                    )
+                };
+                let hot = self.hot_vectors.read();
+                for (start_id, score) in results {
+                    if start_id < min_id || start_id.saturating_add(seq_len) > total_vectors {
+                        continue;
+                    }
+                    if (0..seq_len).any(|offset| !hot.contains_key(&(start_id + offset))) {
+                        continue;
+                    }
+                    merge_best(&mut best, start_id, score);
                 }
-                if (0..seq_len).any(|offset| !hot.contains_key(&(start_id + offset))) {
-                    continue;
+            }
+
+            let segment_snapshot = self.segments.load_full();
+            let segment_results = self.query_pool.install(|| {
+                segment_snapshot
+                    .par_iter()
+                    .filter(|seg| raw_tier_allowed(seg.record.level))
+                    .map(|seg| {
+                        if seq_len > seg.record.row_count {
+                            return Vec::new();
+                        }
+
+                        let min_start = seg.record.vector_id_start;
+                        let max_exclusive = seg.record.vector_id_end.saturating_add(1);
+                        let local = {
+                            let index = seg.index.read();
+                            index.search_subsequence(
+                                &request.vectors,
+                                request.k,
+                                request.ef.max(request.k),
+                                max_exclusive,
+                            )
+                        };
+
+                        local
+                            .into_iter()
+                            .filter(|(start_id, _)| {
+                                *start_id >= min_start
+                                    && start_id.saturating_add(seq_len) <= max_exclusive
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            for results in segment_results {
+                for (start_id, score) in results {
+                    merge_best(&mut best, start_id, score);
                 }
-                merge_best(&mut best, start_id, score);
             }
         }
 
-        let segment_snapshot = self.segments.load_full();
-        let segment_results = self.query_pool.install(|| {
-            segment_snapshot
-                .par_iter()
-                .map(|seg| {
-                    if seq_len > seg.record.row_count {
-                        return Vec::new();
-                    }
-
-                    let min_start = seg.record.vector_id_start;
-                    let max_exclusive = seg.record.vector_id_end.saturating_add(1);
-                    let local = {
-                        let index = seg.index.read();
-                        index.search_subsequence(
-                            &request.vectors,
-                            request.k,
-                            request.ef.max(request.k),
-                            max_exclusive,
-                        )
-                    };
-
-                    local
-                        .into_iter()
-                        .filter(|(start_id, _)| {
-                            *start_id >= min_start
-                                && start_id.saturating_add(seq_len) <= max_exclusive
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
-        });
-
-        for results in segment_results {
-            for (start_id, score) in results {
-                merge_best(&mut best, start_id, score);
+        if !matches!(request.search_tier, SearchTier::Active) {
+            let archive_snapshot = self.archive_segments.load_full();
+            let archive_results = self.query_pool.install(|| {
+                archive_snapshot
+                    .par_iter()
+                    .map(|seg| {
+                        identify_archive_pq_segment(seg, &request.vectors, request.k, request.ef)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for results in archive_results {
+                for (start_id, score) in results {
+                    merge_best(&mut best, start_id, score);
+                }
             }
         }
 
@@ -778,103 +812,102 @@ impl ProductionState {
                 .load(AtomicOrdering::Relaxed)
         ));
 
-        out.push_str("# TYPE vibrato_query_latency_us_bucket counter\n");
+        let b10 = self
+            .metrics
+            .query_latency_us_le_10
+            .load(AtomicOrdering::Relaxed);
+        let b25 = b10
+            + self
+                .metrics
+                .query_latency_us_le_25
+                .load(AtomicOrdering::Relaxed);
+        let b50 = b25
+            + self
+                .metrics
+                .query_latency_us_le_50
+                .load(AtomicOrdering::Relaxed);
+        let b100 = b50
+            + self
+                .metrics
+                .query_latency_us_le_100
+                .load(AtomicOrdering::Relaxed);
+        let b250 = b100
+            + self
+                .metrics
+                .query_latency_us_le_250
+                .load(AtomicOrdering::Relaxed);
+        let b500 = b250
+            + self
+                .metrics
+                .query_latency_us_le_500
+                .load(AtomicOrdering::Relaxed);
+        let b1000 = b500
+            + self
+                .metrics
+                .query_latency_us_le_1000
+                .load(AtomicOrdering::Relaxed);
+        let b2500 = b1000
+            + self
+                .metrics
+                .query_latency_us_le_2500
+                .load(AtomicOrdering::Relaxed);
+        let b5000 = b2500
+            + self
+                .metrics
+                .query_latency_us_le_5000
+                .load(AtomicOrdering::Relaxed);
+        let h_count = self
+            .metrics
+            .query_latency_count
+            .load(AtomicOrdering::Relaxed);
+        let h_sum = self
+            .metrics
+            .query_latency_us_sum
+            .load(AtomicOrdering::Relaxed);
+
+        out.push_str("# TYPE vibrato_query_latency_us histogram\n");
         out.push_str(&format!(
             "vibrato_query_latency_us_bucket{{le=\"10\"}} {}\n",
-            self.metrics
-                .query_latency_us_le_10
-                .load(AtomicOrdering::Relaxed)
+            b10
         ));
         out.push_str(&format!(
             "vibrato_query_latency_us_bucket{{le=\"25\"}} {}\n",
-            self.metrics
-                .query_latency_us_le_25
-                .load(AtomicOrdering::Relaxed)
+            b25
         ));
         out.push_str(&format!(
             "vibrato_query_latency_us_bucket{{le=\"50\"}} {}\n",
-            self.metrics
-                .query_latency_us_le_50
-                .load(AtomicOrdering::Relaxed)
+            b50
         ));
         out.push_str(&format!(
             "vibrato_query_latency_us_bucket{{le=\"100\"}} {}\n",
-            self.metrics
-                .query_latency_us_le_100
-                .load(AtomicOrdering::Relaxed)
+            b100
         ));
         out.push_str(&format!(
             "vibrato_query_latency_us_bucket{{le=\"250\"}} {}\n",
-            self.metrics
-                .query_latency_us_le_250
-                .load(AtomicOrdering::Relaxed)
+            b250
         ));
         out.push_str(&format!(
             "vibrato_query_latency_us_bucket{{le=\"500\"}} {}\n",
-            self.metrics
-                .query_latency_us_le_500
-                .load(AtomicOrdering::Relaxed)
+            b500
         ));
         out.push_str(&format!(
             "vibrato_query_latency_us_bucket{{le=\"1000\"}} {}\n",
-            self.metrics
-                .query_latency_us_le_1000
-                .load(AtomicOrdering::Relaxed)
+            b1000
         ));
         out.push_str(&format!(
             "vibrato_query_latency_us_bucket{{le=\"2500\"}} {}\n",
-            self.metrics
-                .query_latency_us_le_2500
-                .load(AtomicOrdering::Relaxed)
+            b2500
         ));
         out.push_str(&format!(
             "vibrato_query_latency_us_bucket{{le=\"5000\"}} {}\n",
-            self.metrics
-                .query_latency_us_le_5000
-                .load(AtomicOrdering::Relaxed)
+            b5000
         ));
         out.push_str(&format!(
             "vibrato_query_latency_us_bucket{{le=\"+Inf\"}} {}\n",
-            self.metrics
-                .query_latency_us_gt_5000
-                .load(AtomicOrdering::Relaxed)
-                + self
-                    .metrics
-                    .query_latency_us_le_5000
-                    .load(AtomicOrdering::Relaxed)
-                + self
-                    .metrics
-                    .query_latency_us_le_2500
-                    .load(AtomicOrdering::Relaxed)
-                + self
-                    .metrics
-                    .query_latency_us_le_1000
-                    .load(AtomicOrdering::Relaxed)
-                + self
-                    .metrics
-                    .query_latency_us_le_500
-                    .load(AtomicOrdering::Relaxed)
-                + self
-                    .metrics
-                    .query_latency_us_le_250
-                    .load(AtomicOrdering::Relaxed)
-                + self
-                    .metrics
-                    .query_latency_us_le_100
-                    .load(AtomicOrdering::Relaxed)
-                + self
-                    .metrics
-                    .query_latency_us_le_50
-                    .load(AtomicOrdering::Relaxed)
-                + self
-                    .metrics
-                    .query_latency_us_le_25
-                    .load(AtomicOrdering::Relaxed)
-                + self
-                    .metrics
-                    .query_latency_us_le_10
-                    .load(AtomicOrdering::Relaxed)
+            h_count
         ));
+        out.push_str(&format!("vibrato_query_latency_us_sum {}\n", h_sum));
+        out.push_str(&format!("vibrato_query_latency_us_count {}\n", h_count));
 
         out.push_str("# TYPE vibrato_active_segments gauge\n");
         out.push_str(&format!(
@@ -1161,17 +1194,21 @@ impl ProductionState {
         })?;
 
         let result = (|| -> Result<JobResponseV2> {
-            let mut pairs: Vec<(usize, Vec<f32>)> = Vec::new();
-            for seg in &candidates {
+            let mut ordered_segments = candidates.clone();
+            ordered_segments.sort_by_key(|seg| seg.record.vector_id_start);
+            let total_rows = ordered_segments
+                .iter()
+                .map(|seg| seg.record.row_count)
+                .sum::<usize>();
+            let mut ids = Vec::with_capacity(total_rows);
+            let mut vectors = Vec::with_capacity(total_rows);
+            for seg in &ordered_segments {
                 for offset in 0..seg.record.row_count {
                     let vector_id = seg.record.vector_id_start + offset;
-                    pairs.push((vector_id, seg.store.get(offset).to_vec()));
+                    ids.push(vector_id);
+                    vectors.push(seg.store.get(offset).to_vec());
                 }
             }
-            pairs.sort_by_key(|(id, _)| *id);
-
-            let ids = pairs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-            let vectors = pairs.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
             let metadata_map = self.catalog.fetch_metadata(&self.collection.id, &ids)?;
             let metadata = ids
                 .iter()
@@ -1546,12 +1583,12 @@ impl ProductionState {
         let count = store.count;
         let dim = store.dim;
         let store_for_accessor = store.clone();
+        let zero_fallback = vec![0.0f32; dim];
         let accessor = move |id: usize, sink: &mut dyn FnMut(&[f32])| {
             if id >= start && id < start + count {
                 sink(store_for_accessor.get(id - start));
             } else {
-                let fallback = vec![0.0; dim];
-                sink(&fallback);
+                sink(&zero_fallback);
             }
         };
 
@@ -1847,6 +1884,167 @@ fn merge_best(best: &mut HashMap<usize, f32>, id: usize, score: f32) {
     }
 }
 
+fn salient_anchor_offsets(query_sequence: &[Vec<f32>]) -> Vec<usize> {
+    if query_sequence.is_empty() {
+        return Vec::new();
+    }
+    let seq_len = query_sequence.len();
+    let probe_count = seq_len.min(3);
+    let min_anchor_gap = if seq_len >= 48 {
+        48
+    } else if seq_len >= 32 {
+        32
+    } else if seq_len >= 16 {
+        16
+    } else {
+        1
+    };
+
+    let mut salience = query_sequence
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+            (i, norm_sq)
+        })
+        .collect::<Vec<_>>();
+    salience.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+    let mut anchors = Vec::with_capacity(probe_count);
+    for (idx, _) in salience {
+        if anchors
+            .iter()
+            .all(|selected: &usize| selected.abs_diff(idx) >= min_anchor_gap)
+        {
+            anchors.push(idx);
+            if anchors.len() >= probe_count {
+                break;
+            }
+        }
+    }
+    if anchors.is_empty() {
+        anchors.push(0);
+    }
+    anchors
+}
+
+fn identify_archive_pq_segment(
+    segment: &ArchivePqSegment,
+    query_sequence: &[Vec<f32>],
+    k: usize,
+    ef: usize,
+) -> Vec<(usize, f32)> {
+    if k == 0 || query_sequence.is_empty() || segment.record.row_count < query_sequence.len() {
+        return Vec::new();
+    }
+
+    let seq_len = query_sequence.len();
+    let nsub = segment.num_subspaces;
+    if nsub == 0 {
+        return Vec::new();
+    }
+    let codes = &segment.codes;
+    if codes.len() < segment.record.row_count * nsub {
+        return Vec::new();
+    }
+
+    let anchors = salient_anchor_offsets(query_sequence);
+    let anchor_overfetch = ef
+        .max(k)
+        .saturating_mul(4)
+        .max(32)
+        .min(segment.record.row_count);
+    let seg_start = segment.record.vector_id_start;
+    let seg_end_exclusive = segment.record.vector_id_end.saturating_add(1);
+
+    #[derive(Clone, Copy)]
+    struct AnchorCandidate {
+        offset: usize,
+        dist: f32,
+    }
+    impl PartialEq for AnchorCandidate {
+        fn eq(&self, other: &Self) -> bool {
+            self.dist == other.dist
+        }
+    }
+    impl Eq for AnchorCandidate {}
+    impl PartialOrd for AnchorCandidate {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for AnchorCandidate {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.dist
+                .partial_cmp(&other.dist)
+                .unwrap_or(Ordering::Equal)
+        }
+    }
+
+    let mut best_by_start: HashMap<usize, f32> = HashMap::new();
+    for salient_offset in anchors {
+        let table = segment
+            .pq
+            .compute_distance_table(&query_sequence[salient_offset]);
+        let mut heap = std::collections::BinaryHeap::with_capacity(anchor_overfetch + 1);
+
+        for offset in 0..segment.record.row_count {
+            let code_start = offset * nsub;
+            let code_end = code_start + nsub;
+            let dist = ProductQuantizer::adc_distance(&table, &codes[code_start..code_end], nsub);
+            if heap.len() < anchor_overfetch {
+                heap.push(AnchorCandidate { offset, dist });
+            } else if let Some(worst) = heap.peek() {
+                if dist < worst.dist {
+                    heap.pop();
+                    heap.push(AnchorCandidate { offset, dist });
+                }
+            }
+        }
+
+        while let Some(candidate) = heap.pop() {
+            let anchor_id = seg_start + candidate.offset;
+            if anchor_id < salient_offset {
+                continue;
+            }
+            let start_id = anchor_id - salient_offset;
+            if start_id < seg_start || start_id.saturating_add(seq_len) > seg_end_exclusive {
+                continue;
+            }
+
+            let mut total_sim = 0.0f32;
+            let mut valid = true;
+            for (offset, query_vec) in query_sequence.iter().enumerate() {
+                let vec_id = start_id + offset;
+                if vec_id < seg_start || vec_id >= seg_end_exclusive {
+                    valid = false;
+                    break;
+                }
+                let local = vec_id - seg_start;
+                let code_start = local * nsub;
+                let code_end = code_start + nsub;
+                if code_end > codes.len() {
+                    valid = false;
+                    break;
+                }
+                let reconstructed = segment.pq.decode(&codes[code_start..code_end]);
+                total_sim += dot_product(query_vec, &reconstructed);
+            }
+            if !valid {
+                continue;
+            }
+
+            let avg_sim = total_sim / seq_len as f32;
+            merge_best(&mut best_by_start, start_id, avg_sim);
+        }
+    }
+
+    let mut out = best_by_start.into_iter().collect::<Vec<_>>();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    out.truncate(k);
+    out
+}
+
 fn search_archive_pq_segment(
     segment: &ArchivePqSegment,
     query: &[f32],
@@ -2063,13 +2261,13 @@ fn make_hot_accessor(
     hot_vectors: Arc<RwLock<HashMap<usize, Vec<f32>>>>,
     dim: usize,
 ) -> impl Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static {
+    let zero_fallback = vec![0.0f32; dim];
     move |id, sink| {
         let guard = hot_vectors.read();
         if let Some(v) = guard.get(&id) {
             sink(v);
         } else {
-            let fallback = vec![0.0f32; dim];
-            sink(&fallback);
+            sink(&zero_fallback);
         }
     }
 }

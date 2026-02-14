@@ -1194,4 +1194,37 @@ mod tests {
         let results = hnsw.search_subsequence(&query_seq, 3, 50, vectors.len());
         assert!(results.is_empty());
     }
+
+    #[test]
+    fn test_search_subsequence_multi_probe_results_are_deduped_and_bounded() {
+        fn deterministic_vector(i: usize, dim: usize) -> Vec<f32> {
+            let mut out = Vec::with_capacity(dim);
+            for j in 0..dim {
+                let x = (((i + 1) as f32) * ((j + 1) as f32) * 0.173).sin();
+                out.push(x);
+            }
+            l2_normalized(&out)
+        }
+
+        let dim = 32usize;
+        let vectors: Vec<_> = (0..120).map(|i| deterministic_vector(i, dim)).collect();
+        let vectors_clone = vectors.clone();
+
+        let mut hnsw = HNSW::new(16, 120, move |id| vectors_clone[id].clone());
+        for i in 0..vectors.len() {
+            hnsw.insert(i);
+        }
+
+        let mut query_seq: Vec<Vec<f32>> = (40..52).map(|i| vectors[i].clone()).collect();
+        // Inject a single high-norm outlier so the highest-salience anchor is likely wrong.
+        query_seq[6] = vec![50.0; dim];
+
+        let results = hnsw.search_subsequence(&query_seq, 5, 300, vectors.len());
+        assert!(results.len() <= 5, "results must be bounded by k");
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            results.iter().all(|(start, _)| seen.insert(*start)),
+            "multi-probe merge should dedupe repeated start_ids"
+        );
+    }
 }

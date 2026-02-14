@@ -102,6 +102,10 @@ fn default_identify_ef() -> usize {
     100
 }
 
+fn default_identify_search_tier() -> SearchTier {
+    SearchTier::All
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchTier {
@@ -145,6 +149,8 @@ pub struct IdentifyRequestV2 {
     pub ef: usize,
     #[serde(default = "default_true")]
     pub include_metadata: bool,
+    #[serde(default = "default_identify_search_tier")]
+    pub search_tier: SearchTier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

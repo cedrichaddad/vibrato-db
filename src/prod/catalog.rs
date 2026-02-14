@@ -684,7 +684,7 @@ impl SqliteCatalog {
         for _ in 0..count {
             self.readers
                 .push(std::sync::Mutex::new(RawSqliteConnection::open(
-                    &self.path, false,
+                    &self.path, true,
                 )?));
         }
         Ok(())
@@ -1977,8 +1977,15 @@ pub fn verify_token_hash(pepper: &str, secret: &str, expected_hash: &str) -> boo
 }
 
 pub fn parse_token(header_value: &str) -> Option<(String, String)> {
-    let token = header_value.trim();
-    let token = token.strip_prefix("Bearer ")?;
+    let mut parts = header_value.split_whitespace();
+    let scheme = parts.next()?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
     let (id, secret) = token.split_once('.')?;
     if !id.starts_with("vbk_") || secret.is_empty() {
         return None;
@@ -2007,4 +2014,50 @@ fn legacy_hash(pepper: &str, secret: &str) -> String {
     pepper.hash(&mut hasher);
     secret.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_token_requires_bearer_and_vbk_prefix() {
+        let parsed = parse_token("Bearer vbk_abc123.secretxyz");
+        assert_eq!(
+            parsed,
+            Some(("vbk_abc123".to_string(), "secretxyz".to_string()))
+        );
+        let parsed_lower = parse_token("bearer vbk_abc123.secretxyz");
+        assert_eq!(
+            parsed_lower,
+            Some(("vbk_abc123".to_string(), "secretxyz".to_string()))
+        );
+
+        assert!(parse_token("vbk_abc123.secretxyz").is_none());
+        assert!(parse_token("Bearer abc123.secretxyz").is_none());
+        assert!(parse_token("Bearer vbk_abc123.").is_none());
+        assert!(parse_token("Bearer vbk_abc123.secretxyz trailing").is_none());
+    }
+
+    #[test]
+    fn verify_token_hash_supports_current_and_legacy_formats() {
+        let pepper = "pepper";
+        let secret = "super-secret";
+
+        let current = hash_secret(pepper, secret);
+        assert!(verify_token_hash(pepper, secret, &current));
+        assert!(!verify_token_hash(pepper, "wrong", &current));
+
+        let legacy = legacy_hash(pepper, secret);
+        assert_eq!(legacy.len(), 16);
+        assert!(verify_token_hash(pepper, secret, &legacy));
+        assert!(!verify_token_hash(pepper, "wrong", &legacy));
+    }
+
+    #[test]
+    fn constant_time_eq_requires_equal_length_and_content() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+    }
 }
