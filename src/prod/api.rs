@@ -11,8 +11,8 @@ use super::auth::{authorize, AuthError};
 use super::catalog::Role;
 use super::engine::ProductionState;
 use super::model::{
-    ApiResponse, ErrorBody, HealthResponseV2, IngestRequestV2, IngestResponseV2, JobResponseV2,
-    QueryRequestV2,
+    ApiResponse, ErrorBody, HealthResponseV2, IdentifyRequestV2, IngestRequestV2, IngestResponseV2,
+    JobResponseV2, QueryRequestV2,
 };
 use super::snapshot::create_snapshot;
 
@@ -20,6 +20,7 @@ pub fn create_v2_router(state: Arc<ProductionState>) -> Router {
     Router::new()
         .route("/v2/vectors", post(v2_ingest))
         .route("/v2/query", post(v2_query))
+        .route("/v2/identify", post(v2_identify))
         .route("/v2/health/live", get(v2_health_live))
         .route("/v2/health/ready", get(v2_health_ready))
         .route("/v2/admin/checkpoint", post(v2_admin_checkpoint))
@@ -142,6 +143,71 @@ async fn v2_query(
                 auth.as_deref(),
                 "/v2/query",
                 "query",
+                status.as_u16(),
+                started.elapsed().as_secs_f64() * 1000.0,
+                serde_json::json!({"error": e.to_string()}),
+            );
+            resp
+        }
+    }
+}
+
+async fn v2_identify(
+    State(state): State<Arc<ProductionState>>,
+    headers: HeaderMap,
+    Json(body): Json<IdentifyRequestV2>,
+) -> Response {
+    let request_id = request_id(&headers);
+    let started = Instant::now();
+
+    let auth = match authorize(
+        state.catalog.as_ref(),
+        &headers,
+        Some(Role::Query),
+        &state.config.api_pepper,
+    ) {
+        Ok(auth) => auth,
+        Err(e) => {
+            state
+                .metrics
+                .auth_failures_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return auth_error_response(
+                &state,
+                &request_id,
+                "/v2/identify",
+                "identify",
+                started,
+                e,
+            );
+        }
+    };
+
+    match state.identify(&body) {
+        Ok(result) => {
+            let payload = ApiResponse { data: result };
+            let resp = json_response(StatusCode::OK, &request_id, &payload);
+            audit_best_effort(
+                &state,
+                &request_id,
+                auth.as_deref(),
+                "/v2/identify",
+                "identify",
+                200,
+                started.elapsed().as_secs_f64() * 1000.0,
+                serde_json::json!({"k": body.k, "ef": body.ef, "len": body.vectors.len()}),
+            );
+            resp
+        }
+        Err(e) => {
+            let (status, code) = classify_identify_error(&e);
+            let resp = error_response(status, &request_id, code, e.to_string(), None);
+            audit_best_effort(
+                &state,
+                &request_id,
+                auth.as_deref(),
+                "/v2/identify",
+                "identify",
                 status.as_u16(),
                 started.elapsed().as_secs_f64() * 1000.0,
                 serde_json::json!({"error": e.to_string()}),
@@ -624,6 +690,9 @@ fn error_response(
 fn classify_ingest_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
     let msg = err.to_string();
     let lower = msg.to_ascii_lowercase();
+    if lower.contains("catalog_read_timeout") {
+        return (StatusCode::SERVICE_UNAVAILABLE, "catalog_read_timeout");
+    }
     if lower.contains("dimension mismatch") {
         return (StatusCode::BAD_REQUEST, "bad_request");
     }
@@ -639,6 +708,9 @@ fn classify_ingest_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
 fn classify_query_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
     let msg = err.to_string();
     let lower = msg.to_ascii_lowercase();
+    if lower.contains("catalog_read_timeout") {
+        return (StatusCode::SERVICE_UNAVAILABLE, "catalog_read_timeout");
+    }
     if lower.contains("dimension mismatch") {
         return (StatusCode::BAD_REQUEST, "bad_request");
     }
@@ -646,6 +718,10 @@ fn classify_query_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
         return (StatusCode::INTERNAL_SERVER_ERROR, "storage_error");
     }
     (StatusCode::BAD_REQUEST, "bad_request")
+}
+
+fn classify_identify_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
+    classify_query_error(err)
 }
 
 fn new_request_id() -> String {

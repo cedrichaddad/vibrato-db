@@ -94,6 +94,14 @@ fn default_search_tier() -> SearchTier {
     SearchTier::Active
 }
 
+fn default_identify_k() -> usize {
+    5
+}
+
+fn default_identify_ef() -> usize {
+    100
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchTier {
@@ -129,6 +137,33 @@ pub struct QueryResponseV2 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentifyRequestV2 {
+    pub vectors: Vec<Vec<f32>>,
+    #[serde(default = "default_identify_k")]
+    pub k: usize,
+    #[serde(default = "default_identify_ef")]
+    pub ef: usize,
+    #[serde(default = "default_true")]
+    pub include_metadata: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentifyResultV2 {
+    pub id: usize,
+    pub start_timestamp_ms: u64,
+    pub duration_ms: u64,
+    pub score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<VectorMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentifyResponseV2 {
+    pub results: Vec<IdentifyResultV2>,
+    pub query_time_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsResponseV2 {
     pub ready: bool,
     pub live: bool,
@@ -140,6 +175,11 @@ pub struct StatsResponseV2 {
     pub total_vectors: usize,
     pub checkpoint_jobs_inflight: usize,
     pub compaction_jobs_inflight: usize,
+    pub sqlite_wal_bytes: u64,
+    pub catalog_read_timeout_total: u64,
+    pub quarantine_files: usize,
+    pub quarantine_bytes: u64,
+    pub quarantine_evictions_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -28,8 +28,8 @@ use vibrato_db::format_v2::{VdbHeaderV2, VdbWriterV2};
 use vibrato_db::hnsw::HNSW;
 use vibrato_db::prod::{
     bootstrap_data_dirs, create_snapshot, create_v2_router, migrate_existing_vdb_to_segment,
-    recover_state, replay_to_lsn, restore_snapshot, CatalogStore, ProductionConfig,
-    ProductionState, Role, SqliteCatalog,
+    recover_state, replay_to_lsn, restore_snapshot, CatalogOptions, CatalogStore, ProductionConfig,
+    ProductionState, Role, SqliteCatalog, VectorMadviseMode,
 };
 use vibrato_db::server::{
     load_store_metadata, serve, AppState, SearchRequest, SearchResponse, SharedStore,
@@ -181,6 +181,26 @@ enum Commands {
         /// If false, /v2/health/* and /v2/metrics require API auth
         #[arg(long, default_value_t = true)]
         public_health_metrics: bool,
+
+        /// Catalog read timeout in ms (guards against stuck readers / WAL bloat)
+        #[arg(long, default_value = "500")]
+        catalog_read_timeout_ms: u64,
+
+        /// SQLite internal WAL autocheckpoint pages
+        #[arg(long, default_value = "1000")]
+        sqlite_wal_autocheckpoint_pages: u32,
+
+        /// Max quarantined orphan files retained
+        #[arg(long, default_value = "50")]
+        quarantine_max_files: usize,
+
+        /// Max quarantined orphan bytes retained
+        #[arg(long, default_value = "5368709120")]
+        quarantine_max_bytes: u64,
+
+        /// Vector mmap advise mode for active segment vectors: normal|random
+        #[arg(long, default_value = "normal")]
+        vector_madvise_mode: String,
 
         /// Bootstrap first admin API key if no keys exist in catalog
         #[arg(long, default_value_t = false)]
@@ -512,6 +532,11 @@ async fn main() -> anyhow::Result<()> {
             orphan_ttl_hours,
             audio_colocated,
             public_health_metrics,
+            catalog_read_timeout_ms,
+            sqlite_wal_autocheckpoint_pages,
+            quarantine_max_files,
+            quarantine_max_bytes,
+            vector_madvise_mode,
             bootstrap_admin_key,
         } => {
             let mut config = ProductionConfig::from_data_dir(data_dir, collection, dim);
@@ -520,9 +545,20 @@ async fn main() -> anyhow::Result<()> {
             config.orphan_ttl = std::time::Duration::from_secs(orphan_ttl_hours * 3600);
             config.audio_colocated = audio_colocated;
             config.public_health_metrics = public_health_metrics;
+            config.catalog_read_timeout_ms = catalog_read_timeout_ms;
+            config.sqlite_wal_autocheckpoint_pages = sqlite_wal_autocheckpoint_pages;
+            config.quarantine_max_files = quarantine_max_files;
+            config.quarantine_max_bytes = quarantine_max_bytes;
+            config.vector_madvise_mode = parse_vector_madvise_mode(&vector_madvise_mode)?;
 
             bootstrap_data_dirs(&config)?;
-            let catalog = Arc::new(SqliteCatalog::open(&config.catalog_path())?);
+            let catalog = Arc::new(SqliteCatalog::open_with_options(
+                &config.catalog_path(),
+                CatalogOptions {
+                    read_timeout_ms: config.catalog_read_timeout_ms,
+                    wal_autocheckpoint_pages: config.sqlite_wal_autocheckpoint_pages,
+                },
+            )?);
             let state = ProductionState::initialize(config.clone(), catalog.clone())?;
 
             if bootstrap_admin_key && catalog.count_api_keys()? == 0 {
@@ -764,4 +800,15 @@ fn parse_vector(s: &str) -> Result<Vec<f32>, String> {
     s.split(',')
         .map(|v| v.trim().parse::<f32>().map_err(|e| e.to_string()))
         .collect()
+}
+
+fn parse_vector_madvise_mode(s: &str) -> anyhow::Result<VectorMadviseMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "normal" => Ok(VectorMadviseMode::Normal),
+        "random" => Ok(VectorMadviseMode::Random),
+        other => anyhow::bail!(
+            "invalid --vector-madvise-mode '{}', expected normal|random",
+            other
+        ),
+    }
 }

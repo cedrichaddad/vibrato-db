@@ -332,3 +332,123 @@ fn ingest_transaction_rolls_back_on_constraint_failure() {
     assert_eq!(metadata[0].0, 7);
     assert_eq!(metadata[0].1.source_file, "first.wav");
 }
+
+#[test]
+fn monotonic_id_counter_is_atomic_with_wal_and_metadata() {
+    let dir = tempdir().expect("tempdir");
+    let config = test_config(dir.path().join("catalog_protocol_counter"));
+    bootstrap_data_dirs(&config).expect("bootstrap dirs");
+
+    let catalog = SqliteCatalog::open(&config.catalog_path()).expect("open catalog");
+    let collection = catalog
+        .ensure_collection(&config.collection_name, config.dim)
+        .expect("ensure collection");
+
+    for i in 0..3usize {
+        let meta = VectorMetadata {
+            source_file: format!("counter-{i}.wav"),
+            start_time_ms: i as u32,
+            duration_ms: 100,
+            bpm: 128.0,
+            tags: vec!["drums".to_string()],
+        };
+        let res = catalog
+            .ingest_wal_atomic(
+                &collection.id,
+                &[i as f32, 1.0 - (i as f32 / 10.0)],
+                &meta,
+                Some(&format!("counter-key-{i}")),
+            )
+            .expect("ingest_wal_atomic");
+        assert!(res.created);
+        assert_eq!(res.vector_id, i, "vector ids must be monotonic");
+    }
+
+    let dup = catalog
+        .ingest_wal_atomic(
+            &collection.id,
+            &[0.2, 0.8],
+            &VectorMetadata {
+                source_file: "dup.wav".to_string(),
+                start_time_ms: 0,
+                duration_ms: 100,
+                bpm: 128.0,
+                tags: vec!["drums".to_string()],
+            },
+            Some("counter-key-1"),
+        )
+        .expect("idempotent duplicate lookup");
+    assert!(
+        !dup.created,
+        "duplicate idempotency key must not create new row"
+    );
+    assert_eq!(dup.vector_id, 1);
+
+    let next = catalog
+        .next_vector_id(&collection.id)
+        .expect("next vector id from counter");
+    assert_eq!(next, 3, "counter should not regress or reuse ids");
+}
+
+#[test]
+fn tag_dictionary_and_vector_tags_are_stable_across_restart() {
+    let dir = tempdir().expect("tempdir");
+    let config = test_config(dir.path().join("catalog_protocol_tags"));
+    bootstrap_data_dirs(&config).expect("bootstrap dirs");
+
+    let collection_id = {
+        let catalog = SqliteCatalog::open(&config.catalog_path()).expect("open catalog");
+        let collection = catalog
+            .ensure_collection(&config.collection_name, config.dim)
+            .expect("ensure collection");
+
+        let meta_a = VectorMetadata {
+            source_file: "a.wav".to_string(),
+            start_time_ms: 0,
+            duration_ms: 100,
+            bpm: 120.0,
+            tags: vec!["Drums".to_string(), "Snare".to_string()],
+        };
+        let meta_b = VectorMetadata {
+            source_file: "b.wav".to_string(),
+            start_time_ms: 10,
+            duration_ms: 100,
+            bpm: 121.0,
+            tags: vec!["drums".to_string(), "Kick".to_string()],
+        };
+        catalog
+            .ingest_wal_atomic(&collection.id, &[0.1, 0.9], &meta_a, Some("tags-a"))
+            .expect("ingest a");
+        catalog
+            .ingest_wal_atomic(&collection.id, &[0.2, 0.8], &meta_b, Some("tags-b"))
+            .expect("ingest b");
+
+        collection.id
+    };
+
+    let reopened = SqliteCatalog::open(&config.catalog_path()).expect("reopen catalog");
+    let dictionary = reopened
+        .fetch_tag_dictionary(&collection_id)
+        .expect("fetch tag dictionary");
+    assert!(
+        dictionary.contains_key("drums"),
+        "normalized tag id for drums must persist"
+    );
+    assert!(
+        dictionary.contains_key("snare"),
+        "normalized tag id for snare must persist"
+    );
+    assert!(
+        dictionary.contains_key("kick"),
+        "normalized tag id for kick must persist"
+    );
+
+    let rows = reopened
+        .fetch_filter_rows(&collection_id)
+        .expect("fetch filter rows");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter().all(|row| !row.tag_ids.is_empty()),
+        "vector_tags join rows must be present for rebuild"
+    );
+}

@@ -350,6 +350,26 @@ pub struct FilterIndex {
 }
 
 impl FilterIndex {
+    pub fn with_dictionary(tag_ids: HashMap<String, u32>) -> Self {
+        let mut normalized = HashMap::with_capacity(tag_ids.len());
+        let mut next = 0u32;
+        for (tag, id) in tag_ids {
+            let key = tag.trim().to_ascii_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            normalized.insert(key, id);
+            next = next.max(id.saturating_add(1));
+        }
+        Self {
+            tag_ids: normalized,
+            tag_bitmaps: HashMap::new(),
+            next_tag_id: next,
+            bpm_buckets: BTreeMap::new(),
+            bpm_values: HashMap::new(),
+        }
+    }
+
     fn intern_tag(&mut self, tag: &str) -> u32 {
         if let Some(existing) = self.tag_ids.get(tag) {
             return *existing;
@@ -377,6 +397,22 @@ impl FilterIndex {
             .or_default()
             .insert(vector_id);
         self.bpm_values.insert(vector_id, metadata.bpm);
+    }
+
+    pub fn add_with_tag_ids(&mut self, vector_id: usize, bpm: f32, tag_ids: &[u32]) {
+        for tag_id in tag_ids {
+            self.next_tag_id = self.next_tag_id.max(tag_id.saturating_add(1));
+            self.tag_bitmaps
+                .entry(*tag_id)
+                .or_default()
+                .insert(vector_id);
+        }
+        let bpm_bucket = bpm.floor() as i32;
+        self.bpm_buckets
+            .entry(bpm_bucket)
+            .or_default()
+            .insert(vector_id);
+        self.bpm_values.insert(vector_id, bpm);
     }
 
     pub fn build_allow_set(&self, filter: &QueryFilter) -> Option<BitmapSet> {

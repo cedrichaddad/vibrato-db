@@ -196,6 +196,17 @@ impl VectorStore {
             .map(|(start, end)| &self.mmap[start..end])
     }
 
+    /// Return the raw mapped file bytes.
+    pub fn mapped_bytes(&self) -> &[u8] {
+        &self.mmap
+    }
+
+    /// Return the contiguous vector payload bytes (f32 region).
+    pub fn vector_bytes(&self) -> &[u8] {
+        let len = self.count * self.dim * std::mem::size_of::<f32>();
+        &self.mmap[self.data_offset..self.data_offset + len]
+    }
+
     /// Get an iterator over all vectors
     pub fn iter(&self) -> VectorIter<'_> {
         VectorIter {

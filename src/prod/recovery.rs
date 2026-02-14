@@ -52,6 +52,33 @@ pub fn recover_state(state: &Arc<ProductionState>) -> Result<RecoveryReport> {
             continue;
         }
 
+        let _ = state.catalog.enforce_quarantine_cap(
+            state.config.quarantine_max_files,
+            state.config.quarantine_max_bytes,
+        )?;
+        let usage = state.catalog.quarantine_usage()?;
+        let incoming_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let can_admit = usage.files < state.config.quarantine_max_files
+            && usage.bytes.saturating_add(incoming_bytes) <= state.config.quarantine_max_bytes;
+        if !can_admit {
+            if let Err(err) = std::fs::remove_file(&path) {
+                tracing::warn!(
+                    "quarantine_overflow_drop_failed path={:?} err={}",
+                    path,
+                    err
+                );
+            } else {
+                tracing::warn!(
+                    "quarantine_overflow_drop path={:?} size_bytes={} max_files={} max_bytes={}",
+                    path,
+                    incoming_bytes,
+                    state.config.quarantine_max_files,
+                    state.config.quarantine_max_bytes
+                );
+            }
+            continue;
+        }
+
         let quarantine_path = state.config.quarantine_dir.join(
             path.file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("orphan.vdb")),
@@ -66,6 +93,10 @@ pub fn recover_state(state: &Arc<ProductionState>) -> Result<RecoveryReport> {
             "unregistered_segment",
         )?;
         quarantined_files += 1;
+        let _ = state.catalog.enforce_quarantine_cap(
+            state.config.quarantine_max_files,
+            state.config.quarantine_max_bytes,
+        )?;
     }
 
     reconcile_inflight_jobs(state)?;

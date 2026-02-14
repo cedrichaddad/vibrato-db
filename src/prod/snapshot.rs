@@ -198,10 +198,23 @@ pub fn replay_to_lsn(
          DELETE FROM wal_entries WHERE collection_id='{}' AND lsn > {};
          DELETE FROM vector_metadata WHERE collection_id='{}' AND vector_id NOT IN
            (SELECT vector_id FROM wal_entries WHERE collection_id='{}');
+         DELETE FROM vector_tags WHERE collection_id='{}' AND vector_id NOT IN
+           (SELECT vector_id FROM wal_entries WHERE collection_id='{}');
          UPDATE wal_entries SET checkpointed_at=NULL WHERE collection_id='{}';
          UPDATE segments SET state='obsolete' WHERE collection_id='{}' AND state='active';
+         INSERT OR REPLACE INTO vector_id_counters(collection_id, next_id)
+           SELECT '{}', COALESCE(MAX(vector_id) + 1, 0) FROM vector_metadata WHERE collection_id='{}';
          COMMIT;",
-        collection_id, target_lsn, collection_id, collection_id, collection_id, collection_id
+        collection_id,
+        target_lsn,
+        collection_id,
+        collection_id,
+        collection_id,
+        collection_id,
+        collection_id,
+        collection_id,
+        collection_id,
+        collection_id
     );
     catalog.execute_sql(&sql)
 }

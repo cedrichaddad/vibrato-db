@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int, c_uchar, c_void};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
@@ -114,6 +117,355 @@ pub struct CompactionJobRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CatalogOptions {
+    pub read_timeout_ms: u64,
+    pub wal_autocheckpoint_pages: u32,
+}
+
+impl Default for CatalogOptions {
+    fn default() -> Self {
+        Self {
+            read_timeout_ms: 500,
+            wal_autocheckpoint_pages: 1000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FilterRow {
+    pub vector_id: usize,
+    pub bpm: f32,
+    pub tag_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QuarantineUsage {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+const SQLITE_OK: c_int = 0;
+const SQLITE_ROW: c_int = 100;
+const SQLITE_DONE: c_int = 101;
+const SQLITE_INTERRUPT: c_int = 9;
+
+const SQLITE_INTEGER: c_int = 1;
+const SQLITE_FLOAT: c_int = 2;
+const SQLITE_TEXT: c_int = 3;
+const SQLITE_BLOB: c_int = 4;
+const SQLITE_NULL: c_int = 5;
+
+const SQLITE_OPEN_READONLY: c_int = 0x0000_0001;
+const SQLITE_OPEN_READWRITE: c_int = 0x0000_0002;
+const SQLITE_OPEN_CREATE: c_int = 0x0000_0004;
+const SQLITE_OPEN_FULLMUTEX: c_int = 0x0001_0000;
+
+type Sqlite3 = c_void;
+type Sqlite3Stmt = c_void;
+
+#[link(name = "sqlite3")]
+unsafe extern "C" {
+    fn sqlite3_open_v2(
+        filename: *const c_char,
+        pp_db: *mut *mut Sqlite3,
+        flags: c_int,
+        z_vfs: *const c_char,
+    ) -> c_int;
+    fn sqlite3_close(db: *mut Sqlite3) -> c_int;
+    fn sqlite3_errmsg(db: *mut Sqlite3) -> *const c_char;
+    fn sqlite3_busy_timeout(db: *mut Sqlite3, ms: c_int) -> c_int;
+    fn sqlite3_prepare_v2(
+        db: *mut Sqlite3,
+        sql: *const c_char,
+        nbytes: c_int,
+        pp_stmt: *mut *mut Sqlite3Stmt,
+        pz_tail: *mut *const c_char,
+    ) -> c_int;
+    fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int;
+    fn sqlite3_finalize(stmt: *mut Sqlite3Stmt) -> c_int;
+    fn sqlite3_column_count(stmt: *mut Sqlite3Stmt) -> c_int;
+    fn sqlite3_column_name(stmt: *mut Sqlite3Stmt, i_col: c_int) -> *const c_char;
+    fn sqlite3_column_type(stmt: *mut Sqlite3Stmt, i_col: c_int) -> c_int;
+    fn sqlite3_column_int64(stmt: *mut Sqlite3Stmt, i_col: c_int) -> i64;
+    fn sqlite3_column_double(stmt: *mut Sqlite3Stmt, i_col: c_int) -> f64;
+    fn sqlite3_column_text(stmt: *mut Sqlite3Stmt, i_col: c_int) -> *const c_uchar;
+    fn sqlite3_column_blob(stmt: *mut Sqlite3Stmt, i_col: c_int) -> *const c_void;
+    fn sqlite3_column_bytes(stmt: *mut Sqlite3Stmt, i_col: c_int) -> c_int;
+    fn sqlite3_exec(
+        db: *mut Sqlite3,
+        sql: *const c_char,
+        callback: Option<
+            unsafe extern "C" fn(
+                data: *mut c_void,
+                cols: c_int,
+                values: *mut *mut c_char,
+                names: *mut *mut c_char,
+            ) -> c_int,
+        >,
+        data: *mut c_void,
+        errmsg: *mut *mut c_char,
+    ) -> c_int;
+    fn sqlite3_free(ptr: *mut c_void);
+    fn sqlite3_progress_handler(
+        db: *mut Sqlite3,
+        n_ops: c_int,
+        callback: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+        data: *mut c_void,
+    );
+}
+
+struct RawSqliteConnection {
+    db: *mut Sqlite3,
+}
+
+unsafe impl Send for RawSqliteConnection {}
+
+impl Drop for RawSqliteConnection {
+    fn drop(&mut self) {
+        if !self.db.is_null() {
+            unsafe {
+                let _ = sqlite3_close(self.db);
+            }
+            self.db = std::ptr::null_mut();
+        }
+    }
+}
+
+struct TimeoutCtx {
+    start: Instant,
+    timeout: Duration,
+    timed_out: bool,
+}
+
+impl RawSqliteConnection {
+    fn open(path: &Path, readonly: bool) -> Result<Self> {
+        let c_path = CString::new(path.to_string_lossy().as_bytes())?;
+        let mut db: *mut Sqlite3 = std::ptr::null_mut();
+        let flags = if readonly {
+            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
+        } else {
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        };
+        let rc = unsafe { sqlite3_open_v2(c_path.as_ptr(), &mut db, flags, std::ptr::null()) };
+        if rc != SQLITE_OK || db.is_null() {
+            let msg = if !db.is_null() {
+                unsafe { c_ptr_to_string(sqlite3_errmsg(db)) }
+            } else {
+                "sqlite open failed".to_string()
+            };
+            if !db.is_null() {
+                unsafe {
+                    let _ = sqlite3_close(db);
+                }
+            }
+            return Err(anyhow!("sqlite open failed: {}", msg));
+        }
+        let conn = Self { db };
+        conn.exec("PRAGMA foreign_keys=ON;")?;
+        conn.exec("PRAGMA temp_store=MEMORY;")?;
+        unsafe {
+            let _ = sqlite3_busy_timeout(conn.db, 5000);
+        }
+        Ok(conn)
+    }
+
+    fn configure_writer(&self, wal_autocheckpoint_pages: u32) -> Result<()> {
+        self.exec("PRAGMA journal_mode=WAL;")?;
+        self.exec("PRAGMA synchronous=NORMAL;")?;
+        self.exec(&format!(
+            "PRAGMA wal_autocheckpoint={};",
+            wal_autocheckpoint_pages
+        ))?;
+        self.exec("PRAGMA mmap_size=268435456;")?;
+        Ok(())
+    }
+
+    fn exec(&self, sql: &str) -> Result<()> {
+        let c_sql = CString::new(sql)?;
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            sqlite3_exec(
+                self.db,
+                c_sql.as_ptr(),
+                None,
+                std::ptr::null_mut(),
+                &mut err_ptr,
+            )
+        };
+        if rc != SQLITE_OK {
+            let msg = if !err_ptr.is_null() {
+                let s = c_ptr_to_string(err_ptr as *const c_char);
+                unsafe { sqlite3_free(err_ptr as *mut c_void) };
+                s
+            } else {
+                unsafe { c_ptr_to_string(sqlite3_errmsg(self.db)) }
+            };
+            return Err(anyhow!("sqlite exec failed: {}", msg));
+        }
+        Ok(())
+    }
+
+    fn query_json(&self, sql: &str, timeout_ms: Option<u64>) -> Result<Vec<Value>> {
+        let c_sql = CString::new(sql)?;
+        let mut rows = Vec::new();
+        let mut tail = c_sql.as_ptr();
+
+        let mut timeout_ctx = timeout_ms.map(|ms| TimeoutCtx {
+            start: Instant::now(),
+            timeout: Duration::from_millis(ms.max(1)),
+            timed_out: false,
+        });
+        if let Some(ctx) = timeout_ctx.as_mut() {
+            unsafe {
+                sqlite3_progress_handler(
+                    self.db,
+                    100,
+                    Some(progress_timeout_callback),
+                    ctx as *mut TimeoutCtx as *mut c_void,
+                );
+            }
+        }
+
+        let query_result = (|| -> Result<()> {
+            loop {
+                let mut stmt: *mut Sqlite3Stmt = std::ptr::null_mut();
+                let mut next_tail: *const c_char = std::ptr::null();
+                let rc = unsafe {
+                    sqlite3_prepare_v2(self.db, tail, -1, &mut stmt, &mut next_tail as *mut _)
+                };
+                if rc != SQLITE_OK {
+                    return Err(anyhow!("sqlite prepare failed: {}", unsafe {
+                        c_ptr_to_string(sqlite3_errmsg(self.db))
+                    }));
+                }
+
+                tail = next_tail;
+                if stmt.is_null() {
+                    if tail.is_null() || unsafe { *tail } == 0 {
+                        break;
+                    }
+                    continue;
+                }
+
+                let step_result = loop {
+                    let step_rc = unsafe { sqlite3_step(stmt) };
+                    if step_rc == SQLITE_ROW {
+                        rows.push(statement_row_to_json(stmt));
+                        continue;
+                    }
+                    if step_rc == SQLITE_DONE {
+                        break Ok(());
+                    }
+                    if step_rc == SQLITE_INTERRUPT
+                        && timeout_ctx.as_ref().map(|c| c.timed_out).unwrap_or(false)
+                    {
+                        break Err(anyhow!(
+                            "catalog_read_timeout: sqlite exceeded {}ms",
+                            timeout_ms.unwrap_or(0)
+                        ));
+                    }
+                    break Err(anyhow!("sqlite step failed: {}", unsafe {
+                        c_ptr_to_string(sqlite3_errmsg(self.db))
+                    }));
+                };
+
+                unsafe {
+                    let _ = sqlite3_finalize(stmt);
+                }
+                step_result?;
+
+                if tail.is_null() || unsafe { *tail } == 0 {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+
+        unsafe {
+            sqlite3_progress_handler(self.db, 0, None, std::ptr::null_mut());
+        }
+
+        query_result?;
+        Ok(rows)
+    }
+}
+
+unsafe extern "C" fn progress_timeout_callback(data: *mut c_void) -> c_int {
+    if data.is_null() {
+        return 0;
+    }
+    let ctx = &mut *(data as *mut TimeoutCtx);
+    if ctx.start.elapsed() >= ctx.timeout {
+        ctx.timed_out = true;
+        1
+    } else {
+        0
+    }
+}
+
+fn statement_row_to_json(stmt: *mut Sqlite3Stmt) -> Value {
+    let cols = unsafe { sqlite3_column_count(stmt) }.max(0) as usize;
+    let mut map = serde_json::Map::with_capacity(cols);
+    for i in 0..cols {
+        let name = unsafe { c_ptr_to_string(sqlite3_column_name(stmt, i as c_int)) };
+        let col_type = unsafe { sqlite3_column_type(stmt, i as c_int) };
+        let value = match col_type {
+            SQLITE_INTEGER => Value::from(unsafe { sqlite3_column_int64(stmt, i as c_int) }),
+            SQLITE_FLOAT => {
+                serde_json::Number::from_f64(unsafe { sqlite3_column_double(stmt, i as c_int) })
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null)
+            }
+            SQLITE_TEXT => {
+                let ptr = unsafe { sqlite3_column_text(stmt, i as c_int) };
+                if ptr.is_null() {
+                    Value::Null
+                } else {
+                    let s = unsafe { CStr::from_ptr(ptr as *const c_char) }
+                        .to_string_lossy()
+                        .to_string();
+                    Value::String(s)
+                }
+            }
+            SQLITE_BLOB => {
+                let ptr = unsafe { sqlite3_column_blob(stmt, i as c_int) };
+                let len = unsafe { sqlite3_column_bytes(stmt, i as c_int) }.max(0) as usize;
+                if ptr.is_null() || len == 0 {
+                    Value::String(String::new())
+                } else {
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+                    Value::String(hex_string(bytes))
+                }
+            }
+            SQLITE_NULL => Value::Null,
+            _ => Value::Null,
+        };
+        map.insert(name, value);
+    }
+    Value::Object(map)
+}
+
+fn c_ptr_to_string(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(ptr) }.to_string_lossy().to_string()
+}
+
+fn is_read_only_sql(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let first = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(first.as_str(), "SELECT" | "PRAGMA" | "WITH")
+}
+
 pub trait CatalogStore: Send + Sync {
     fn ensure_collection(&self, name: &str, dim: usize) -> Result<CollectionRecord>;
     fn get_collection(&self, name: &str) -> Result<Option<CollectionRecord>>;
@@ -214,8 +566,14 @@ pub trait CatalogStore: Send + Sync {
         vector_id: usize,
         metadata: &VectorMetadata,
     ) -> Result<()>;
-    fn fetch_metadata(&self, ids: &[usize]) -> Result<HashMap<usize, VectorMetadata>>;
+    fn fetch_metadata(
+        &self,
+        collection_id: &str,
+        ids: &[usize],
+    ) -> Result<HashMap<usize, VectorMetadata>>;
     fn fetch_all_metadata(&self, collection_id: &str) -> Result<Vec<(usize, VectorMetadata)>>;
+    fn fetch_tag_dictionary(&self, collection_id: &str) -> Result<HashMap<String, u32>>;
+    fn fetch_filter_rows(&self, collection_id: &str) -> Result<Vec<FilterRow>>;
 
     fn insert_orphan_file(
         &self,
@@ -224,6 +582,8 @@ pub trait CatalogStore: Send + Sync {
         quarantine_path: &Path,
         reason: &str,
     ) -> Result<()>;
+    fn quarantine_usage(&self) -> Result<QuarantineUsage>;
+    fn enforce_quarantine_cap(&self, max_files: usize, max_bytes: u64) -> Result<usize>;
     fn quarantine_gc(&self, ttl_secs: i64) -> Result<Vec<PathBuf>>;
 
     fn total_vectors(&self, collection_id: &str) -> Result<usize>;
@@ -242,70 +602,106 @@ pub trait CatalogStore: Send + Sync {
 
 pub struct SqliteCatalog {
     path: PathBuf,
+    options: CatalogOptions,
+    writer: std::sync::Mutex<RawSqliteConnection>,
+    readers: Vec<std::sync::Mutex<RawSqliteConnection>>,
+    next_reader: AtomicUsize,
+    read_timeout_total: AtomicU64,
+    quarantine_evictions_total: AtomicU64,
 }
 
 impl SqliteCatalog {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_options(path, CatalogOptions::default())
+    }
+
+    pub fn open_with_options(path: &Path, options: CatalogOptions) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let catalog = Self {
-            path: path.to_path_buf(),
-        };
-        catalog.exec("PRAGMA journal_mode=WAL;")?;
-        catalog.exec("PRAGMA synchronous=FULL;")?;
-        catalog.exec("PRAGMA foreign_keys=ON;")?;
-        catalog.exec("PRAGMA temp_store=MEMORY;")?;
-        catalog.exec("PRAGMA busy_timeout=5000;")?;
-        catalog.exec("PRAGMA mmap_size=268435456;")?;
+        let writer = RawSqliteConnection::open(path, false)?;
+        writer.configure_writer(options.wal_autocheckpoint_pages)?;
 
+        let mut catalog = Self {
+            path: path.to_path_buf(),
+            options,
+            writer: std::sync::Mutex::new(writer),
+            readers: Vec::new(),
+            next_reader: AtomicUsize::new(0),
+            read_timeout_total: AtomicU64::new(0),
+            quarantine_evictions_total: AtomicU64::new(0),
+        };
         catalog.apply_migrations()?;
+        catalog.init_readers(3)?;
         Ok(catalog)
     }
 
     fn exec(&self, sql: &str) -> Result<()> {
-        let output = Command::new("sqlite3")
-            .arg(&self.path)
-            .arg(sql)
-            .output()
-            .with_context(|| format!("running sqlite3 exec against {:?}", self.path))?;
+        let guard = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.exec(sql)
+    }
 
-        if !output.status.success() {
-            return Err(anyhow!(
-                "sqlite exec failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
+    fn query_json(&self, sql: &str) -> Result<Vec<Value>> {
+        let is_read = is_read_only_sql(sql);
+        let timeout = if is_read {
+            Some(self.options.read_timeout_ms.max(1))
+        } else {
+            None
+        };
+
+        let result = if is_read && !self.readers.is_empty() {
+            let idx = self.next_reader.fetch_add(1, AtomicOrdering::Relaxed) % self.readers.len();
+            let guard = self.readers[idx]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.query_json(sql, timeout)
+        } else {
+            let guard = self
+                .writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.query_json(sql, timeout)
+        };
+
+        if result
+            .as_ref()
+            .err()
+            .map(|e| e.to_string().contains("catalog_read_timeout"))
+            .unwrap_or(false)
+        {
+            self.read_timeout_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        result
+    }
+
+    fn init_readers(&mut self, count: usize) -> Result<()> {
+        self.readers.clear();
+        for _ in 0..count {
+            self.readers
+                .push(std::sync::Mutex::new(RawSqliteConnection::open(
+                    &self.path, false,
+                )?));
         }
         Ok(())
     }
 
-    fn query_json(&self, sql: &str) -> Result<Vec<Value>> {
-        let output = Command::new("sqlite3")
-            .arg("-json")
-            .arg(&self.path)
-            .arg(sql)
-            .output()
-            .with_context(|| format!("running sqlite3 query against {:?}", self.path))?;
+    pub fn read_timeout_total(&self) -> u64 {
+        self.read_timeout_total.load(AtomicOrdering::Relaxed)
+    }
 
-        if !output.status.success() {
-            return Err(anyhow!(
-                "sqlite query failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
+    pub fn quarantine_evictions_total(&self) -> u64 {
+        self.quarantine_evictions_total
+            .load(AtomicOrdering::Relaxed)
+    }
 
-        if output.stdout.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let rows: Vec<Value> = serde_json::from_slice(&output.stdout).with_context(|| {
-            format!(
-                "parsing sqlite json output: {}",
-                String::from_utf8_lossy(&output.stdout)
-            )
-        })?;
-        Ok(rows)
+    pub fn sqlite_wal_bytes(&self) -> u64 {
+        let wal_path = PathBuf::from(format!("{}-wal", self.path.to_string_lossy()));
+        std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0)
     }
 
     fn apply_migrations(&self) -> Result<()> {
@@ -316,27 +712,133 @@ impl SqliteCatalog {
             "CREATE TABLE IF NOT EXISTS wal_entries (lsn INTEGER PRIMARY KEY AUTOINCREMENT, collection_id TEXT NOT NULL, vector_id INTEGER NOT NULL, vector_json TEXT NOT NULL, metadata_json TEXT NOT NULL, idempotency_key TEXT, checkpointed_at INTEGER, created_at INTEGER NOT NULL)",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_idempotency ON wal_entries(collection_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_vector_id ON wal_entries(collection_id, vector_id)",
-            "CREATE TABLE IF NOT EXISTS vector_metadata (vector_id INTEGER PRIMARY KEY, collection_id TEXT NOT NULL, source_file TEXT NOT NULL, start_time_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL, bpm REAL NOT NULL, tags_json TEXT NOT NULL, created_at INTEGER NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_wal_pending_by_collection_lsn ON wal_entries(collection_id, checkpointed_at, lsn)",
+            "CREATE TABLE IF NOT EXISTS vector_metadata (collection_id TEXT NOT NULL, vector_id INTEGER NOT NULL, source_file TEXT NOT NULL, start_time_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL, bpm REAL NOT NULL, tags_json TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(collection_id, vector_id))",
+            "CREATE INDEX IF NOT EXISTS idx_vector_metadata_collection_vector ON vector_metadata(collection_id, vector_id)",
+            "CREATE TABLE IF NOT EXISTS vector_id_counters (collection_id TEXT PRIMARY KEY, next_id INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS tag_ids (collection_id TEXT NOT NULL, id INTEGER NOT NULL, tag TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(collection_id, id), UNIQUE(collection_id, tag))",
+            "CREATE INDEX IF NOT EXISTS idx_tag_ids_collection_tag ON tag_ids(collection_id, tag)",
+            "CREATE TABLE IF NOT EXISTS vector_tags (collection_id TEXT NOT NULL, vector_id INTEGER NOT NULL, tag_id INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(collection_id, vector_id, tag_id))",
+            "CREATE INDEX IF NOT EXISTS idx_vector_tags_collection_vector ON vector_tags(collection_id, vector_id)",
+            "CREATE INDEX IF NOT EXISTS idx_vector_tags_collection_tag ON vector_tags(collection_id, tag_id)",
             "CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL, roles TEXT NOT NULL, created_at INTEGER NOT NULL, revoked_at INTEGER)",
             "CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, request_id TEXT NOT NULL, api_key_id TEXT, endpoint TEXT NOT NULL, action TEXT NOT NULL, status_code INTEGER NOT NULL, latency_ms REAL NOT NULL, client_ip TEXT, details_json TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS checkpoint_jobs (id TEXT PRIMARY KEY, collection_id TEXT NOT NULL, state TEXT NOT NULL, start_lsn INTEGER, end_lsn INTEGER, details_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
             "CREATE TABLE IF NOT EXISTS compaction_jobs (id TEXT PRIMARY KEY, collection_id TEXT NOT NULL, state TEXT NOT NULL, details_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS orphan_files (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id TEXT NOT NULL, original_path TEXT NOT NULL, quarantine_path TEXT NOT NULL, reason TEXT NOT NULL, quarantined_at INTEGER NOT NULL, deleted_at INTEGER)",
+            "CREATE TABLE IF NOT EXISTS orphan_files (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id TEXT NOT NULL, original_path TEXT NOT NULL, quarantine_path TEXT NOT NULL, reason TEXT NOT NULL, size_bytes INTEGER NOT NULL DEFAULT 0, quarantined_at INTEGER NOT NULL, deleted_at INTEGER, deleted_reason TEXT)",
         ];
 
         for sql in migration_sql {
             self.exec(sql)?;
         }
+        self.migrate_vector_metadata_pk()?;
+        self.ensure_column("orphan_files", "size_bytes", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("orphan_files", "deleted_reason", "TEXT")?;
+        self.ensure_column("api_keys", "hash_version", "INTEGER NOT NULL DEFAULT 1")?;
+        self.exec(
+            "INSERT OR IGNORE INTO vector_id_counters(collection_id, next_id)
+             SELECT collection_id, COALESCE(MAX(vector_id) + 1, 0)
+             FROM vector_metadata
+             GROUP BY collection_id;",
+        )?;
+        self.backfill_vector_tags_if_needed()?;
         self.exec(&format!(
-            "INSERT OR REPLACE INTO schema_migrations(version, applied_at, checksum) VALUES (1, {}, '{}');",
+            "INSERT OR REPLACE INTO schema_migrations(version, applied_at, checksum) VALUES (2, {}, '{}');",
             now_unix_ts(),
-            sql_quote("v1")
+            sql_quote("v2_1")
         ))?;
         Ok(())
     }
 
     pub fn execute_sql(&self, sql: &str) -> Result<()> {
         self.exec(sql)
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+        let rows = self.query_json(&format!("PRAGMA table_info({});", table))?;
+        let exists = rows.iter().any(|row| {
+            row.get("name")
+                .and_then(Value::as_str)
+                .map(|name| name == column)
+                .unwrap_or(false)
+        });
+        if exists {
+            return Ok(());
+        }
+        self.exec(&format!(
+            "ALTER TABLE {} ADD COLUMN {} {};",
+            table, column, decl
+        ))
+    }
+
+    fn migrate_vector_metadata_pk(&self) -> Result<()> {
+        let rows = self.query_json("PRAGMA table_info(vector_metadata);")?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut has_collection_pk = false;
+        let mut has_vector_pk = false;
+        for row in &rows {
+            let name = row.get("name").and_then(Value::as_str).unwrap_or_default();
+            let pk = row.get("pk").and_then(Value::as_i64).unwrap_or_default();
+            if pk > 0 && name == "collection_id" {
+                has_collection_pk = true;
+            }
+            if pk > 0 && name == "vector_id" {
+                has_vector_pk = true;
+            }
+        }
+        if has_collection_pk && has_vector_pk {
+            return Ok(());
+        }
+
+        self.exec(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS vector_metadata_v2 (
+               collection_id TEXT NOT NULL,
+               vector_id INTEGER NOT NULL,
+               source_file TEXT NOT NULL,
+               start_time_ms INTEGER NOT NULL,
+               duration_ms INTEGER NOT NULL,
+               bpm REAL NOT NULL,
+               tags_json TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               PRIMARY KEY(collection_id, vector_id)
+             );
+             INSERT OR REPLACE INTO vector_metadata_v2(
+               collection_id, vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json, created_at
+             )
+             SELECT collection_id, vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json, created_at
+             FROM vector_metadata;
+             DROP TABLE vector_metadata;
+             ALTER TABLE vector_metadata_v2 RENAME TO vector_metadata;
+             COMMIT;",
+        )
+    }
+
+    fn backfill_vector_tags_if_needed(&self) -> Result<()> {
+        let rows = self.query_json("SELECT COUNT(*) AS n FROM vector_tags;")?;
+        let existing = rows
+            .first()
+            .and_then(|r| r["n"].as_i64())
+            .unwrap_or_default();
+        if existing > 0 {
+            return Ok(());
+        }
+
+        let collections = self.query_json("SELECT id FROM collections ORDER BY id ASC;")?;
+        for row in collections {
+            let collection_id = row["id"].as_str().unwrap_or_default();
+            if collection_id.is_empty() {
+                continue;
+            }
+            let metadata_rows = self.fetch_all_metadata(collection_id)?;
+            for (vector_id, metadata) in metadata_rows {
+                self.upsert_metadata(collection_id, vector_id, &metadata)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -409,7 +911,7 @@ impl CatalogStore for SqliteCatalog {
         let hash = hash_secret(pepper, &secret);
 
         self.exec(&format!(
-            "INSERT INTO api_keys(id, name, key_hash, roles, created_at, revoked_at) VALUES ('{}', '{}', '{}', '{}', {}, NULL);",
+            "INSERT INTO api_keys(id, name, key_hash, roles, created_at, revoked_at, hash_version) VALUES ('{}', '{}', '{}', '{}', {}, NULL, 2);",
             sql_quote(&id),
             sql_quote(name),
             sql_quote(&hash),
@@ -447,15 +949,22 @@ impl CatalogStore for SqliteCatalog {
     }
 
     fn next_vector_id(&self, collection_id: &str) -> Result<usize> {
+        let collection = sql_quote(collection_id);
         let rows = self.query_json(&format!(
-            "SELECT COALESCE(MAX(vector_id), -1) AS max_id FROM vector_metadata WHERE collection_id='{}';",
-            sql_quote(collection_id)
+            "BEGIN IMMEDIATE;
+             INSERT OR IGNORE INTO vector_id_counters(collection_id, next_id)
+             SELECT '{collection}', COALESCE(MAX(vector_id) + 1, 0)
+             FROM vector_metadata
+             WHERE collection_id='{collection}';
+             SELECT next_id AS next_id FROM vector_id_counters WHERE collection_id='{collection}' LIMIT 1;
+             COMMIT;"
         ))?;
-        let max_id = rows
+        let next_id = rows
             .first()
-            .and_then(|r| r["max_id"].as_i64())
-            .unwrap_or(-1);
-        Ok((max_id + 1) as usize)
+            .and_then(|r| r["next_id"].as_i64())
+            .unwrap_or(0)
+            .max(0);
+        Ok(next_id as usize)
     }
 
     fn ingest_wal(
@@ -867,20 +1376,73 @@ impl CatalogStore for SqliteCatalog {
         vector_id: usize,
         metadata: &VectorMetadata,
     ) -> Result<()> {
+        let now = now_unix_ts();
+        let collection = sql_quote(collection_id);
+        let mut tags = metadata
+            .tags
+            .iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>();
+        tags.sort();
+        tags.dedup();
+
+        let mut tag_sql = format!(
+            "DELETE FROM vector_tags WHERE collection_id='{}' AND vector_id={};",
+            collection, vector_id
+        );
+        for tag in &tags {
+            let tag_q = sql_quote(tag);
+            tag_sql.push_str(&format!(
+                "INSERT INTO tag_ids(collection_id, id, tag, created_at)
+                 SELECT '{collection}',
+                        COALESCE((SELECT MAX(id) + 1 FROM tag_ids WHERE collection_id='{collection}'), 1),
+                        '{tag_q}',
+                        {now}
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM tag_ids WHERE collection_id='{collection}' AND tag='{tag_q}'
+                 );
+                 INSERT OR IGNORE INTO vector_tags(collection_id, vector_id, tag_id, created_at)
+                 SELECT '{collection}', {vector_id}, id, {now}
+                 FROM tag_ids
+                 WHERE collection_id='{collection}' AND tag='{tag_q}'
+                 LIMIT 1;"
+            ));
+        }
+
         self.exec(&format!(
-            "INSERT OR REPLACE INTO vector_metadata(vector_id, collection_id, source_file, start_time_ms, duration_ms, bpm, tags_json, created_at) VALUES ({}, '{}', '{}', {}, {}, {}, '{}', {});",
+            "BEGIN IMMEDIATE;
+             INSERT OR IGNORE INTO vector_id_counters(collection_id, next_id)
+             SELECT '{}', COALESCE(MAX(vector_id) + 1, 0) FROM vector_metadata WHERE collection_id='{}';
+             UPDATE vector_id_counters
+             SET next_id = CASE WHEN next_id <= {} THEN {} ELSE next_id END
+             WHERE collection_id='{}';
+             INSERT OR REPLACE INTO vector_metadata(collection_id, vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json, created_at)
+             VALUES ('{}', {}, '{}', {}, {}, {}, '{}', {});
+             {}
+             COMMIT;",
+            collection,
+            collection,
             vector_id,
-            sql_quote(collection_id),
+            vector_id + 1,
+            collection,
+            collection,
+            vector_id,
             sql_quote(&metadata.source_file),
             metadata.start_time_ms,
             metadata.duration_ms,
             metadata.bpm,
-            sql_quote(&serde_json::to_string(&metadata.tags)?),
-            now_unix_ts(),
+            sql_quote(&serde_json::to_string(&tags)?),
+            now,
+            tag_sql,
         ))
     }
 
-    fn fetch_metadata(&self, ids: &[usize]) -> Result<HashMap<usize, VectorMetadata>> {
+    fn fetch_metadata(
+        &self,
+        collection_id: &str,
+        ids: &[usize],
+    ) -> Result<HashMap<usize, VectorMetadata>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -896,8 +1458,9 @@ impl CatalogStore for SqliteCatalog {
         let rows = self.query_json(&format!(
             "SELECT vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json
              FROM vector_metadata
-             WHERE vector_id IN ({})
+             WHERE collection_id='{}' AND vector_id IN ({})
              ORDER BY vector_id ASC;",
+            sql_quote(collection_id),
             in_clause
         ))?;
 
@@ -947,6 +1510,64 @@ impl CatalogStore for SqliteCatalog {
         Ok(out)
     }
 
+    fn fetch_tag_dictionary(&self, collection_id: &str) -> Result<HashMap<String, u32>> {
+        let rows = self.query_json(&format!(
+            "SELECT id, tag
+             FROM tag_ids
+             WHERE collection_id='{}'
+             ORDER BY id ASC;",
+            sql_quote(collection_id)
+        ))?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let tag = row["tag"].as_str().unwrap_or_default().to_string();
+            let id = row["id"].as_i64().unwrap_or_default().max(0) as u32;
+            if !tag.is_empty() {
+                out.insert(tag, id);
+            }
+        }
+        Ok(out)
+    }
+
+    fn fetch_filter_rows(&self, collection_id: &str) -> Result<Vec<FilterRow>> {
+        let rows = self.query_json(&format!(
+            "SELECT vm.vector_id AS vector_id, vm.bpm AS bpm, COALESCE(GROUP_CONCAT(vt.tag_id), '') AS tag_ids
+             FROM vector_metadata vm
+             LEFT JOIN vector_tags vt
+               ON vt.collection_id = vm.collection_id
+              AND vt.vector_id = vm.vector_id
+             WHERE vm.collection_id='{}'
+             GROUP BY vm.vector_id, vm.bpm
+             ORDER BY vm.vector_id ASC;",
+            sql_quote(collection_id)
+        ))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let vector_id = row["vector_id"].as_i64().unwrap_or_default().max(0) as usize;
+            let bpm = row["bpm"].as_f64().unwrap_or_default() as f32;
+            let tag_ids = row["tag_ids"]
+                .as_str()
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|v| {
+                    let t = v.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<u32>().ok()
+                    }
+                })
+                .collect::<Vec<_>>();
+            out.push(FilterRow {
+                vector_id,
+                bpm,
+                tag_ids,
+            });
+        }
+        Ok(out)
+    }
+
     fn insert_orphan_file(
         &self,
         collection_id: &str,
@@ -954,14 +1575,89 @@ impl CatalogStore for SqliteCatalog {
         quarantine_path: &Path,
         reason: &str,
     ) -> Result<()> {
+        let size_bytes = std::fs::metadata(quarantine_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         self.exec(&format!(
-            "INSERT INTO orphan_files(collection_id, original_path, quarantine_path, reason, quarantined_at, deleted_at) VALUES ('{}', '{}', '{}', '{}', {}, NULL);",
+            "INSERT INTO orphan_files(collection_id, original_path, quarantine_path, reason, size_bytes, quarantined_at, deleted_at, deleted_reason) VALUES ('{}', '{}', '{}', '{}', {}, {}, NULL, NULL);",
             sql_quote(collection_id),
             sql_quote(&original_path.to_string_lossy()),
             sql_quote(&quarantine_path.to_string_lossy()),
             sql_quote(reason),
+            size_bytes,
             now_unix_ts()
         ))
+    }
+
+    fn quarantine_usage(&self) -> Result<QuarantineUsage> {
+        let rows = self.query_json(
+            "SELECT COUNT(*) AS files, COALESCE(SUM(size_bytes), 0) AS bytes
+             FROM orphan_files
+             WHERE deleted_at IS NULL;",
+        )?;
+        let files = rows
+            .first()
+            .and_then(|r| r["files"].as_i64())
+            .unwrap_or_default()
+            .max(0) as usize;
+        let bytes = rows
+            .first()
+            .and_then(|r| r["bytes"].as_i64())
+            .unwrap_or_default()
+            .max(0) as u64;
+        Ok(QuarantineUsage { files, bytes })
+    }
+
+    fn enforce_quarantine_cap(&self, max_files: usize, max_bytes: u64) -> Result<usize> {
+        let rows = self.query_json(
+            "SELECT id, quarantine_path, COALESCE(size_bytes, 0) AS size_bytes
+             FROM orphan_files
+             WHERE deleted_at IS NULL
+             ORDER BY quarantined_at ASC, id ASC;",
+        )?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tracked = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row["id"].as_i64().unwrap_or_default(),
+                    PathBuf::from(row["quarantine_path"].as_str().unwrap_or_default()),
+                    row["size_bytes"].as_i64().unwrap_or_default().max(0) as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut files = tracked.len();
+        let mut bytes = tracked.iter().map(|(_, _, sz)| *sz).sum::<u64>();
+        let mut evicted = 0usize;
+
+        while files > max_files || bytes > max_bytes {
+            let Some((id, path, size)) = tracked.first().cloned() else {
+                break;
+            };
+            tracked.remove(0);
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+            self.exec(&format!(
+                "UPDATE orphan_files
+                 SET deleted_at = {}, deleted_reason = 'cap_evict'
+                 WHERE id = {};",
+                now_unix_ts(),
+                id
+            ))?;
+            files = files.saturating_sub(1);
+            bytes = bytes.saturating_sub(size);
+            evicted += 1;
+        }
+
+        if evicted > 0 {
+            self.quarantine_evictions_total
+                .fetch_add(evicted as u64, AtomicOrdering::Relaxed);
+        }
+        Ok(evicted)
     }
 
     fn quarantine_gc(&self, ttl_secs: i64) -> Result<Vec<PathBuf>> {
@@ -979,7 +1675,7 @@ impl CatalogStore for SqliteCatalog {
                 let _ = std::fs::remove_file(&path);
             }
             self.exec(&format!(
-                "UPDATE orphan_files SET deleted_at = {} WHERE id = {};",
+                "UPDATE orphan_files SET deleted_at = {}, deleted_reason = 'ttl_gc' WHERE id = {};",
                 now_unix_ts(),
                 id
             ))?;
@@ -1081,9 +1777,7 @@ impl SqliteCatalog {
         let now = now_unix_ts();
         let collection = sql_quote(collection_id);
         let vector_json = sql_quote(&serde_json::to_string(vector)?);
-        let metadata_json = sql_quote(&serde_json::to_string(metadata)?);
         let source_file = sql_quote(&metadata.source_file);
-        let tags_json = sql_quote(&serde_json::to_string(&metadata.tags)?);
 
         let key_sql = normalized_key
             .as_ref()
@@ -1104,11 +1798,75 @@ impl SqliteCatalog {
             String::new()
         };
 
-        let assigned_vector_id_expr = match vector_id {
-            Some(v) => v.to_string(),
+        let mut normalized_tags = metadata
+            .tags
+            .iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>();
+        normalized_tags.sort();
+        normalized_tags.dedup();
+
+        let mut normalized_metadata = metadata.clone();
+        normalized_metadata.tags = normalized_tags.clone();
+        let metadata_json = sql_quote(&serde_json::to_string(&normalized_metadata)?);
+        let tags_json = sql_quote(&serde_json::to_string(&normalized_tags)?);
+
+        let mut tag_sql = String::new();
+        if !normalized_tags.is_empty() {
+            tag_sql.push_str(&format!(
+                "DELETE FROM vector_tags
+                 WHERE collection_id='{collection}'
+                   AND vector_id IN (SELECT vector_id FROM _ingest_res WHERE created = 1);"
+            ));
+            for tag in normalized_tags {
+                let tag_q = sql_quote(&tag);
+                tag_sql.push_str(&format!(
+                    "INSERT INTO tag_ids(collection_id, id, tag, created_at)
+                     SELECT '{collection}',
+                            COALESCE((SELECT MAX(id) + 1 FROM tag_ids WHERE collection_id='{collection}'), 1),
+                            '{tag_q}',
+                            {now}
+                     WHERE NOT EXISTS (
+                       SELECT 1 FROM tag_ids WHERE collection_id='{collection}' AND tag='{tag_q}'
+                     );
+                     INSERT OR IGNORE INTO vector_tags(collection_id, vector_id, tag_id, created_at)
+                     SELECT '{collection}', vector_id,
+                            (SELECT id FROM tag_ids WHERE collection_id='{collection}' AND tag='{tag_q}' LIMIT 1),
+                            {now}
+                     FROM _ingest_res
+                     WHERE created = 1;"
+                ));
+            }
+        }
+
+        let counter_init_sql = format!(
+            "INSERT OR IGNORE INTO vector_id_counters(collection_id, next_id)
+             SELECT '{collection}', COALESCE(MAX(vector_id) + 1, 0)
+             FROM vector_metadata
+             WHERE collection_id='{collection}';"
+        );
+
+        let alloc_sql = match vector_id {
+            Some(v) => format!(
+                "INSERT INTO _ingest_alloc(vector_id)
+                 SELECT {v}
+                 WHERE NOT EXISTS (SELECT 1 FROM _ingest_res);
+                 {counter_init_sql}
+                 UPDATE vector_id_counters
+                 SET next_id = CASE WHEN next_id <= {v} THEN {next} ELSE next_id END
+                 WHERE collection_id='{collection}' AND NOT EXISTS (SELECT 1 FROM _ingest_res);",
+                next = v + 1
+            ),
             None => format!(
-                "COALESCE((SELECT MAX(vector_id) + 1 FROM vector_metadata WHERE collection_id='{}'), 0)",
-                collection
+                "{counter_init_sql}
+                 UPDATE vector_id_counters
+                 SET next_id = next_id + 1
+                 WHERE collection_id='{collection}' AND NOT EXISTS (SELECT 1 FROM _ingest_res);
+                 INSERT INTO _ingest_alloc(vector_id)
+                 SELECT next_id - 1
+                 FROM vector_id_counters
+                 WHERE collection_id='{collection}' AND NOT EXISTS (SELECT 1 FROM _ingest_res);"
             ),
         };
 
@@ -1119,26 +1877,34 @@ impl SqliteCatalog {
                created INTEGER NOT NULL,
                lsn INTEGER
              );
+             CREATE TEMP TABLE IF NOT EXISTS _ingest_alloc(
+               vector_id INTEGER NOT NULL
+             );
              DELETE FROM _ingest_res;
+             DELETE FROM _ingest_alloc;
+             {}
              {}
              INSERT INTO wal_entries(collection_id, vector_id, vector_json, metadata_json, idempotency_key, checkpointed_at, created_at)
-             SELECT '{}', {}, '{}', '{}', {}, NULL, {}
-             WHERE NOT EXISTS (SELECT 1 FROM _ingest_res);
+             SELECT '{}', vector_id, '{}', '{}', {}, NULL, {}
+             FROM _ingest_alloc
+             WHERE NOT EXISTS (SELECT 1 FROM _ingest_res)
+             LIMIT 1;
              INSERT INTO _ingest_res(vector_id, created, lsn)
              SELECT vector_id, 1, lsn
              FROM wal_entries
              WHERE lsn = last_insert_rowid()
                AND changes() > 0
                AND NOT EXISTS (SELECT 1 FROM _ingest_res);
-             INSERT OR REPLACE INTO vector_metadata(vector_id, collection_id, source_file, start_time_ms, duration_ms, bpm, tags_json, created_at)
-             SELECT vector_id, '{}', '{}', {}, {}, {}, '{}', {}
+             INSERT OR REPLACE INTO vector_metadata(collection_id, vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json, created_at)
+             SELECT '{}', vector_id, '{}', {}, {}, {}, '{}', {}
              FROM _ingest_res
              WHERE created = 1;
+             {}
              SELECT vector_id, created, lsn FROM _ingest_res LIMIT 1;
              COMMIT;",
             idempotency_lookup,
+            alloc_sql,
             collection,
-            assigned_vector_id_expr,
             vector_json,
             metadata_json,
             key_sql,
@@ -1149,7 +1915,8 @@ impl SqliteCatalog {
             metadata.duration_ms,
             metadata.bpm,
             tags_json,
-            now
+            now,
+            tag_sql
         );
 
         let rows = self.query_json(&sql)?;

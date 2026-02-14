@@ -681,55 +681,92 @@ impl HNSW {
         }
 
         let seq_len = query_sequence.len();
+        let probe_count = seq_len.min(3);
+        let min_anchor_gap = if seq_len >= 48 {
+            48
+        } else if seq_len >= 32 {
+            32
+        } else if seq_len >= 16 {
+            16
+        } else {
+            1
+        };
 
-        // Step 1: Find the most salient vector (highest L2 norm)
-        let (salient_offset, _) = query_sequence
+        let mut salience = query_sequence
             .iter()
             .enumerate()
             .map(|(i, v)| {
                 let norm_sq: f32 = v.iter().map(|x| x * x).sum();
                 (i, norm_sq)
             })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
-            .unwrap();
+            .collect::<Vec<_>>();
+        salience.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
-        let salient_query = &query_sequence[salient_offset];
-
-        // Step 2: HNSW search for the salient vector (over-fetch for candidates)
-        let anchor_candidates = self.search(salient_query, k * 4, ef);
-
-        // Step 3: For each candidate anchor, compute the start_id and verify
-        // the full sequence alignment via brute-force
-        let mut sequence_results: Vec<(usize, f32)> = Vec::new();
-
-        for (anchor_id, _anchor_score) in &anchor_candidates {
-            // The anchor matches query_sequence[salient_offset],
-            // so the sequence would start at anchor_id - salient_offset
-            let start_id = if *anchor_id >= salient_offset {
-                anchor_id - salient_offset
-            } else {
-                continue; // Can't fit the sequence
-            };
-
-            // Check bounds: sequence must fit within total vectors
-            if start_id + seq_len > total_vectors {
-                continue;
+        let mut anchor_offsets: Vec<usize> = Vec::with_capacity(probe_count);
+        for (idx, _) in &salience {
+            if anchor_offsets
+                .iter()
+                .all(|selected| selected.abs_diff(*idx) >= min_anchor_gap)
+            {
+                anchor_offsets.push(*idx);
+                if anchor_offsets.len() >= probe_count {
+                    break;
+                }
             }
-
-            // Brute-force verify: compute average similarity across all positions
-            let mut total_sim = 0.0f32;
-            for (offset, query_vec) in query_sequence.iter().enumerate() {
-                let vec_id = start_id + offset;
-                self.with_vector(vec_id, &mut |stored_vec| {
-                    total_sim += dot_product(query_vec, stored_vec);
-                });
-            }
-            let avg_sim = total_sim / seq_len as f32;
-
-            sequence_results.push((start_id, avg_sim));
+        }
+        if anchor_offsets.is_empty() {
+            anchor_offsets.push(salience.first().map(|(i, _)| *i).unwrap_or(0));
         }
 
-        // Sort by similarity (descending) and return top k
+        let mut best_by_start: HashMap<usize, f32> = HashMap::new();
+        let anchor_overfetch = (k.saturating_mul(6)).max(32);
+
+        for salient_offset in anchor_offsets {
+            let salient_query = &query_sequence[salient_offset];
+            let anchor_candidates = self.search(salient_query, anchor_overfetch, ef);
+
+            for (anchor_id, _anchor_score) in &anchor_candidates {
+                let start_id = if *anchor_id >= salient_offset {
+                    anchor_id - salient_offset
+                } else {
+                    continue;
+                };
+
+                if start_id + seq_len > total_vectors {
+                    continue;
+                }
+
+                let mut total_sim = 0.0f32;
+                let mut valid = true;
+                for (offset, query_vec) in query_sequence.iter().enumerate() {
+                    let vec_id = start_id + offset;
+                    if vec_id >= total_vectors {
+                        valid = false;
+                        break;
+                    }
+                    self.with_vector(vec_id, &mut |stored_vec| {
+                        total_sim += dot_product(query_vec, stored_vec);
+                    });
+                }
+                if !valid {
+                    continue;
+                }
+
+                let avg_sim = total_sim / seq_len as f32;
+                match best_by_start.get_mut(&start_id) {
+                    Some(existing) => {
+                        if avg_sim > *existing {
+                            *existing = avg_sim;
+                        }
+                    }
+                    None => {
+                        best_by_start.insert(start_id, avg_sim);
+                    }
+                }
+            }
+        }
+
+        let mut sequence_results = best_by_start.into_iter().collect::<Vec<_>>();
         sequence_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
         sequence_results.truncate(k);
         sequence_results
@@ -1141,5 +1178,20 @@ mod tests {
         let query_seq: Vec<Vec<f32>> = vec![random_vector(128)];
         let results = hnsw.search_subsequence(&query_seq, 5, 100, 0);
         assert!(results.is_empty(), "Empty index should return no results");
+    }
+
+    #[test]
+    fn test_search_subsequence_bounds_are_safe() {
+        let vectors: Vec<_> = (0..5).map(|_| random_vector(16)).collect();
+        let vectors_clone = vectors.clone();
+        let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
+        for i in 0..vectors.len() {
+            hnsw.insert(i);
+        }
+
+        // Query length exceeds total vectors; function must return without panic.
+        let query_seq: Vec<Vec<f32>> = (0..8).map(|_| random_vector(16)).collect();
+        let results = hnsw.search_subsequence(&query_seq, 3, 50, vectors.len());
+        assert!(results.is_empty());
     }
 }

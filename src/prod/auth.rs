@@ -1,6 +1,9 @@
 use axum::http::HeaderMap;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use super::catalog::{parse_token, verify_token_hash, CatalogStore, Role};
+use super::catalog::{parse_token, verify_token_hash, ApiKeyRecord, CatalogStore, Role};
 
 #[derive(Debug)]
 pub enum AuthError {
@@ -8,6 +11,20 @@ pub enum AuthError {
     Invalid,
     Forbidden,
     Internal,
+}
+
+const API_KEY_CACHE_TTL: Duration = Duration::from_secs(30);
+const API_KEY_CACHE_MAX: usize = 4096;
+
+#[derive(Debug, Clone)]
+struct CachedKey {
+    record: ApiKeyRecord,
+    expires_at: Instant,
+}
+
+fn key_cache() -> &'static Mutex<HashMap<String, CachedKey>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedKey>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn authorize(
@@ -27,11 +44,42 @@ pub fn authorize(
 
     let (key_id, secret) = parse_token(auth).ok_or(AuthError::Invalid)?;
 
-    let Some(key) = catalog
-        .lookup_api_key(&key_id)
-        .map_err(|_| AuthError::Internal)?
-    else {
-        return Err(AuthError::Invalid);
+    let now = Instant::now();
+    let cached = {
+        let mut guard = key_cache().lock().map_err(|_| AuthError::Internal)?;
+        if let Some(entry) = guard.get(&key_id) {
+            if entry.expires_at > now {
+                Some(entry.record.clone())
+            } else {
+                guard.remove(&key_id);
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    let key = if let Some(cached_key) = cached {
+        cached_key
+    } else {
+        let Some(fetched) = catalog
+            .lookup_api_key(&key_id)
+            .map_err(|_| AuthError::Internal)?
+        else {
+            return Err(AuthError::Invalid);
+        };
+        let mut guard = key_cache().lock().map_err(|_| AuthError::Internal)?;
+        if guard.len() >= API_KEY_CACHE_MAX {
+            guard.clear();
+        }
+        guard.insert(
+            key_id.clone(),
+            CachedKey {
+                record: fetched.clone(),
+                expires_at: now + API_KEY_CACHE_TTL,
+            },
+        );
+        fetched
     };
 
     if key.revoked {

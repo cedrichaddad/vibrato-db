@@ -8,8 +8,8 @@ pub mod recovery;
 pub mod snapshot;
 
 pub use api::create_v2_router;
-pub use catalog::{ApiKeyCreateResult, CatalogStore, Role, SqliteCatalog};
-pub use engine::{ProductionConfig, ProductionState};
+pub use catalog::{ApiKeyCreateResult, CatalogOptions, CatalogStore, Role, SqliteCatalog};
+pub use engine::{ProductionConfig, ProductionState, VectorMadviseMode};
 pub use recovery::{
     bootstrap_data_dirs, migrate_existing_vdb_to_segment, recover_state, RecoveryReport,
 };

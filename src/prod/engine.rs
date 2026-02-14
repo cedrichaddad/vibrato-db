@@ -28,8 +28,15 @@ use super::catalog::{
 };
 use super::filter::{BitmapSet, FilterIndex};
 use super::model::{
-    JobResponseV2, QueryRequestV2, QueryResponseV2, QueryResultV2, SearchTier, StatsResponseV2,
+    IdentifyRequestV2, IdentifyResponseV2, IdentifyResultV2, JobResponseV2, QueryRequestV2,
+    QueryResponseV2, QueryResultV2, SearchTier, StatsResponseV2,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorMadviseMode {
+    Normal,
+    Random,
+}
 
 #[derive(Debug, Clone)]
 pub struct ProductionConfig {
@@ -48,18 +55,34 @@ pub struct ProductionConfig {
     pub orphan_ttl: Duration,
     pub audio_colocated: bool,
     pub public_health_metrics: bool,
+    pub catalog_read_timeout_ms: u64,
+    pub sqlite_wal_autocheckpoint_pages: u32,
+    pub quarantine_max_files: usize,
+    pub quarantine_max_bytes: u64,
+    pub vector_madvise_mode: VectorMadviseMode,
     pub api_pepper: String,
 }
 
 #[derive(Default)]
 pub struct Metrics {
     pub query_total: AtomicU64,
+    pub identify_total: AtomicU64,
     pub ingest_total: AtomicU64,
     pub auth_failures_total: AtomicU64,
     pub audit_failures_total: AtomicU64,
     pub checkpoint_total: AtomicU64,
     pub compaction_total: AtomicU64,
     pub obsolete_files_deleted_total: AtomicU64,
+    pub query_latency_us_le_10: AtomicU64,
+    pub query_latency_us_le_25: AtomicU64,
+    pub query_latency_us_le_50: AtomicU64,
+    pub query_latency_us_le_100: AtomicU64,
+    pub query_latency_us_le_250: AtomicU64,
+    pub query_latency_us_le_500: AtomicU64,
+    pub query_latency_us_le_1000: AtomicU64,
+    pub query_latency_us_le_2500: AtomicU64,
+    pub query_latency_us_le_5000: AtomicU64,
+    pub query_latency_us_gt_5000: AtomicU64,
 }
 
 pub struct SegmentHandle {
@@ -135,6 +158,11 @@ impl ProductionConfig {
             orphan_ttl: Duration::from_secs(168 * 3600),
             audio_colocated: true,
             public_health_metrics: true,
+            catalog_read_timeout_ms: 500,
+            sqlite_wal_autocheckpoint_pages: 1000,
+            quarantine_max_files: 50,
+            quarantine_max_bytes: 5 * 1024 * 1024 * 1024,
+            vector_madvise_mode: VectorMadviseMode::Normal,
             api_pepper: std::env::var("VIBRATO_API_PEPPER")
                 .unwrap_or_else(|_| "dev-pepper".to_string()),
         }
@@ -199,6 +227,51 @@ impl ProductionState {
     pub fn set_ready(&self, ready: bool, report: impl Into<String>) {
         self.ready.store(ready, AtomicOrdering::SeqCst);
         *self.recovery_report.write() = report.into();
+    }
+
+    fn observe_query_latency_us(&self, us: u64) {
+        let bucket = &self.metrics;
+        if us <= 10 {
+            bucket
+                .query_latency_us_le_10
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else if us <= 25 {
+            bucket
+                .query_latency_us_le_25
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else if us <= 50 {
+            bucket
+                .query_latency_us_le_50
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else if us <= 100 {
+            bucket
+                .query_latency_us_le_100
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else if us <= 250 {
+            bucket
+                .query_latency_us_le_250
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else if us <= 500 {
+            bucket
+                .query_latency_us_le_500
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else if us <= 1_000 {
+            bucket
+                .query_latency_us_le_1000
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else if us <= 2_500 {
+            bucket
+                .query_latency_us_le_2500
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else if us <= 5_000 {
+            bucket
+                .query_latency_us_le_5000
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else {
+            bucket
+                .query_latency_us_gt_5000
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
     }
 
     pub fn audit_event_best_effort(
@@ -404,6 +477,7 @@ impl ProductionState {
         self.metrics
             .query_total
             .fetch_add(1, AtomicOrdering::Relaxed);
+        self.observe_query_latency_us(start.elapsed().as_micros() as u64);
         let query_time_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         Ok(QueryResponseV2 {
@@ -419,6 +493,195 @@ impl ProductionState {
                     },
                 })
                 .collect(),
+            query_time_ms,
+        })
+    }
+
+    pub fn identify(&self, request: &IdentifyRequestV2) -> Result<IdentifyResponseV2> {
+        let start = Instant::now();
+        if request.vectors.is_empty() {
+            return Err(anyhow!("identify requires at least one vector"));
+        }
+        if request.k == 0 {
+            return Ok(IdentifyResponseV2 {
+                results: Vec::new(),
+                query_time_ms: 0.0,
+            });
+        }
+        for (i, vector) in request.vectors.iter().enumerate() {
+            if vector.len() != self.collection.dim {
+                return Err(anyhow!(
+                    "dimension mismatch at vectors[{}]: expected {}, got {}",
+                    i,
+                    self.collection.dim,
+                    vector.len()
+                ));
+            }
+        }
+
+        let seq_len = request.vectors.len();
+        let mut best: HashMap<usize, f32> = HashMap::new();
+
+        let hot_bounds = {
+            let hot = self.hot_vectors.read();
+            if hot.is_empty() {
+                None
+            } else {
+                let mut min_id = usize::MAX;
+                let mut max_id = 0usize;
+                for id in hot.keys().copied() {
+                    min_id = min_id.min(id);
+                    max_id = max_id.max(id);
+                }
+                Some((min_id, max_id))
+            }
+        };
+
+        if let Some((min_id, max_id)) = hot_bounds {
+            let total_vectors = max_id.saturating_add(1);
+            let results = {
+                let index = self.hot_index.read();
+                index.search_subsequence(
+                    &request.vectors,
+                    request.k,
+                    request.ef.max(request.k),
+                    total_vectors,
+                )
+            };
+            let hot = self.hot_vectors.read();
+            for (start_id, score) in results {
+                if start_id < min_id || start_id.saturating_add(seq_len) > total_vectors {
+                    continue;
+                }
+                if (0..seq_len).any(|offset| !hot.contains_key(&(start_id + offset))) {
+                    continue;
+                }
+                merge_best(&mut best, start_id, score);
+            }
+        }
+
+        let segment_snapshot = self.segments.load_full();
+        let segment_results = self.query_pool.install(|| {
+            segment_snapshot
+                .par_iter()
+                .map(|seg| {
+                    if seq_len > seg.record.row_count {
+                        return Vec::new();
+                    }
+
+                    let min_start = seg.record.vector_id_start;
+                    let max_exclusive = seg.record.vector_id_end.saturating_add(1);
+                    let local = {
+                        let index = seg.index.read();
+                        index.search_subsequence(
+                            &request.vectors,
+                            request.k,
+                            request.ef.max(request.k),
+                            max_exclusive,
+                        )
+                    };
+
+                    local
+                        .into_iter()
+                        .filter(|(start_id, _)| {
+                            *start_id >= min_start
+                                && start_id.saturating_add(seq_len) <= max_exclusive
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
+
+        for results in segment_results {
+            for (start_id, score) in results {
+                merge_best(&mut best, start_id, score);
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct MinScore {
+            id: usize,
+            score: f32,
+        }
+        impl PartialEq for MinScore {
+            fn eq(&self, other: &Self) -> bool {
+                self.score == other.score
+            }
+        }
+        impl Eq for MinScore {}
+        impl PartialOrd for MinScore {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for MinScore {
+            fn cmp(&self, other: &Self) -> Ordering {
+                other
+                    .score
+                    .partial_cmp(&self.score)
+                    .unwrap_or(Ordering::Equal)
+            }
+        }
+
+        let mut heap = std::collections::BinaryHeap::with_capacity(request.k + 1);
+        for (id, score) in best {
+            if heap.len() < request.k {
+                heap.push(MinScore { id, score });
+            } else if let Some(worst) = heap.peek() {
+                if score > worst.score {
+                    heap.pop();
+                    heap.push(MinScore { id, score });
+                }
+            }
+        }
+
+        let mut merged = Vec::with_capacity(heap.len());
+        while let Some(entry) = heap.pop() {
+            merged.push((entry.id, entry.score));
+        }
+        merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+        let metadata_map = if request.include_metadata {
+            self.metadata_for_ids(&merged.iter().map(|(id, _)| *id).collect::<Vec<_>>())?
+        } else {
+            HashMap::new()
+        };
+
+        self.metrics
+            .identify_total
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.observe_query_latency_us(start.elapsed().as_micros() as u64);
+        let query_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let results = merged
+            .into_iter()
+            .map(|(id, score)| {
+                let metadata = if request.include_metadata {
+                    metadata_map.get(&id).cloned()
+                } else {
+                    None
+                };
+                let (start_timestamp_ms, duration_ms) = if let Some(meta) = metadata.as_ref() {
+                    (
+                        meta.start_time_ms as u64,
+                        (meta.duration_ms as u64).saturating_mul(seq_len as u64),
+                    )
+                } else {
+                    (0, 0)
+                };
+
+                IdentifyResultV2 {
+                    id,
+                    start_timestamp_ms,
+                    duration_ms,
+                    score,
+                    metadata,
+                }
+            })
+            .collect();
+
+        Ok(IdentifyResponseV2 {
+            results,
             query_time_ms,
         })
     }
@@ -444,6 +707,7 @@ impl ProductionState {
             .catalog
             .list_compaction_jobs_by_state(&self.collection.id, &["building", "pending_activate"])?
             .len();
+        let quarantine_usage = self.catalog.quarantine_usage()?;
 
         Ok(StatsResponseV2 {
             ready: self.ready.load(AtomicOrdering::SeqCst),
@@ -456,66 +720,220 @@ impl ProductionState {
             total_vectors,
             checkpoint_jobs_inflight,
             compaction_jobs_inflight,
+            sqlite_wal_bytes: self.catalog.sqlite_wal_bytes(),
+            catalog_read_timeout_total: self.catalog.read_timeout_total(),
+            quarantine_files: quarantine_usage.files,
+            quarantine_bytes: quarantine_usage.bytes,
+            quarantine_evictions_total: self.catalog.quarantine_evictions_total(),
         })
     }
 
     pub fn render_metrics(&self) -> Result<String> {
         let stats = self.stats()?;
-        Ok(format!(
-            concat!(
-                "# TYPE vibrato_query_requests_total counter\n",
-                "vibrato_query_requests_total {}\n",
-                "# TYPE vibrato_ingest_requests_total counter\n",
-                "vibrato_ingest_requests_total {}\n",
-                "# TYPE vibrato_auth_failures_total counter\n",
-                "vibrato_auth_failures_total {}\n",
-                "# TYPE vibrato_audit_failures_total counter\n",
-                "vibrato_audit_failures_total {}\n",
-                "# TYPE vibrato_checkpoint_total counter\n",
-                "vibrato_checkpoint_total {}\n",
-                "# TYPE vibrato_compaction_total counter\n",
-                "vibrato_compaction_total {}\n",
-                "# TYPE vibrato_obsolete_files_deleted_total counter\n",
-                "vibrato_obsolete_files_deleted_total {}\n",
-                "# TYPE vibrato_active_segments gauge\n",
-                "vibrato_active_segments {}\n",
-                "# TYPE vibrato_obsolete_segments gauge\n",
-                "vibrato_obsolete_segments {}\n",
-                "# TYPE vibrato_failed_segments gauge\n",
-                "vibrato_failed_segments {}\n",
-                "# TYPE vibrato_hot_vectors gauge\n",
-                "vibrato_hot_vectors {}\n",
-                "# TYPE vibrato_wal_pending gauge\n",
-                "vibrato_wal_pending {}\n",
-                "# TYPE vibrato_total_vectors gauge\n",
-                "vibrato_total_vectors {}\n",
-                "# TYPE vibrato_checkpoint_jobs_inflight gauge\n",
-                "vibrato_checkpoint_jobs_inflight {}\n",
-                "# TYPE vibrato_compaction_jobs_inflight gauge\n",
-                "vibrato_compaction_jobs_inflight {}\n"
-            ),
-            self.metrics.query_total.load(AtomicOrdering::Relaxed),
-            self.metrics.ingest_total.load(AtomicOrdering::Relaxed),
+        let mut out = String::new();
+        out.push_str("# TYPE vibrato_query_requests_total counter\n");
+        out.push_str(&format!(
+            "vibrato_query_requests_total {}\n",
+            self.metrics.query_total.load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_identify_requests_total counter\n");
+        out.push_str(&format!(
+            "vibrato_identify_requests_total {}\n",
+            self.metrics.identify_total.load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_ingest_requests_total counter\n");
+        out.push_str(&format!(
+            "vibrato_ingest_requests_total {}\n",
+            self.metrics.ingest_total.load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_auth_failures_total counter\n");
+        out.push_str(&format!(
+            "vibrato_auth_failures_total {}\n",
             self.metrics
                 .auth_failures_total
-                .load(AtomicOrdering::Relaxed),
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_audit_failures_total counter\n");
+        out.push_str(&format!(
+            "vibrato_audit_failures_total {}\n",
             self.metrics
                 .audit_failures_total
-                .load(AtomicOrdering::Relaxed),
-            self.metrics.checkpoint_total.load(AtomicOrdering::Relaxed),
-            self.metrics.compaction_total.load(AtomicOrdering::Relaxed),
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_checkpoint_total counter\n");
+        out.push_str(&format!(
+            "vibrato_checkpoint_total {}\n",
+            self.metrics.checkpoint_total.load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_compaction_total counter\n");
+        out.push_str(&format!(
+            "vibrato_compaction_total {}\n",
+            self.metrics.compaction_total.load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_obsolete_files_deleted_total counter\n");
+        out.push_str(&format!(
+            "vibrato_obsolete_files_deleted_total {}\n",
             self.metrics
                 .obsolete_files_deleted_total
-                .load(AtomicOrdering::Relaxed),
-            stats.active_segments,
-            stats.obsolete_segments,
-            stats.failed_segments,
-            stats.hot_vectors,
-            stats.wal_pending,
-            stats.total_vectors,
-            stats.checkpoint_jobs_inflight,
-            stats.compaction_jobs_inflight,
-        ))
+                .load(AtomicOrdering::Relaxed)
+        ));
+
+        out.push_str("# TYPE vibrato_query_latency_us_bucket counter\n");
+        out.push_str(&format!(
+            "vibrato_query_latency_us_bucket{{le=\"10\"}} {}\n",
+            self.metrics
+                .query_latency_us_le_10
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "vibrato_query_latency_us_bucket{{le=\"25\"}} {}\n",
+            self.metrics
+                .query_latency_us_le_25
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "vibrato_query_latency_us_bucket{{le=\"50\"}} {}\n",
+            self.metrics
+                .query_latency_us_le_50
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "vibrato_query_latency_us_bucket{{le=\"100\"}} {}\n",
+            self.metrics
+                .query_latency_us_le_100
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "vibrato_query_latency_us_bucket{{le=\"250\"}} {}\n",
+            self.metrics
+                .query_latency_us_le_250
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "vibrato_query_latency_us_bucket{{le=\"500\"}} {}\n",
+            self.metrics
+                .query_latency_us_le_500
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "vibrato_query_latency_us_bucket{{le=\"1000\"}} {}\n",
+            self.metrics
+                .query_latency_us_le_1000
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "vibrato_query_latency_us_bucket{{le=\"2500\"}} {}\n",
+            self.metrics
+                .query_latency_us_le_2500
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "vibrato_query_latency_us_bucket{{le=\"5000\"}} {}\n",
+            self.metrics
+                .query_latency_us_le_5000
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "vibrato_query_latency_us_bucket{{le=\"+Inf\"}} {}\n",
+            self.metrics
+                .query_latency_us_gt_5000
+                .load(AtomicOrdering::Relaxed)
+                + self
+                    .metrics
+                    .query_latency_us_le_5000
+                    .load(AtomicOrdering::Relaxed)
+                + self
+                    .metrics
+                    .query_latency_us_le_2500
+                    .load(AtomicOrdering::Relaxed)
+                + self
+                    .metrics
+                    .query_latency_us_le_1000
+                    .load(AtomicOrdering::Relaxed)
+                + self
+                    .metrics
+                    .query_latency_us_le_500
+                    .load(AtomicOrdering::Relaxed)
+                + self
+                    .metrics
+                    .query_latency_us_le_250
+                    .load(AtomicOrdering::Relaxed)
+                + self
+                    .metrics
+                    .query_latency_us_le_100
+                    .load(AtomicOrdering::Relaxed)
+                + self
+                    .metrics
+                    .query_latency_us_le_50
+                    .load(AtomicOrdering::Relaxed)
+                + self
+                    .metrics
+                    .query_latency_us_le_25
+                    .load(AtomicOrdering::Relaxed)
+                + self
+                    .metrics
+                    .query_latency_us_le_10
+                    .load(AtomicOrdering::Relaxed)
+        ));
+
+        out.push_str("# TYPE vibrato_active_segments gauge\n");
+        out.push_str(&format!(
+            "vibrato_active_segments {}\n",
+            stats.active_segments
+        ));
+        out.push_str("# TYPE vibrato_obsolete_segments gauge\n");
+        out.push_str(&format!(
+            "vibrato_obsolete_segments {}\n",
+            stats.obsolete_segments
+        ));
+        out.push_str("# TYPE vibrato_failed_segments gauge\n");
+        out.push_str(&format!(
+            "vibrato_failed_segments {}\n",
+            stats.failed_segments
+        ));
+        out.push_str("# TYPE vibrato_hot_vectors gauge\n");
+        out.push_str(&format!("vibrato_hot_vectors {}\n", stats.hot_vectors));
+        out.push_str("# TYPE vibrato_wal_pending gauge\n");
+        out.push_str(&format!("vibrato_wal_pending {}\n", stats.wal_pending));
+        out.push_str("# TYPE vibrato_total_vectors gauge\n");
+        out.push_str(&format!("vibrato_total_vectors {}\n", stats.total_vectors));
+        out.push_str("# TYPE vibrato_checkpoint_jobs_inflight gauge\n");
+        out.push_str(&format!(
+            "vibrato_checkpoint_jobs_inflight {}\n",
+            stats.checkpoint_jobs_inflight
+        ));
+        out.push_str("# TYPE vibrato_compaction_jobs_inflight gauge\n");
+        out.push_str(&format!(
+            "vibrato_compaction_jobs_inflight {}\n",
+            stats.compaction_jobs_inflight
+        ));
+        out.push_str("# TYPE vibrato_sqlite_wal_bytes gauge\n");
+        out.push_str(&format!(
+            "vibrato_sqlite_wal_bytes {}\n",
+            stats.sqlite_wal_bytes
+        ));
+        out.push_str("# TYPE vibrato_catalog_read_timeout_total counter\n");
+        out.push_str(&format!(
+            "vibrato_catalog_read_timeout_total {}\n",
+            stats.catalog_read_timeout_total
+        ));
+        out.push_str("# TYPE vibrato_quarantine_files gauge\n");
+        out.push_str(&format!(
+            "vibrato_quarantine_files {}\n",
+            stats.quarantine_files
+        ));
+        out.push_str("# TYPE vibrato_quarantine_bytes gauge\n");
+        out.push_str(&format!(
+            "vibrato_quarantine_bytes {}\n",
+            stats.quarantine_bytes
+        ));
+        out.push_str("# TYPE vibrato_quarantine_evictions_total counter\n");
+        out.push_str(&format!(
+            "vibrato_quarantine_evictions_total {}\n",
+            stats.quarantine_evictions_total
+        ));
+
+        Ok(out)
     }
 
     pub fn checkpoint_once(&self) -> Result<JobResponseV2> {
@@ -625,7 +1043,7 @@ impl ProductionState {
                 created_lsn: end_lsn,
                 state: "pending_activate".to_string(),
             })?;
-            prewarm_segment(&handle);
+            prewarm_segment(&self.config, &handle);
 
             self.catalog.checkpoint_activate(
                 &segment_id,
@@ -754,7 +1172,7 @@ impl ProductionState {
 
             let ids = pairs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
             let vectors = pairs.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
-            let metadata_map = self.catalog.fetch_metadata(&ids)?;
+            let metadata_map = self.catalog.fetch_metadata(&self.collection.id, &ids)?;
             let metadata = ids
                 .iter()
                 .map(|id| metadata_map.get(id).cloned().unwrap_or_default())
@@ -811,7 +1229,7 @@ impl ProductionState {
                 None
             } else {
                 let handle = self.load_segment_handle(&pending_record)?;
-                prewarm_segment(&handle);
+                prewarm_segment(&self.config, &handle);
                 Some(handle)
             };
             let loaded_archive = if use_archive_pq {
@@ -917,7 +1335,7 @@ impl ProductionState {
                 }
                 _ => {
                     let handle = self.load_segment_handle(&seg)?;
-                    prewarm_segment(&handle);
+                    prewarm_segment(&self.config, &handle);
                     handles.push(handle);
                 }
             }
@@ -960,10 +1378,15 @@ impl ProductionState {
 
     pub fn rebuild_filter_index(&self) -> Result<()> {
         let entries = self.catalog.fetch_all_metadata(&self.collection.id)?;
-        let mut index = FilterIndex::default();
+        let tag_dictionary = self.catalog.fetch_tag_dictionary(&self.collection.id)?;
+        let filter_rows = self.catalog.fetch_filter_rows(&self.collection.id)?;
+
+        let mut index = FilterIndex::with_dictionary(tag_dictionary);
+        for row in filter_rows {
+            index.add_with_tag_ids(row.vector_id, row.bpm, &row.tag_ids);
+        }
         let mut metadata_cache = HashMap::with_capacity(entries.len());
         for (id, meta) in entries {
-            index.add(id, &meta);
             metadata_cache.insert(id, meta);
         }
         *self.filter_index.write() = index;
@@ -990,7 +1413,7 @@ impl ProductionState {
         }
 
         if !missing.is_empty() {
-            let fetched = self.catalog.fetch_metadata(&missing)?;
+            let fetched = self.catalog.fetch_metadata(&self.collection.id, &missing)?;
             if !fetched.is_empty() {
                 let mut cache = self.metadata_cache.write();
                 for (id, meta) in &fetched {
@@ -1651,15 +2074,99 @@ fn make_hot_accessor(
     }
 }
 
-fn prewarm_segment(segment: &SegmentHandle) {
-    if segment.store.count == 0 {
+fn prewarm_segment(config: &ProductionConfig, segment: &SegmentHandle) {
+    let mapped = segment.store.mapped_bytes();
+    if mapped.len() < 64 {
         return;
     }
 
-    let stride = (segment.store.count / 128).max(1);
-    for i in (0..segment.store.count).step_by(stride).take(256) {
-        let v = segment.store.get(i);
-        std::hint::black_box(v[0]);
+    let header = VdbHeaderV2::from_bytes(&mapped[..64]);
+    if let Ok(header) = header {
+        if header.metadata_offset > 0 {
+            let metadata_start = header.metadata_offset as usize;
+            let metadata_end = if header.graph_offset > 0 {
+                header.graph_offset as usize
+            } else {
+                mapped.len()
+            };
+            if metadata_start < metadata_end && metadata_end <= mapped.len() {
+                let metadata = &mapped[metadata_start..metadata_end];
+                advise_memory(metadata, libc_advice_willneed());
+                pretouch_sampled_pages(metadata, 64);
+            }
+        }
+        if header.graph_offset > 0 {
+            let graph_start = header.graph_offset as usize;
+            if graph_start < mapped.len() {
+                let graph = &mapped[graph_start..];
+                advise_memory(graph, libc_advice_willneed());
+                pretouch_sampled_pages(graph, 64);
+            }
+        }
+    }
+
+    let vector_bytes = segment.store.vector_bytes();
+    let vector_advice = match config.vector_madvise_mode {
+        VectorMadviseMode::Normal => libc_advice_normal(),
+        VectorMadviseMode::Random => libc_advice_random(),
+    };
+    advise_memory(vector_bytes, vector_advice);
+    pretouch_sampled_pages(vector_bytes, 128);
+}
+
+fn pretouch_sampled_pages(bytes: &[u8], sample_pages: usize) {
+    if bytes.is_empty() {
+        return;
+    }
+    let page_size = 4096usize;
+    let total_pages = (bytes.len() + page_size - 1) / page_size;
+    let stride_pages = (total_pages / sample_pages.max(1)).max(1);
+    let stride = stride_pages * page_size;
+    for i in (0..bytes.len()).step_by(stride).take(sample_pages.max(1)) {
+        std::hint::black_box(bytes[i]);
+    }
+}
+
+fn libc_advice_normal() -> i32 {
+    #[cfg(unix)]
+    {
+        libc::MADV_NORMAL
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn libc_advice_random() -> i32 {
+    #[cfg(unix)]
+    {
+        libc::MADV_RANDOM
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn libc_advice_willneed() -> i32 {
+    #[cfg(unix)]
+    {
+        libc::MADV_WILLNEED
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn advise_memory(bytes: &[u8], advice: i32) {
+    #[cfg(unix)]
+    unsafe {
+        if bytes.is_empty() {
+            return;
+        }
+        let _ = libc::madvise(bytes.as_ptr() as *mut libc::c_void, bytes.len(), advice);
     }
 }
 
