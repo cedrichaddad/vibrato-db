@@ -414,6 +414,7 @@ impl HNSW {
 
         // Found neighbors (max-heap to track worst)
         let mut results: BinaryHeap<SearchResult> = BinaryHeap::with_capacity(ef + 1);
+        let mut worst_distance = f32::INFINITY;
 
         // Initialize with entry points
         for &ep in entry_points {
@@ -428,16 +429,15 @@ impl HNSW {
                     id: ep,
                     distance: dist,
                 });
+                worst_distance = results.peek().map(|r| r.distance).unwrap_or(f32::INFINITY);
             }
         }
 
         // Greedy search
         while let Some(current) = candidates.pop() {
             // Pruning: if current is worse than worst result, stop
-            if let Some(worst) = results.peek() {
-                if current.distance > worst.distance && results.len() >= ef {
-                    break;
-                }
+            if results.len() >= ef && current.distance > worst_distance {
+                break;
             }
 
             // Explore neighbors using O(1) HashMap lookup
@@ -455,7 +455,7 @@ impl HNSW {
                     let dist = self.distance(query, neighbor_id);
 
                     // Add to candidates if promising
-                    let dominated = results.len() >= ef && dist > results.peek().unwrap().distance;
+                    let dominated = results.len() >= ef && dist > worst_distance;
                     if !dominated {
                         candidates.push(Candidate {
                             id: neighbor_id,
@@ -470,6 +470,8 @@ impl HNSW {
                         if results.len() > ef {
                             results.pop();
                         }
+                        worst_distance =
+                            results.peek().map(|r| r.distance).unwrap_or(f32::INFINITY);
                     }
                 }
             }
@@ -731,6 +733,18 @@ impl HNSW {
         sequence_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
         sequence_results.truncate(k);
         sequence_results
+    }
+
+    /// Number of indexed nodes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Returns true when the index is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
     }
 
     /// Get statistics about the index

@@ -107,7 +107,32 @@ cargo run --release -- ingest --input vectors.json --output data.vdb
 cargo run --release -- search --query "0.1,0.2,..." --k 5
 ```
 
-### 3. Python Bindings
+### 3. Production v2 Control Plane
+
+`v2` adds SQLite catalog, WAL ingest, immutable segment lifecycle, admin auth, and recovery/orphan handling.
+It also includes roaring-style bitmap filter acceleration and PQ-encoded L2 archive segments for archive-tier search.
+
+```bash
+# Start production server
+cargo run --release -- serve-v2 \
+  --data-dir ./vibrato_data \
+  --collection default \
+  --dim 128 \
+  --bootstrap-admin-key true
+
+# Create/revoke API keys
+cargo run --release -- key-create --data-dir ./vibrato_data --name ops --roles admin,query,ingest
+cargo run --release -- key-revoke --data-dir ./vibrato_data --key-id <vbk_id>
+
+# Snapshot / restore / replay
+cargo run --release -- snapshot-create --data-dir ./vibrato_data --collection default
+cargo run --release -- snapshot-restore --data-dir ./vibrato_data --snapshot-dir ./vibrato_data/snapshots/<snapshot_id>
+cargo run --release -- replay-to-lsn --data-dir ./vibrato_data --collection default --target-lsn 1000
+```
+
+See `/Users/cedrichaddad/vibrato-db/docs/PRODUCTION_RUNBOOK_V21.md` for full operations guidance.
+
+### 4. Python Bindings
 
 Vibrato-DB exposes a high-performance Python API via PyO3.
 
@@ -122,7 +147,7 @@ results = index.search(query_vector, k=10)
 print(results) # [(id, score), ...]
 ```
 
-### 4. HTTP API
+### 5. HTTP API
 
 Search for similar vectors using a simple REST API.
 

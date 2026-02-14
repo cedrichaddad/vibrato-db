@@ -26,6 +26,11 @@ use tracing_subscriber::EnvFilter;
 
 use vibrato_db::format_v2::{VdbHeaderV2, VdbWriterV2};
 use vibrato_db::hnsw::HNSW;
+use vibrato_db::prod::{
+    bootstrap_data_dirs, create_snapshot, create_v2_router, migrate_existing_vdb_to_segment,
+    recover_state, replay_to_lsn, restore_snapshot, CatalogStore, ProductionConfig,
+    ProductionState, Role, SqliteCatalog,
+};
 use vibrato_db::server::{
     load_store_metadata, serve, AppState, SearchRequest, SearchResponse, SharedStore,
 };
@@ -133,6 +138,122 @@ enum Commands {
         /// Model directory (defaults to ./models)
         #[arg(long, default_value = "models")]
         model_dir: PathBuf,
+    },
+
+    /// Start the production v2 server (SQLite catalog + WAL + segments)
+    ServeV2 {
+        /// Root data directory (catalog, segments, tmp, quarantine)
+        #[arg(long, default_value = "vibrato_data")]
+        data_dir: PathBuf,
+
+        /// Collection name
+        #[arg(long, default_value = "default")]
+        collection: String,
+
+        /// Vector dimensionality for bootstrap/new collections
+        #[arg(long, default_value = "128")]
+        dim: usize,
+
+        /// Server port
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+
+        /// Host to bind to
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+
+        /// Background checkpoint interval in seconds
+        #[arg(long, default_value = "30")]
+        checkpoint_interval_secs: u64,
+
+        /// Background compaction interval in seconds
+        #[arg(long, default_value = "180")]
+        compaction_interval_secs: u64,
+
+        /// Quarantine GC TTL in hours
+        #[arg(long, default_value = "168")]
+        orphan_ttl_hours: u64,
+
+        /// Assume co-location with audio workloads and lower maintenance worker priority
+        #[arg(long, default_value_t = true)]
+        audio_colocated: bool,
+
+        /// If false, /v2/health/* and /v2/metrics require API auth
+        #[arg(long, default_value_t = true)]
+        public_health_metrics: bool,
+
+        /// Bootstrap first admin API key if no keys exist in catalog
+        #[arg(long, default_value_t = false)]
+        bootstrap_admin_key: bool,
+    },
+
+    /// Create an API key for v2 server auth
+    KeyCreate {
+        #[arg(long, default_value = "vibrato_data")]
+        data_dir: PathBuf,
+
+        #[arg(long)]
+        name: String,
+
+        #[arg(long, default_value = "admin,query,ingest")]
+        roles: String,
+    },
+
+    /// Revoke an API key by ID
+    KeyRevoke {
+        #[arg(long, default_value = "vibrato_data")]
+        data_dir: PathBuf,
+
+        #[arg(long)]
+        key_id: String,
+    },
+
+    /// Migrate an existing single .vdb into v2 catalog + segment layout
+    MigrateV2 {
+        #[arg(long, default_value = "vibrato_data")]
+        data_dir: PathBuf,
+
+        #[arg(long)]
+        input: PathBuf,
+
+        #[arg(long, default_value = "default")]
+        collection: String,
+
+        #[arg(long, default_value = "128")]
+        dim: usize,
+
+        #[arg(long, default_value = "1")]
+        level: i64,
+    },
+
+    /// Create a local snapshot (catalog + active segments)
+    SnapshotCreate {
+        #[arg(long, default_value = "vibrato_data")]
+        data_dir: PathBuf,
+
+        #[arg(long, default_value = "default")]
+        collection: String,
+    },
+
+    /// Restore a previously created snapshot
+    SnapshotRestore {
+        #[arg(long, default_value = "vibrato_data")]
+        data_dir: PathBuf,
+
+        #[arg(long)]
+        snapshot_dir: PathBuf,
+    },
+
+    /// Replay catalog/WAL to a target LSN (marks current active segments obsolete)
+    ReplayToLsn {
+        #[arg(long, default_value = "vibrato_data")]
+        data_dir: PathBuf,
+
+        #[arg(long, default_value = "default")]
+        collection: String,
+
+        #[arg(long)]
+        target_lsn: u64,
     },
 }
 
@@ -378,6 +499,133 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Setting up models in {:?}", model_dir);
             InferenceEngine::setup_models(&model_dir)?;
             println!("Models downloaded and verified in {:?}", model_dir);
+        }
+
+        Commands::ServeV2 {
+            data_dir,
+            collection,
+            dim,
+            port,
+            host,
+            checkpoint_interval_secs,
+            compaction_interval_secs,
+            orphan_ttl_hours,
+            audio_colocated,
+            public_health_metrics,
+            bootstrap_admin_key,
+        } => {
+            let mut config = ProductionConfig::from_data_dir(data_dir, collection, dim);
+            config.checkpoint_interval = std::time::Duration::from_secs(checkpoint_interval_secs);
+            config.compaction_interval = std::time::Duration::from_secs(compaction_interval_secs);
+            config.orphan_ttl = std::time::Duration::from_secs(orphan_ttl_hours * 3600);
+            config.audio_colocated = audio_colocated;
+            config.public_health_metrics = public_health_metrics;
+
+            bootstrap_data_dirs(&config)?;
+            let catalog = Arc::new(SqliteCatalog::open(&config.catalog_path())?);
+            let state = ProductionState::initialize(config.clone(), catalog.clone())?;
+
+            if bootstrap_admin_key && catalog.count_api_keys()? == 0 {
+                let key = catalog.create_api_key(
+                    "bootstrap-admin",
+                    &[Role::Admin, Role::Query, Role::Ingest],
+                    &config.api_pepper,
+                )?;
+                println!("BOOTSTRAP_ADMIN_KEY={}", key.token);
+            }
+
+            let report = recover_state(&state)?;
+            tracing::info!("{}", report.report);
+
+            state.start_background_workers();
+
+            let router = create_v2_router(state);
+            let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+            tracing::info!("Starting Vibrato v2 server on {}", addr);
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(listener, router).await?;
+        }
+
+        Commands::KeyCreate {
+            data_dir,
+            name,
+            roles,
+        } => {
+            let config = ProductionConfig::from_data_dir(data_dir, "default".to_string(), 128);
+            bootstrap_data_dirs(&config)?;
+            let catalog = SqliteCatalog::open(&config.catalog_path())?;
+            let parsed_roles = Role::parse_csv(&roles);
+            if parsed_roles.is_empty() {
+                anyhow::bail!(
+                    "No valid roles parsed from '{}'. Use comma-separated query,ingest,admin",
+                    roles
+                );
+            }
+            let key = catalog.create_api_key(&name, &parsed_roles, &config.api_pepper)?;
+            println!("id={}", key.id);
+            println!("token={}", key.token);
+        }
+
+        Commands::KeyRevoke { data_dir, key_id } => {
+            let config = ProductionConfig::from_data_dir(data_dir, "default".to_string(), 128);
+            bootstrap_data_dirs(&config)?;
+            let catalog = SqliteCatalog::open(&config.catalog_path())?;
+            catalog.revoke_api_key(&key_id)?;
+            println!("revoked={}", key_id);
+        }
+
+        Commands::MigrateV2 {
+            data_dir,
+            input,
+            collection,
+            dim,
+            level,
+        } => {
+            let config = ProductionConfig::from_data_dir(data_dir, collection, dim);
+            bootstrap_data_dirs(&config)?;
+            let catalog = Arc::new(SqliteCatalog::open(&config.catalog_path())?);
+            let state = ProductionState::initialize(config.clone(), catalog)?;
+
+            let segment_id = migrate_existing_vdb_to_segment(&state, &input, level)?;
+            let report = recover_state(&state)?;
+            println!("migrated_segment={}", segment_id);
+            println!("{}", report.report);
+        }
+
+        Commands::SnapshotCreate {
+            data_dir,
+            collection,
+        } => {
+            let config = ProductionConfig::from_data_dir(data_dir, collection.clone(), 128);
+            bootstrap_data_dirs(&config)?;
+            let catalog = SqliteCatalog::open(&config.catalog_path())?;
+            let snapshot = create_snapshot(&config, &catalog, &collection)?;
+            println!("snapshot_id={}", snapshot.snapshot_id);
+            println!("snapshot_dir={}", snapshot.snapshot_dir.display());
+            println!("segments={}", snapshot.segments);
+        }
+
+        Commands::SnapshotRestore {
+            data_dir,
+            snapshot_dir,
+        } => {
+            let config = ProductionConfig::from_data_dir(data_dir, "default".to_string(), 128);
+            bootstrap_data_dirs(&config)?;
+            restore_snapshot(&config, &snapshot_dir)?;
+            println!("restored_snapshot={}", snapshot_dir.display());
+        }
+
+        Commands::ReplayToLsn {
+            data_dir,
+            collection,
+            target_lsn,
+        } => {
+            let config = ProductionConfig::from_data_dir(data_dir, collection.clone(), 128);
+            bootstrap_data_dirs(&config)?;
+            let catalog = SqliteCatalog::open(&config.catalog_path())?;
+            replay_to_lsn(&catalog, &collection, target_lsn)?;
+            println!("replayed_to_lsn={}", target_lsn);
+            println!("collection={}", collection);
         }
     }
 

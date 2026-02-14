@@ -3,6 +3,7 @@
 //! This is the root binary crate. All core functionality lives in `vibrato-core`.
 //! The neural pipeline lives in `vibrato-neural`.
 
+pub mod prod;
 pub mod server;
 
 // Re-export core types for backward compatibility
