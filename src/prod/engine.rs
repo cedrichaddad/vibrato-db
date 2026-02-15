@@ -38,6 +38,41 @@ pub enum VectorMadviseMode {
     Random,
 }
 
+#[derive(Debug)]
+struct BackgroundIoThrottle {
+    bytes_per_sec: u64,
+    next_available: std::sync::Mutex<Instant>,
+}
+
+impl BackgroundIoThrottle {
+    fn new(bytes_per_sec: u64) -> Self {
+        Self {
+            bytes_per_sec,
+            next_available: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    fn consume(&self, bytes: u64) {
+        if bytes == 0 || self.bytes_per_sec == 0 {
+            return;
+        }
+        let reserve = Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec as f64);
+        let now = Instant::now();
+        let sleep_for = {
+            let mut guard = self
+                .next_available
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let start = if *guard > now { *guard } else { now };
+            *guard = start + reserve;
+            start.saturating_duration_since(now)
+        };
+        if !sleep_for.is_zero() {
+            std::thread::sleep(sleep_for);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductionConfig {
     pub data_dir: PathBuf,
@@ -59,6 +94,7 @@ pub struct ProductionConfig {
     pub sqlite_wal_autocheckpoint_pages: u32,
     pub quarantine_max_files: usize,
     pub quarantine_max_bytes: u64,
+    pub background_io_mb_per_sec: u64,
     pub vector_madvise_mode: VectorMadviseMode,
     pub api_pepper: String,
 }
@@ -131,6 +167,7 @@ pub struct ProductionState {
     pub checkpoint_lock: std::sync::Mutex<()>,
     pub compaction_lock: std::sync::Mutex<()>,
     pub background_pool: std::sync::Mutex<Option<Arc<ThreadPool>>>,
+    background_io_throttle: Option<Arc<BackgroundIoThrottle>>,
     pub query_pool: Arc<ThreadPool>,
     pub audit_tx: SyncSender<AuditEvent>,
     pub audit_rx: std::sync::Mutex<Option<Receiver<AuditEvent>>>,
@@ -164,6 +201,7 @@ impl ProductionConfig {
             sqlite_wal_autocheckpoint_pages: 1000,
             quarantine_max_files: 50,
             quarantine_max_bytes: 5 * 1024 * 1024 * 1024,
+            background_io_mb_per_sec: 40,
             vector_madvise_mode: VectorMadviseMode::Normal,
             api_pepper: std::env::var("VIBRATO_API_PEPPER")
                 .unwrap_or_else(|_| "dev-pepper".to_string()),
@@ -199,6 +237,14 @@ impl ProductionState {
                 .build()
                 .context("building query pool")?,
         );
+        let background_io_throttle =
+            if config.audio_colocated && config.background_io_mb_per_sec > 0 {
+                Some(Arc::new(BackgroundIoThrottle::new(
+                    config.background_io_mb_per_sec * 1024 * 1024,
+                )))
+            } else {
+                None
+            };
 
         let state = Arc::new(Self {
             config,
@@ -218,6 +264,7 @@ impl ProductionState {
             checkpoint_lock: std::sync::Mutex::new(()),
             compaction_lock: std::sync::Mutex::new(()),
             background_pool: std::sync::Mutex::new(None),
+            background_io_throttle,
             query_pool,
             audit_tx,
             audit_rx: std::sync::Mutex::new(Some(audit_rx)),
@@ -1015,6 +1062,11 @@ impl ProductionState {
                 &ids,
                 &vectors,
             );
+            self.throttle_background_io(estimate_raw_segment_io_bytes(
+                self.collection.dim,
+                vectors.len(),
+                metadata.len(),
+            ));
 
             write_segment(
                 &self.config,
@@ -1202,12 +1254,21 @@ impl ProductionState {
                 .sum::<usize>();
             let mut ids = Vec::with_capacity(total_rows);
             let mut vectors = Vec::with_capacity(total_rows);
+            let mut read_bytes_budget = 0u64;
             for seg in &ordered_segments {
                 for offset in 0..seg.record.row_count {
                     let vector_id = seg.record.vector_id_start + offset;
                     ids.push(vector_id);
                     vectors.push(seg.store.get(offset).to_vec());
+                    read_bytes_budget += (self.collection.dim as u64) * 4;
+                    if read_bytes_budget >= 1 * 1024 * 1024 {
+                        self.throttle_background_io(read_bytes_budget);
+                        read_bytes_budget = 0;
+                    }
                 }
+            }
+            if read_bytes_budget > 0 {
+                self.throttle_background_io(read_bytes_budget);
             }
             let metadata_map = self.catalog.fetch_metadata(&self.collection.id, &ids)?;
             let metadata = ids
@@ -1216,6 +1277,16 @@ impl ProductionState {
                 .collect::<Vec<_>>();
             let use_archive_pq =
                 output_level >= 2 && should_use_archive_pq(self.collection.dim, vectors.len());
+            let write_budget = if use_archive_pq {
+                estimate_archive_segment_io_bytes(
+                    self.collection.dim,
+                    vectors.len(),
+                    metadata.len(),
+                )
+            } else {
+                estimate_raw_segment_io_bytes(self.collection.dim, vectors.len(), metadata.len())
+            };
+            self.throttle_background_io(write_budget);
             if use_archive_pq {
                 write_archive_pq_segment(self.collection.dim, &vectors, &metadata, &tmp_path)?;
             } else {
@@ -1356,6 +1427,12 @@ impl ProductionState {
         }
 
         result
+    }
+
+    fn throttle_background_io(&self, bytes: u64) {
+        if let Some(throttle) = &self.background_io_throttle {
+            throttle.consume(bytes);
+        }
     }
 
     pub fn load_active_segments_from_catalog(&self) -> Result<()> {
@@ -1813,6 +1890,21 @@ fn write_archive_pq_segment(
 
 fn should_use_archive_pq(dim: usize, vector_count: usize) -> bool {
     vector_count >= 256 && choose_pq_subspaces(dim) > 1
+}
+
+fn estimate_raw_segment_io_bytes(dim: usize, rows: usize, metadata_rows: usize) -> u64 {
+    let vector_bytes = (dim as u64) * (rows as u64) * 4;
+    let graph_overhead = (rows as u64) * 128;
+    let metadata_estimate = (metadata_rows as u64) * 256;
+    64 + vector_bytes + graph_overhead + metadata_estimate
+}
+
+fn estimate_archive_segment_io_bytes(dim: usize, rows: usize, metadata_rows: usize) -> u64 {
+    let nsub = choose_pq_subspaces(dim).max(1);
+    let code_bytes = (rows as u64) * (nsub as u64);
+    let codebook_bytes = (dim as u64) * 256;
+    let metadata_estimate = (metadata_rows as u64) * 256;
+    64 + code_bytes + codebook_bytes + metadata_estimate
 }
 
 fn choose_pq_subspaces(dim: usize) -> usize {

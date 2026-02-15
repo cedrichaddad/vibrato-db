@@ -131,3 +131,75 @@ When latency regresses:
 3. Verify background workers are running (`checkpoint_total` and `compaction_total` in `/v2/metrics`).
 4. Check segment state drift (`active/obsolete/failed` counts).
 5. If filter-heavy workload regressed, test with and without filter to isolate Layer-0 filtered path.
+
+## 9. Crash Matrix Gate
+
+PR subset (10 seeds):
+
+```bash
+VIBRATO_CRASH_SEEDS=10 bash scripts/ci/run_crash_matrix.sh
+```
+
+Full nightly gate (100 seeds):
+
+```bash
+VIBRATO_CRASH_SEEDS=100 bash scripts/ci/run_crash_matrix.sh
+```
+
+The harness lives in `/Users/cedrichaddad/vibrato-db/tests/v2_crash_matrix_kill9_e2e.rs` and performs kill-9 during ingest/checkpoint/compaction windows, restart, and acknowledged-write integrity verification.
+
+## 10. WAL Growth Guard
+
+Run:
+
+```bash
+cargo test --test v2_catalog_wal_growth_guard_e2e
+```
+
+This validates bounded SQLite WAL file growth under timeout-prone read workload plus write pressure.
+
+## 11. madvise A/B Perf Harness
+
+Run A/B harness:
+
+```bash
+bash scripts/perf/run_madvise_ab.sh
+```
+
+To enforce threshold in CI:
+
+```bash
+VIBRATO_ENFORCE_MADVISE_GATE=1 bash scripts/perf/run_madvise_ab.sh
+```
+
+## 12. Soak Gate (24h)
+
+Run mixed ingest/query/checkpoint/compaction soak:
+
+```bash
+VIBRATO_SOAK_SECS=86400 VIBRATO_SOAK_SEED=42 bash scripts/soak/run_mixed_workload_soak.sh
+```
+
+Harness file: `/Users/cedrichaddad/vibrato-db/tests/v2_soak_mixed_workload_e2e.rs`.
+
+## 13. Canary + Rollback Drill (72h)
+
+Scripted drill entrypoint:
+
+```bash
+bash scripts/ops/canary_rollback_drill.sh
+```
+
+Expected process:
+1. Take pre-canary snapshot.
+2. Run canary for 72h with production traffic shadow/canary split.
+3. Validate SLO and integrity dashboards.
+4. Execute rollback sequence from the script output and verify recovery.
+
+## 14. Container Smoke
+
+Build and smoke-test containerized deployment:
+
+```bash
+bash scripts/smoke/container_smoke.sh
+```

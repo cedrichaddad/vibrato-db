@@ -198,6 +198,10 @@ enum Commands {
         #[arg(long, default_value = "5368709120")]
         quarantine_max_bytes: u64,
 
+        /// Background IO throttle for checkpoint/compaction workers in MB/s (0 disables)
+        #[arg(long, default_value = "40")]
+        background_io_mb_per_sec: u64,
+
         /// Vector mmap advise mode for active segment vectors: normal|random
         #[arg(long, default_value = "normal")]
         vector_madvise_mode: String,
@@ -536,6 +540,7 @@ async fn main() -> anyhow::Result<()> {
             sqlite_wal_autocheckpoint_pages,
             quarantine_max_files,
             quarantine_max_bytes,
+            background_io_mb_per_sec,
             vector_madvise_mode,
             bootstrap_admin_key,
         } => {
@@ -549,6 +554,7 @@ async fn main() -> anyhow::Result<()> {
             config.sqlite_wal_autocheckpoint_pages = sqlite_wal_autocheckpoint_pages;
             config.quarantine_max_files = quarantine_max_files;
             config.quarantine_max_bytes = quarantine_max_bytes;
+            config.background_io_mb_per_sec = background_io_mb_per_sec;
             config.vector_madvise_mode = parse_vector_madvise_mode(&vector_madvise_mode)?;
 
             bootstrap_data_dirs(&config)?;
