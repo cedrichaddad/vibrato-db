@@ -156,7 +156,7 @@ pub struct ProductionState {
     pub ready: AtomicBool,
     pub recovery_report: RwLock<String>,
 
-    pub hot_vectors: Arc<RwLock<HashMap<usize, Vec<f32>>>>,
+    pub hot_vector_shards: Vec<Arc<RwLock<HashMap<usize, Vec<f32>>>>>,
     pub hot_indices: Vec<RwLock<HNSW>>,
     pub shard_mask: usize,
     pub metadata_cache: Arc<RwLock<HashMap<usize, VectorMetadata>>>,
@@ -220,12 +220,15 @@ impl ProductionState {
     pub fn initialize(config: ProductionConfig, catalog: Arc<SqliteCatalog>) -> Result<Arc<Self>> {
         let collection = catalog.ensure_collection(&config.collection_name, config.dim)?;
 
-        let hot_vectors = Arc::new(RwLock::new(HashMap::new()));
         let shard_count = next_power_of_two_at_least_one(config.hot_index_shards);
         let shard_mask = shard_count - 1;
-        let hot_indices = (0..shard_count)
-            .map(|_| {
-                let accessor = make_hot_accessor(hot_vectors.clone(), config.dim);
+        let hot_vector_shards = (0..shard_count)
+            .map(|_| Arc::new(RwLock::new(HashMap::new())))
+            .collect::<Vec<_>>();
+        let hot_indices = hot_vector_shards
+            .iter()
+            .map(|shard_vectors| {
+                let accessor = make_hot_accessor(shard_vectors.clone(), config.dim);
                 RwLock::new(HNSW::new_with_accessor(
                     config.hnsw_m,
                     config.hnsw_ef_construction,
@@ -262,7 +265,7 @@ impl ProductionState {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
             recovery_report: RwLock::new("initializing".to_string()),
-            hot_vectors,
+            hot_vector_shards,
             hot_indices,
             shard_mask,
             metadata_cache,
@@ -366,8 +369,10 @@ impl ProductionState {
     }
 
     pub fn insert_hot_vector(&self, vector_id: usize, vector: Vec<f32>, metadata: VectorMetadata) {
-        self.hot_vectors.write().insert(vector_id, vector);
         let shard = vector_id & self.shard_mask;
+        if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
+            shard_vectors.write().insert(vector_id, vector);
+        }
         if let Some(index) = self.hot_indices.get(shard) {
             index.write().insert(vector_id);
         }
@@ -605,17 +610,24 @@ impl ProductionState {
 
         if !matches!(request.search_tier, SearchTier::Archive) {
             let hot_snapshot = {
-                let hot = self.hot_vectors.read();
-                if hot.is_empty() {
+                let total_hot = self
+                    .hot_vector_shards
+                    .iter()
+                    .map(|shard| shard.read().len())
+                    .sum::<usize>();
+                if total_hot == 0 {
                     None
                 } else {
                     let mut min_id = usize::MAX;
                     let mut max_id = 0usize;
-                    let mut ids = HashSet::with_capacity(hot.len());
-                    for id in hot.keys().copied() {
-                        min_id = min_id.min(id);
-                        max_id = max_id.max(id);
-                        ids.insert(id);
+                    let mut ids = HashSet::with_capacity(total_hot);
+                    for shard in &self.hot_vector_shards {
+                        let guard = shard.read();
+                        for id in guard.keys().copied() {
+                            min_id = min_id.min(id);
+                            max_id = max_id.max(id);
+                            ids.insert(id);
+                        }
                     }
                     Some((min_id, max_id, Arc::new(ids)))
                 }
@@ -807,7 +819,11 @@ impl ProductionState {
             .catalog
             .list_segments_by_state(&self.collection.id, &["failed"])?
             .len();
-        let hot_vectors = self.hot_vectors.read().len();
+        let hot_vectors = self
+            .hot_vector_shards
+            .iter()
+            .map(|shard| shard.read().len())
+            .sum();
         let wal_pending = self.catalog.count_wal_pending(&self.collection.id)?;
         let total_vectors = self.catalog.total_vectors(&self.collection.id)?;
         let checkpoint_jobs_inflight = self
@@ -1047,7 +1063,10 @@ impl ProductionState {
     }
 
     pub fn checkpoint_once(&self) -> Result<JobResponseV2> {
-        let _guard = self.checkpoint_lock.lock().unwrap();
+        let _guard = self
+            .checkpoint_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let job_id = make_id("chk");
         let mut pending = self.catalog.pending_wal(&self.collection.id, 50_000)?;
         // Deterministic replay/build order across restarts.
@@ -1224,7 +1243,10 @@ impl ProductionState {
     }
 
     pub fn compact_once(&self) -> Result<JobResponseV2> {
-        let _guard = self.compaction_lock.lock().unwrap();
+        let _guard = self
+            .compaction_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let job_id = make_id("cmp");
 
         let snapshot = self.segments.load_full();
@@ -1439,7 +1461,7 @@ impl ProductionState {
                     if candidate_ids.contains(&seg.record.id) {
                         self.retired_segments
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .insert(seg.record.id.clone(), Arc::downgrade(seg));
                     }
                 }
@@ -1536,20 +1558,24 @@ impl ProductionState {
         let mut pending = self.catalog.pending_wal_after_lsn(&self.collection.id, 0)?;
         // Enforce LSN order even if upstream query ordering changes.
         pending.sort_by_key(|e| e.lsn);
-        {
-            let mut hv = self.hot_vectors.write();
-            hv.clear();
-            for e in &pending {
-                hv.insert(e.vector_id, e.vector.clone());
+        for shard in &self.hot_vector_shards {
+            shard.write().clear();
+        }
+        for e in &pending {
+            let shard = e.vector_id & self.shard_mask;
+            if let Some(vectors) = self.hot_vector_shards.get(shard) {
+                vectors.write().insert(e.vector_id, e.vector.clone());
             }
         }
 
-        for shard in &self.hot_indices {
-            let mut idx = shard.write();
+        for (shard_index, shard_vectors) in
+            self.hot_indices.iter().zip(self.hot_vector_shards.iter())
+        {
+            let mut idx = shard_index.write();
             *idx = HNSW::new_with_accessor(
                 self.config.hnsw_m,
                 self.config.hnsw_ef_construction,
-                make_hot_accessor(self.hot_vectors.clone(), self.collection.dim),
+                make_hot_accessor(shard_vectors.clone(), self.collection.dim),
             );
         }
         for e in &pending {
@@ -2490,12 +2516,12 @@ fn audit_worker_loop(state: Arc<ProductionState>, rx: Receiver<AuditEvent>) {
 }
 
 fn make_hot_accessor(
-    hot_vectors: Arc<RwLock<HashMap<usize, Vec<f32>>>>,
+    hot_vector_shard: Arc<RwLock<HashMap<usize, Vec<f32>>>>,
     dim: usize,
 ) -> impl Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static {
     let zero_fallback = vec![0.0f32; dim];
     move |id, sink| {
-        let guard = hot_vectors.read();
+        let guard = hot_vector_shard.read();
         if let Some(v) = guard.get(&id) {
             sink(v);
         } else {

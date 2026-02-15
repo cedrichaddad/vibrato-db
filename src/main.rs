@@ -73,6 +73,10 @@ enum Commands {
         /// HNSW ef_construction parameter (search depth during build)
         #[arg(long, default_value = "100")]
         ef_construction: usize,
+
+        /// Maximum number of unflushed vectors kept in RAM before /ingest returns 503.
+        #[arg(long, default_value = "100000")]
+        max_ram_buffer_vectors: usize,
     },
 
     /// Build an HNSW index from a .vdb file
@@ -304,6 +308,7 @@ async fn main() -> anyhow::Result<()> {
             host,
             m,
             ef_construction,
+            max_ram_buffer_vectors,
         } => {
             tracing::info!("Loading vector data from {:?}", data);
             let store = Arc::new(VectorStore::open(&data)?);
@@ -413,6 +418,7 @@ async fn main() -> anyhow::Result<()> {
                 })),
                 flush_job_seq: std::sync::atomic::AtomicU64::new(0),
                 data_path: data.clone(),
+                max_dynamic_vectors: max_ram_buffer_vectors,
             });
 
             let addr: SocketAddr = format!("{}:{}", host, port).parse()?;

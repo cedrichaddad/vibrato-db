@@ -73,6 +73,7 @@ async fn test_persistence_integrity() {
         })),
         flush_job_seq: std::sync::atomic::AtomicU64::new(0),
         data_path: vdb_path.clone(),
+        max_dynamic_vectors: 100_000,
     });
 
     let router = create_router(state.clone());

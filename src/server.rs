@@ -60,6 +60,8 @@ pub struct AppState {
     pub flush_job_seq: AtomicU64,
     // Single source-of-truth container path (same as --data)
     pub data_path: PathBuf,
+    // Maximum number of unflushed vectors buffered in memory.
+    pub max_dynamic_vectors: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +369,18 @@ async fn ingest(
     let id_offset = store_count as usize;
     let mut dynamic = state.dynamic_store.write();
     let mut dynamic_metadata = state.dynamic_metadata.write();
+    if dynamic.len() >= state.max_dynamic_vectors {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!(
+                    "ingest backpressure: dynamic buffer limit reached ({})",
+                    state.max_dynamic_vectors
+                ),
+            }),
+        )
+            .into_response();
+    }
     let current_dynamic_count = dynamic.len();
     let new_id = id_offset + current_dynamic_count;
     dynamic.push(vector); // move, no extra clone
@@ -736,6 +750,10 @@ mod tests {
     }
 
     fn create_test_state() -> Arc<AppState> {
+        create_test_state_with_limit(100_000)
+    }
+
+    fn create_test_state_with_limit(max_dynamic_vectors: usize) -> Arc<AppState> {
         let dim = 64;
         let num_vectors = 100;
 
@@ -792,6 +810,7 @@ mod tests {
             flush_status: Arc::new(RwLock::new(idle_flush_status(0, store.count, 0))),
             flush_job_seq: AtomicU64::new(0),
             data_path: vdb_path, // Use the temporary path for data_path
+            max_dynamic_vectors,
         })
     }
 
@@ -853,5 +872,26 @@ mod tests {
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_ingest_backpressure_when_dynamic_limit_reached() {
+        let state = create_test_state_with_limit(1);
+        let dim = state.store.load().dim;
+        state.dynamic_store.write().push(vec![0.0; dim]);
+        let router = create_router(state);
+
+        let body = serde_json::json!({
+            "vector": vec![0.1f32; dim],
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
