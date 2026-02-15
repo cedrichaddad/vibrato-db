@@ -9,6 +9,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -55,8 +56,21 @@ pub struct AppState {
     pub inference: Option<Arc<InferenceEngine>>,
     // Global lock to coordinate flush vs ingest consistency
     pub flush_mutex: RwLock<()>,
+    pub flush_status: Arc<RwLock<FlushStatus>>,
+    pub flush_job_seq: AtomicU64,
     // Single source-of-truth container path (same as --data)
     pub data_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlushStatus {
+    pub state: String,
+    pub job_id: u64,
+    pub snapshot_vectors: usize,
+    pub persisted_vectors: usize,
+    pub dynamic_vectors: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Search request body
@@ -108,6 +122,17 @@ fn default_k() -> usize {
 
 fn default_ef() -> usize {
     50
+}
+
+fn idle_flush_status(job_id: u64, persisted_vectors: usize, dynamic_vectors: usize) -> FlushStatus {
+    FlushStatus {
+        state: "idle".to_string(),
+        job_id,
+        snapshot_vectors: 0,
+        persisted_vectors,
+        dynamic_vectors,
+        error: None,
+    }
 }
 
 /// Single search result
@@ -200,6 +225,7 @@ async fn search(
 
     // Execute search
     let start = Instant::now();
+    let _flush_read = state.flush_mutex.read();
     let results = {
         let index = state.index.read();
         index.search(&request.vector, request.k, request.ef)
@@ -364,102 +390,230 @@ async fn ingest(
 
 /// POST /flush - Persist in-memory index to disk
 ///
-/// 1. Takes write locks to stop the world.
-/// 2. Merges static + dynamic stores to new file.
-/// 3. Atomically swaps file and reloads store.
+/// Fast path:
+/// 1. Snapshot current dynamic buffers under lock.
+/// 2. Return `202 Accepted` immediately.
+///
+/// Slow path runs in background:
+/// 1. Build merged graph + V2 container from persisted store + snapshot.
+/// 2. Atomically swap store on success.
+/// 3. Trim flushed prefix from dynamic buffers.
 async fn flush(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // 1. Acquire Locks (Global Flush Lock -> Dynamic -> Index -> Store)
-    // We take flush_mutex (write) to ensure no ingests are running or starting.
-    let _flush_guard = state.flush_mutex.write();
+    let (
+        job_id,
+        snapshot_vectors,
+        snapshot_metadata,
+        current_store,
+        current_metadata,
+        hnsw_m,
+        hnsw_ef_construction,
+    ) = {
+        let _flush_guard = state.flush_mutex.write();
+        let status = state.flush_status.read().clone();
+        if status.state == "running" {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "flush_in_progress",
+                    "job_id": status.job_id
+                })),
+            )
+                .into_response();
+        }
 
-    let index_guard = state.index.read(); // Read lock is enough for serialization
-    let mut dynamic_guard = state.dynamic_store.write(); // Write lock to clear it later
-    let mut dynamic_metadata_guard = state.dynamic_metadata.write();
-    // No store lock needed for ArcSwap read, but we need the current one for merging
-    let current_store = state.store.load_full();
-    let current_metadata = state.persisted_metadata.load_full();
+        let snapshot_vectors = state.dynamic_store.read().clone();
+        let snapshot_metadata = state.dynamic_metadata.read().clone();
+        let current_store = state.store.load_full();
+        let current_metadata = state.persisted_metadata.load_full();
+        if snapshot_vectors.is_empty() {
+            let persisted = current_store.count;
+            let dynamic = 0usize;
+            let current_job_id = state.flush_job_seq.load(AtomicOrdering::Relaxed);
+            *state.flush_status.write() = idle_flush_status(current_job_id, persisted, dynamic);
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "idle",
+                    "job_id": current_job_id,
+                    "persisted_vectors": persisted,
+                    "dynamic_vectors": dynamic
+                })),
+            )
+                .into_response();
+        }
 
-    // 2. Merge Logic
-    let temp_path = state.data_path.with_extension("vdb.tmp");
+        let stats = state.index.read().stats();
+        let job_id = state.flush_job_seq.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        *state.flush_status.write() = FlushStatus {
+            state: "running".to_string(),
+            job_id,
+            snapshot_vectors: snapshot_vectors.len(),
+            persisted_vectors: current_store.count,
+            dynamic_vectors: snapshot_vectors.len(),
+            error: None,
+        };
 
-    let mut merged_metadata = Vec::with_capacity(current_store.count + dynamic_guard.len());
-    if current_metadata.len() == current_store.count {
-        merged_metadata.extend(current_metadata.iter().cloned());
-    } else {
-        tracing::warn!(
-            "Persisted metadata count mismatch (metadata={}, vectors={}), filling defaults",
-            current_metadata.len(),
-            current_store.count
-        );
-        merged_metadata.resize(current_store.count, VectorMetadata::default());
-    }
-    merged_metadata.extend(dynamic_metadata_guard.iter().cloned());
-
-    if let Err(e) = VdbWriterV2::merge_with_metadata(
-        &current_store,
-        &dynamic_guard,
-        &merged_metadata,
-        &index_guard,
-        &temp_path,
-    ) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
+        (
+            job_id,
+            snapshot_vectors,
+            snapshot_metadata,
+            current_store,
+            current_metadata,
+            stats.m,
+            stats.ef_construction,
         )
-            .into_response();
-    }
+    };
 
-    // 3. Atomic Rename
-    if let Err(e) = std::fs::rename(&temp_path, &state.data_path) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
+    let state_for_task = Arc::clone(&state);
+    tokio::spawn(async move {
+        run_flush_job(
+            state_for_task,
+            job_id,
+            snapshot_vectors,
+            snapshot_metadata,
+            current_store,
+            current_metadata,
+            hnsw_m,
+            hnsw_ef_construction,
         )
-            .into_response();
-    }
-    if let Err(e) = sync_path_durable(&state.data_path) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Flush durability sync failed: {}", e),
-            }),
-        )
-            .into_response();
-    }
+        .await;
+    });
 
-    // 4. Hot Swap
-    match VectorStore::open(&state.data_path) {
-        Ok(new_store) => {
-            let new_store_arc = Arc::new(new_store);
-            state.store.store(new_store_arc.clone());
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "started",
+            "job_id": job_id
+        })),
+    )
+        .into_response()
+}
+
+async fn flush_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut status = state.flush_status.read().clone();
+    status.persisted_vectors = state.store.load().count;
+    status.dynamic_vectors = state.dynamic_store.read().len();
+    (StatusCode::OK, Json(status)).into_response()
+}
+
+async fn run_flush_job(
+    state: Arc<AppState>,
+    job_id: u64,
+    snapshot_vectors: Vec<Vec<f32>>,
+    snapshot_metadata: Vec<VectorMetadata>,
+    current_store: Arc<VectorStore>,
+    current_metadata: Arc<Vec<VectorMetadata>>,
+    hnsw_m: usize,
+    hnsw_ef_construction: usize,
+) {
+    let snapshot_len = snapshot_vectors.len();
+    let data_path = state.data_path.clone();
+    let temp_path = state
+        .data_path
+        .with_extension(format!("vdb.tmp.{}", job_id));
+
+    let persist_result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(Arc<VectorStore>, Vec<VectorMetadata>)> {
+            let snapshot_vectors = Arc::new(snapshot_vectors);
+            let dim = current_store.dim;
+            let fallback = vec![0.0f32; dim];
+            let accessor_store = current_store.clone();
+            let accessor_dynamic = snapshot_vectors.clone();
+            let mut rebuilt =
+                HNSW::new_with_accessor(hnsw_m, hnsw_ef_construction, move |id, sink| {
+                    if id < accessor_store.count {
+                        sink(accessor_store.get(id));
+                    } else {
+                        let offset = id - accessor_store.count;
+                        if let Some(v) = accessor_dynamic.get(offset) {
+                            sink(v);
+                        } else {
+                            sink(&fallback);
+                        }
+                    }
+                });
+
+            for id in 0..(current_store.count + snapshot_vectors.len()) {
+                rebuilt.insert(id);
+            }
+
+            let mut merged_metadata =
+                Vec::with_capacity(current_store.count + snapshot_vectors.len());
+            if current_metadata.len() == current_store.count {
+                merged_metadata.extend(current_metadata.iter().cloned());
+            } else {
+                merged_metadata.resize(current_store.count, VectorMetadata::default());
+            }
+            merged_metadata.extend(snapshot_metadata.into_iter());
+
+            VdbWriterV2::merge_with_metadata(
+                &current_store,
+                snapshot_vectors.as_ref(),
+                &merged_metadata,
+                &rebuilt,
+                &temp_path,
+            )?;
+            std::fs::rename(&temp_path, &data_path)?;
+            sync_path_durable(&data_path)?;
+            let new_store = Arc::new(VectorStore::open(&data_path)?);
+            Ok((new_store, merged_metadata))
+        },
+    )
+    .await;
+
+    match persist_result {
+        Ok(Ok((new_store, merged_metadata))) => {
+            let _flush_guard = state.flush_mutex.write();
+            state.store.store(new_store.clone());
             state.persisted_metadata.store(Arc::new(merged_metadata));
 
-            // Clear dynamic store since everything is now on disk
-            dynamic_guard.clear();
-            dynamic_metadata_guard.clear();
+            let mut dynamic = state.dynamic_store.write();
+            let mut dynamic_metadata = state.dynamic_metadata.write();
+            let drain_n = snapshot_len.min(dynamic.len()).min(dynamic_metadata.len());
+            if drain_n > 0 {
+                dynamic.drain(0..drain_n);
+                dynamic_metadata.drain(0..drain_n);
+            }
 
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "status": "flushed", "vectors": new_store_arc.count })),
-            )
-                .into_response()
+            *state.flush_status.write() = FlushStatus {
+                state: "completed".to_string(),
+                job_id,
+                snapshot_vectors: drain_n,
+                persisted_vectors: new_store.count,
+                dynamic_vectors: dynamic.len(),
+                error: None,
+            };
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Ok(Err(err)) => {
+            let persisted = state.store.load().count;
+            let dynamic = state.dynamic_store.read().len();
+            *state.flush_status.write() = FlushStatus {
+                state: "failed".to_string(),
+                job_id,
+                snapshot_vectors: snapshot_len,
+                persisted_vectors: persisted,
+                dynamic_vectors: dynamic,
+                error: Some(err.to_string()),
+            };
+        }
+        Err(join_err) => {
+            let persisted = state.store.load().count;
+            let dynamic = state.dynamic_store.read().len();
+            *state.flush_status.write() = FlushStatus {
+                state: "failed".to_string(),
+                job_id,
+                snapshot_vectors: snapshot_len,
+                persisted_vectors: persisted,
+                dynamic_vectors: dynamic,
+                error: Some(format!("flush task join error: {}", join_err)),
+            };
+        }
     }
 }
 
 /// GET /health - Server health and telemetry
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let _flush_read = state.flush_mutex.read();
     let stats = {
         let index = state.index.read();
         index.stats()
@@ -499,6 +653,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/search", post(search))
         .route("/ingest", post(ingest))
         .route("/flush", post(flush))
+        .route("/flush/status", get(flush_status))
         .route("/health", get(health))
         .layer(cors)
         .with_state(state)
@@ -634,6 +789,8 @@ mod tests {
             dynamic_metadata,
             inference: None,
             flush_mutex: RwLock::new(()),
+            flush_status: Arc::new(RwLock::new(idle_flush_status(0, store.count, 0))),
+            flush_job_seq: AtomicU64::new(0),
             data_path: vdb_path, // Use the temporary path for data_path
         })
     }

@@ -164,6 +164,12 @@ const SQLITE_OPEN_FULLMUTEX: c_int = 0x0001_0000;
 type Sqlite3 = c_void;
 type Sqlite3Stmt = c_void;
 
+trait FromSqlRow: Sized {
+    /// # Safety
+    /// `stmt` must be positioned on a valid SQLITE_ROW and follow the expected select column order.
+    unsafe fn from_row(stmt: *mut Sqlite3Stmt) -> Result<Self>;
+}
+
 #[link(name = "sqlite3")]
 unsafe extern "C" {
     fn sqlite3_open_v2(
@@ -389,6 +395,90 @@ impl RawSqliteConnection {
         query_result?;
         Ok(rows)
     }
+
+    fn query_rows<T: FromSqlRow>(&self, sql: &str, timeout_ms: Option<u64>) -> Result<Vec<T>> {
+        let c_sql = CString::new(sql)?;
+        let mut rows = Vec::new();
+        let mut tail = c_sql.as_ptr();
+
+        let mut timeout_ctx = timeout_ms.map(|ms| TimeoutCtx {
+            start: Instant::now(),
+            timeout: Duration::from_millis(ms.max(1)),
+            timed_out: false,
+        });
+        if let Some(ctx) = timeout_ctx.as_mut() {
+            unsafe {
+                sqlite3_progress_handler(
+                    self.db,
+                    100,
+                    Some(progress_timeout_callback),
+                    ctx as *mut TimeoutCtx as *mut c_void,
+                );
+            }
+        }
+
+        let query_result = (|| -> Result<()> {
+            loop {
+                let mut stmt: *mut Sqlite3Stmt = std::ptr::null_mut();
+                let mut next_tail: *const c_char = std::ptr::null();
+                let rc = unsafe {
+                    sqlite3_prepare_v2(self.db, tail, -1, &mut stmt, &mut next_tail as *mut _)
+                };
+                if rc != SQLITE_OK {
+                    return Err(anyhow!("sqlite prepare failed: {}", unsafe {
+                        c_ptr_to_string(sqlite3_errmsg(self.db))
+                    }));
+                }
+                tail = next_tail;
+
+                if stmt.is_null() {
+                    if tail.is_null() || unsafe { *tail } == 0 {
+                        break;
+                    }
+                    continue;
+                }
+
+                let step_result = loop {
+                    let step_rc = unsafe { sqlite3_step(stmt) };
+                    if step_rc == SQLITE_ROW {
+                        rows.push(unsafe { T::from_row(stmt)? });
+                        continue;
+                    }
+                    if step_rc == SQLITE_DONE {
+                        break Ok(());
+                    }
+                    if step_rc == SQLITE_INTERRUPT
+                        && timeout_ctx.as_ref().map(|c| c.timed_out).unwrap_or(false)
+                    {
+                        break Err(anyhow!(
+                            "catalog_read_timeout: sqlite exceeded {}ms",
+                            timeout_ms.unwrap_or(0)
+                        ));
+                    }
+                    break Err(anyhow!("sqlite step failed: {}", unsafe {
+                        c_ptr_to_string(sqlite3_errmsg(self.db))
+                    }));
+                };
+
+                unsafe {
+                    let _ = sqlite3_finalize(stmt);
+                }
+                step_result?;
+
+                if tail.is_null() || unsafe { *tail } == 0 {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+
+        unsafe {
+            sqlite3_progress_handler(self.db, 0, None, std::ptr::null_mut());
+        }
+
+        query_result?;
+        Ok(rows)
+    }
 }
 
 unsafe extern "C" fn progress_timeout_callback(data: *mut c_void) -> c_int {
@@ -444,6 +534,28 @@ fn statement_row_to_json(stmt: *mut Sqlite3Stmt) -> Value {
         map.insert(name, value);
     }
     Value::Object(map)
+}
+
+unsafe fn column_i64(stmt: *mut Sqlite3Stmt, idx: c_int) -> i64 {
+    sqlite3_column_int64(stmt, idx)
+}
+
+unsafe fn column_f64(stmt: *mut Sqlite3Stmt, idx: c_int) -> f64 {
+    sqlite3_column_double(stmt, idx)
+}
+
+unsafe fn column_text_bytes<'a>(stmt: *mut Sqlite3Stmt, idx: c_int) -> &'a [u8] {
+    let ptr = sqlite3_column_text(stmt, idx);
+    let len = sqlite3_column_bytes(stmt, idx).max(0) as usize;
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr as *const u8, len)
+    }
+}
+
+unsafe fn column_text_string(stmt: *mut Sqlite3Stmt, idx: c_int) -> String {
+    String::from_utf8_lossy(column_text_bytes(stmt, idx)).to_string()
 }
 
 fn c_ptr_to_string(ptr: *const c_char) -> String {
@@ -665,6 +777,40 @@ impl SqliteCatalog {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.query_json(sql, timeout)
+        };
+
+        if result
+            .as_ref()
+            .err()
+            .map(|e| e.to_string().contains("catalog_read_timeout"))
+            .unwrap_or(false)
+        {
+            self.read_timeout_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        result
+    }
+
+    fn query_rows<T: FromSqlRow>(&self, sql: &str) -> Result<Vec<T>> {
+        let is_read = is_read_only_sql(sql);
+        let timeout = if is_read {
+            Some(self.options.read_timeout_ms.max(1))
+        } else {
+            None
+        };
+
+        let result = if is_read && !self.readers.is_empty() {
+            let idx = self.next_reader.fetch_add(1, AtomicOrdering::Relaxed) % self.readers.len();
+            let guard = self.readers[idx]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.query_rows(sql, timeout)
+        } else {
+            let guard = self
+                .writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.query_rows(sql, timeout)
         };
 
         if result
@@ -1079,31 +1225,11 @@ impl CatalogStore for SqliteCatalog {
             .collect::<Vec<_>>()
             .join(",");
 
-        let rows = self.query_json(&format!(
+        self.query_rows::<SegmentRecord>(&format!(
             "SELECT id, collection_id, level, path, row_count, vector_id_start, vector_id_end, created_lsn, state FROM segments WHERE collection_id='{}' AND state IN ({}) ORDER BY level ASC, vector_id_start ASC;",
             sql_quote(collection_id),
             in_clause
-        ))?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(SegmentRecord {
-                id: row["id"].as_str().unwrap_or_default().to_string(),
-                collection_id: row["collection_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                level: row["level"].as_i64().unwrap_or_default(),
-                path: PathBuf::from(row["path"].as_str().unwrap_or_default()),
-                row_count: row["row_count"].as_i64().unwrap_or_default() as usize,
-                vector_id_start: row["vector_id_start"].as_i64().unwrap_or_default() as usize,
-                vector_id_end: row["vector_id_end"].as_i64().unwrap_or_default() as usize,
-                created_lsn: row["created_lsn"].as_i64().unwrap_or_default() as u64,
-                state: row["state"].as_str().unwrap_or_default().to_string(),
-            });
-        }
-
-        Ok(out)
+        ))
     }
 
     fn list_known_segment_paths(&self, collection_id: &str) -> Result<Vec<PathBuf>> {
@@ -1118,27 +1244,11 @@ impl CatalogStore for SqliteCatalog {
     }
 
     fn get_segment(&self, segment_id: &str) -> Result<Option<SegmentRecord>> {
-        let rows = self.query_json(&format!(
+        let rows = self.query_rows::<SegmentRecord>(&format!(
             "SELECT id, collection_id, level, path, row_count, vector_id_start, vector_id_end, created_lsn, state FROM segments WHERE id='{}' LIMIT 1;",
             sql_quote(segment_id)
         ))?;
-        let Some(row) = rows.first() else {
-            return Ok(None);
-        };
-        Ok(Some(SegmentRecord {
-            id: row["id"].as_str().unwrap_or_default().to_string(),
-            collection_id: row["collection_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            level: row["level"].as_i64().unwrap_or_default(),
-            path: PathBuf::from(row["path"].as_str().unwrap_or_default()),
-            row_count: row["row_count"].as_i64().unwrap_or_default() as usize,
-            vector_id_start: row["vector_id_start"].as_i64().unwrap_or_default() as usize,
-            vector_id_end: row["vector_id_end"].as_i64().unwrap_or_default() as usize,
-            created_lsn: row["created_lsn"].as_i64().unwrap_or_default() as u64,
-            state: row["state"].as_str().unwrap_or_default().to_string(),
-        }))
+        Ok(rows.into_iter().next())
     }
 
     fn upsert_checkpoint_job(&self, job: &CheckpointJobRecord) -> Result<()> {
@@ -1455,7 +1565,7 @@ impl CatalogStore for SqliteCatalog {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let rows = self.query_json(&format!(
+        let rows = self.query_rows::<MetadataRow>(&format!(
             "SELECT vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json
              FROM vector_metadata
              WHERE collection_id='{}' AND vector_id IN ({})
@@ -1466,25 +1576,13 @@ impl CatalogStore for SqliteCatalog {
 
         let mut out = HashMap::with_capacity(rows.len());
         for row in rows {
-            let id = row["vector_id"].as_i64().unwrap_or_default() as usize;
-            let tags: Vec<String> =
-                serde_json::from_str(row["tags_json"].as_str().unwrap_or("[]"))?;
-            out.insert(
-                id,
-                VectorMetadata {
-                    source_file: row["source_file"].as_str().unwrap_or_default().to_string(),
-                    start_time_ms: row["start_time_ms"].as_i64().unwrap_or_default() as u32,
-                    duration_ms: row["duration_ms"].as_i64().unwrap_or_default() as u16,
-                    bpm: row["bpm"].as_f64().unwrap_or_default() as f32,
-                    tags,
-                },
-            );
+            out.insert(row.vector_id, row.metadata);
         }
         Ok(out)
     }
 
     fn fetch_all_metadata(&self, collection_id: &str) -> Result<Vec<(usize, VectorMetadata)>> {
-        let rows = self.query_json(&format!(
+        let rows = self.query_rows::<MetadataRow>(&format!(
             "SELECT vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json
              FROM vector_metadata
              WHERE collection_id='{}'
@@ -1494,24 +1592,13 @@ impl CatalogStore for SqliteCatalog {
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let tags: Vec<String> =
-                serde_json::from_str(row["tags_json"].as_str().unwrap_or("[]"))?;
-            out.push((
-                row["vector_id"].as_i64().unwrap_or_default() as usize,
-                VectorMetadata {
-                    source_file: row["source_file"].as_str().unwrap_or_default().to_string(),
-                    start_time_ms: row["start_time_ms"].as_i64().unwrap_or_default() as u32,
-                    duration_ms: row["duration_ms"].as_i64().unwrap_or_default() as u16,
-                    bpm: row["bpm"].as_f64().unwrap_or_default() as f32,
-                    tags,
-                },
-            ));
+            out.push((row.vector_id, row.metadata));
         }
         Ok(out)
     }
 
     fn fetch_tag_dictionary(&self, collection_id: &str) -> Result<HashMap<String, u32>> {
-        let rows = self.query_json(&format!(
+        let rows = self.query_rows::<TagDictionaryRow>(&format!(
             "SELECT id, tag
              FROM tag_ids
              WHERE collection_id='{}'
@@ -1520,17 +1607,15 @@ impl CatalogStore for SqliteCatalog {
         ))?;
         let mut out = HashMap::with_capacity(rows.len());
         for row in rows {
-            let tag = row["tag"].as_str().unwrap_or_default().to_string();
-            let id = row["id"].as_i64().unwrap_or_default().max(0) as u32;
-            if !tag.is_empty() {
-                out.insert(tag, id);
+            if !row.tag.is_empty() {
+                out.insert(row.tag, row.id);
             }
         }
         Ok(out)
     }
 
     fn fetch_filter_rows(&self, collection_id: &str) -> Result<Vec<FilterRow>> {
-        let rows = self.query_json(&format!(
+        self.query_rows::<FilterRow>(&format!(
             "SELECT vm.vector_id AS vector_id, vm.bpm AS bpm, COALESCE(GROUP_CONCAT(vt.tag_id), '') AS tag_ids
              FROM vector_metadata vm
              LEFT JOIN vector_tags vt
@@ -1540,32 +1625,7 @@ impl CatalogStore for SqliteCatalog {
              GROUP BY vm.vector_id, vm.bpm
              ORDER BY vm.vector_id ASC;",
             sql_quote(collection_id)
-        ))?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let vector_id = row["vector_id"].as_i64().unwrap_or_default().max(0) as usize;
-            let bpm = row["bpm"].as_f64().unwrap_or_default() as f32;
-            let tag_ids = row["tag_ids"]
-                .as_str()
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|v| {
-                    let t = v.trim();
-                    if t.is_empty() {
-                        None
-                    } else {
-                        t.parse::<u32>().ok()
-                    }
-                })
-                .collect::<Vec<_>>();
-            out.push(FilterRow {
-                vector_id,
-                bpm,
-                tag_ids,
-            });
-        }
-        Ok(out)
+        ))
     }
 
     fn insert_orphan_file(
@@ -1736,25 +1796,121 @@ impl CatalogStore for SqliteCatalog {
     }
 }
 
+#[derive(Debug)]
+struct MetadataRow {
+    vector_id: usize,
+    metadata: VectorMetadata,
+}
+
+#[derive(Debug)]
+struct TagDictionaryRow {
+    id: u32,
+    tag: String,
+}
+
+impl FromSqlRow for WalEntry {
+    unsafe fn from_row(stmt: *mut Sqlite3Stmt) -> Result<Self> {
+        let lsn = column_i64(stmt, 0).max(0) as u64;
+        let vector_id = column_i64(stmt, 1).max(0) as usize;
+        let vector: Vec<f32> = serde_json::from_slice(column_text_bytes(stmt, 2))?;
+        let metadata: VectorMetadata = serde_json::from_slice(column_text_bytes(stmt, 3))?;
+        Ok(Self {
+            lsn,
+            vector_id,
+            vector,
+            metadata,
+        })
+    }
+}
+
+impl FromSqlRow for WalIngestResult {
+    unsafe fn from_row(stmt: *mut Sqlite3Stmt) -> Result<Self> {
+        let vector_id = column_i64(stmt, 0).max(0) as usize;
+        let created = column_i64(stmt, 1) != 0;
+        let lsn = match sqlite3_column_type(stmt, 2) {
+            SQLITE_NULL => None,
+            _ => Some(column_i64(stmt, 2).max(0) as u64),
+        };
+        Ok(Self {
+            vector_id,
+            created,
+            lsn,
+        })
+    }
+}
+
+impl FromSqlRow for SegmentRecord {
+    unsafe fn from_row(stmt: *mut Sqlite3Stmt) -> Result<Self> {
+        Ok(Self {
+            id: column_text_string(stmt, 0),
+            collection_id: column_text_string(stmt, 1),
+            level: column_i64(stmt, 2),
+            path: PathBuf::from(column_text_string(stmt, 3)),
+            row_count: column_i64(stmt, 4).max(0) as usize,
+            vector_id_start: column_i64(stmt, 5).max(0) as usize,
+            vector_id_end: column_i64(stmt, 6).max(0) as usize,
+            created_lsn: column_i64(stmt, 7).max(0) as u64,
+            state: column_text_string(stmt, 8),
+        })
+    }
+}
+
+impl FromSqlRow for MetadataRow {
+    unsafe fn from_row(stmt: *mut Sqlite3Stmt) -> Result<Self> {
+        let vector_id = column_i64(stmt, 0).max(0) as usize;
+        let source_file = column_text_string(stmt, 1);
+        let start_time_ms = column_i64(stmt, 2).max(0) as u32;
+        let duration_ms = column_i64(stmt, 3).max(0) as u16;
+        let bpm = column_f64(stmt, 4) as f32;
+        let tags: Vec<String> = serde_json::from_slice(column_text_bytes(stmt, 5))?;
+        Ok(Self {
+            vector_id,
+            metadata: VectorMetadata {
+                source_file,
+                start_time_ms,
+                duration_ms,
+                bpm,
+                tags,
+            },
+        })
+    }
+}
+
+impl FromSqlRow for TagDictionaryRow {
+    unsafe fn from_row(stmt: *mut Sqlite3Stmt) -> Result<Self> {
+        Ok(Self {
+            id: column_i64(stmt, 0).max(0) as u32,
+            tag: column_text_string(stmt, 1),
+        })
+    }
+}
+
+impl FromSqlRow for FilterRow {
+    unsafe fn from_row(stmt: *mut Sqlite3Stmt) -> Result<Self> {
+        let vector_id = column_i64(stmt, 0).max(0) as usize;
+        let bpm = column_f64(stmt, 1) as f32;
+        let tag_ids = column_text_string(stmt, 2)
+            .split(',')
+            .filter_map(|v| {
+                let t = v.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    t.parse::<u32>().ok()
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(Self {
+            vector_id,
+            bpm,
+            tag_ids,
+        })
+    }
+}
+
 impl SqliteCatalog {
     fn query_wal(&self, sql: &str) -> Result<Vec<WalEntry>> {
-        let rows = self.query_json(sql)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let lsn = row["lsn"].as_i64().unwrap_or_default() as u64;
-            let vector_id = row["vector_id"].as_i64().unwrap_or_default() as usize;
-            let vector: Vec<f32> =
-                serde_json::from_str(row["vector_json"].as_str().unwrap_or("[]"))?;
-            let metadata: VectorMetadata =
-                serde_json::from_str(row["metadata_json"].as_str().unwrap_or("{}"))?;
-            out.push(WalEntry {
-                lsn,
-                vector_id,
-                vector,
-                metadata,
-            });
-        }
-        Ok(out)
+        self.query_rows::<WalEntry>(sql)
     }
 
     fn ingest_wal_internal(
@@ -1919,16 +2075,12 @@ impl SqliteCatalog {
             tag_sql
         );
 
-        let rows = self.query_json(&sql)?;
+        let rows = self.query_rows::<WalIngestResult>(&sql)?;
         let Some(row) = rows.first() else {
             return Err(anyhow!("ingest transaction produced no result row"));
         };
 
-        Ok(WalIngestResult {
-            vector_id: row["vector_id"].as_i64().unwrap_or_default() as usize,
-            created: row["created"].as_i64().unwrap_or_default() != 0,
-            lsn: row["lsn"].as_i64().map(|v| v as u64),
-        })
+        Ok(row.clone())
     }
 }
 

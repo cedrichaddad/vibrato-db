@@ -5,10 +5,11 @@ use axum::{
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tempfile::tempdir;
+use tokio::time::{sleep, Duration};
 use tower::ServiceExt; // for oneshot
 use vibrato_core::metadata::VectorMetadata;
 use vibrato_db::hnsw::HNSW;
-use vibrato_db::server::{create_router, load_store_metadata, AppState};
+use vibrato_db::server::{create_router, load_store_metadata, AppState, FlushStatus};
 use vibrato_db::store::VectorStore;
 
 #[tokio::test]
@@ -62,6 +63,15 @@ async fn test_persistence_integrity() {
         dynamic_metadata: dynamic_metadata.clone(),
         inference: None,
         flush_mutex: RwLock::new(()),
+        flush_status: Arc::new(RwLock::new(FlushStatus {
+            state: "idle".to_string(),
+            job_id: 0,
+            snapshot_vectors: 0,
+            persisted_vectors: 0,
+            dynamic_vectors: 0,
+            error: None,
+        })),
+        flush_job_seq: std::sync::atomic::AtomicU64::new(0),
         data_path: vdb_path.clone(),
     });
 
@@ -101,7 +111,23 @@ async fn test_persistence_integrity() {
         .unwrap();
 
     let resp = router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // Poll until background flush completes.
+    for _ in 0..100 {
+        let status_req = Request::builder()
+            .method("GET")
+            .uri("/flush/status")
+            .body(Body::empty())
+            .unwrap();
+        let status_resp = router.clone().oneshot(status_req).await.unwrap();
+        assert_eq!(status_resp.status(), StatusCode::OK);
+        if state.flush_status.read().state == "completed" {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(state.flush_status.read().state, "completed");
 
     // 6. Verify Persistence
     // Dynamic store should be empty

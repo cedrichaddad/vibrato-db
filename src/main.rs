@@ -202,6 +202,10 @@ enum Commands {
         #[arg(long, default_value = "40")]
         background_io_mb_per_sec: u64,
 
+        /// Number of hot-index shards (rounded up to next power-of-two)
+        #[arg(long, default_value = "8")]
+        hot_index_shards: usize,
+
         /// Vector mmap advise mode for active segment vectors: normal|random
         #[arg(long, default_value = "normal")]
         vector_madvise_mode: String,
@@ -399,6 +403,15 @@ async fn main() -> anyhow::Result<()> {
                 dynamic_metadata,
                 inference,
                 flush_mutex: RwLock::new(()),
+                flush_status: Arc::new(RwLock::new(vibrato_db::server::FlushStatus {
+                    state: "idle".to_string(),
+                    job_id: 0,
+                    snapshot_vectors: 0,
+                    persisted_vectors: store.count,
+                    dynamic_vectors: 0,
+                    error: None,
+                })),
+                flush_job_seq: std::sync::atomic::AtomicU64::new(0),
                 data_path: data.clone(),
             });
 
@@ -541,6 +554,7 @@ async fn main() -> anyhow::Result<()> {
             quarantine_max_files,
             quarantine_max_bytes,
             background_io_mb_per_sec,
+            hot_index_shards,
             vector_madvise_mode,
             bootstrap_admin_key,
         } => {
@@ -555,6 +569,7 @@ async fn main() -> anyhow::Result<()> {
             config.quarantine_max_files = quarantine_max_files;
             config.quarantine_max_bytes = quarantine_max_bytes;
             config.background_io_mb_per_sec = background_io_mb_per_sec;
+            config.hot_index_shards = hot_index_shards;
             config.vector_madvise_mode = parse_vector_madvise_mode(&vector_madvise_mode)?;
 
             bootstrap_data_dirs(&config)?;

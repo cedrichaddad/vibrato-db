@@ -676,6 +676,23 @@ impl HNSW {
         ef: usize,
         total_vectors: usize,
     ) -> Vec<(usize, f32)> {
+        self.search_subsequence_with_predicate(query_sequence, k, ef, total_vectors, |_| true)
+    }
+
+    /// Sub-sequence search with explicit validity predicate.
+    ///
+    /// `is_valid_id` allows callers to enforce tombstone/hole checks for append-only ID invariants.
+    pub fn search_subsequence_with_predicate<F>(
+        &self,
+        query_sequence: &[Vec<f32>],
+        k: usize,
+        ef: usize,
+        total_vectors: usize,
+        mut is_valid_id: F,
+    ) -> Vec<(usize, f32)>
+    where
+        F: FnMut(usize) -> bool,
+    {
         if query_sequence.is_empty() || self.entry_point.is_none() {
             return Vec::new();
         }
@@ -740,7 +757,7 @@ impl HNSW {
                 let mut valid = true;
                 for (offset, query_vec) in query_sequence.iter().enumerate() {
                     let vec_id = start_id + offset;
-                    if vec_id >= total_vectors {
+                    if vec_id >= total_vectors || !is_valid_id(vec_id) {
                         valid = false;
                         break;
                     }
@@ -1225,6 +1242,38 @@ mod tests {
         assert!(
             results.iter().all(|(start, _)| seen.insert(*start)),
             "multi-probe merge should dedupe repeated start_ids"
+        );
+    }
+
+    #[test]
+    fn test_search_subsequence_predicate_blocks_holes() {
+        let vectors: Vec<Vec<f32>> = (0..40)
+            .map(|i| {
+                let mut v = vec![0.0f32; 8];
+                v[i % 8] = 1.0;
+                v
+            })
+            .collect();
+        let vectors_clone = vectors.clone();
+        let mut hnsw = HNSW::new(8, 64, move |id| vectors_clone[id].clone());
+        for i in 0..vectors.len() {
+            hnsw.insert(i);
+        }
+
+        let query_seq = vectors[10..15].to_vec();
+        let open = hnsw.search_subsequence(&query_seq, 5, 100, vectors.len());
+        assert!(
+            open.iter().any(|(start, _)| *start == 10),
+            "baseline subsequence should find the exact start"
+        );
+
+        let blocked =
+            hnsw.search_subsequence_with_predicate(&query_seq, 5, 100, vectors.len(), |id| {
+                id != 12
+            });
+        assert!(
+            blocked.iter().all(|(start, _)| *start != 10),
+            "predicate hole should invalidate exact sequence alignment"
         );
     }
 }

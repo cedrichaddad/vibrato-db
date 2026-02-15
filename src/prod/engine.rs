@@ -95,6 +95,7 @@ pub struct ProductionConfig {
     pub quarantine_max_files: usize,
     pub quarantine_max_bytes: u64,
     pub background_io_mb_per_sec: u64,
+    pub hot_index_shards: usize,
     pub vector_madvise_mode: VectorMadviseMode,
     pub api_pepper: String,
 }
@@ -156,7 +157,8 @@ pub struct ProductionState {
     pub recovery_report: RwLock<String>,
 
     pub hot_vectors: Arc<RwLock<HashMap<usize, Vec<f32>>>>,
-    pub hot_index: Arc<RwLock<HNSW>>,
+    pub hot_indices: Vec<RwLock<HNSW>>,
+    pub shard_mask: usize,
     pub metadata_cache: Arc<RwLock<HashMap<usize, VectorMetadata>>>,
     pub segments: ArcSwap<Vec<Arc<SegmentHandle>>>,
     pub archive_segments: ArcSwap<Vec<Arc<ArchivePqSegment>>>,
@@ -202,6 +204,7 @@ impl ProductionConfig {
             quarantine_max_files: 50,
             quarantine_max_bytes: 5 * 1024 * 1024 * 1024,
             background_io_mb_per_sec: 40,
+            hot_index_shards: 8,
             vector_madvise_mode: VectorMadviseMode::Normal,
             api_pepper: std::env::var("VIBRATO_API_PEPPER")
                 .unwrap_or_else(|_| "dev-pepper".to_string()),
@@ -218,12 +221,18 @@ impl ProductionState {
         let collection = catalog.ensure_collection(&config.collection_name, config.dim)?;
 
         let hot_vectors = Arc::new(RwLock::new(HashMap::new()));
-        let hot_accessor = make_hot_accessor(hot_vectors.clone(), config.dim);
-        let hot_index = Arc::new(RwLock::new(HNSW::new_with_accessor(
-            config.hnsw_m,
-            config.hnsw_ef_construction,
-            hot_accessor,
-        )));
+        let shard_count = next_power_of_two_at_least_one(config.hot_index_shards);
+        let shard_mask = shard_count - 1;
+        let hot_indices = (0..shard_count)
+            .map(|_| {
+                let accessor = make_hot_accessor(hot_vectors.clone(), config.dim);
+                RwLock::new(HNSW::new_with_accessor(
+                    config.hnsw_m,
+                    config.hnsw_ef_construction,
+                    accessor,
+                ))
+            })
+            .collect::<Vec<_>>();
         let metadata_cache = Arc::new(RwLock::new(HashMap::new()));
         let (audit_tx, audit_rx) = sync_channel(4096);
         let available = std::thread::available_parallelism()
@@ -254,7 +263,8 @@ impl ProductionState {
             ready: AtomicBool::new(false),
             recovery_report: RwLock::new("initializing".to_string()),
             hot_vectors,
-            hot_index,
+            hot_indices,
+            shard_mask,
             metadata_cache,
             segments: ArcSwap::from_pointee(Vec::new()),
             archive_segments: ArcSwap::from_pointee(Vec::new()),
@@ -357,7 +367,10 @@ impl ProductionState {
 
     pub fn insert_hot_vector(&self, vector_id: usize, vector: Vec<f32>, metadata: VectorMetadata) {
         self.hot_vectors.write().insert(vector_id, vector);
-        self.hot_index.write().insert(vector_id);
+        let shard = vector_id & self.shard_mask;
+        if let Some(index) = self.hot_indices.get(shard) {
+            index.write().insert(vector_id);
+        }
         self.metadata_cache
             .write()
             .insert(vector_id, metadata.clone());
@@ -413,18 +426,25 @@ impl ProductionState {
         let mut best: HashMap<usize, f32> = HashMap::new();
 
         if !matches!(request.search_tier, SearchTier::Archive) {
-            let hot_results = {
-                let index = self.hot_index.read();
-                search_index_with_dynamic_fallback(
-                    &index,
-                    &request.vector,
-                    request.k,
-                    request.ef,
-                    allow_bitmap.as_ref(),
-                )
-            };
-            for (id, score) in hot_results {
-                merge_best(&mut best, id, score);
+            let hot_results = self.query_pool.install(|| {
+                self.hot_indices
+                    .par_iter()
+                    .map(|shard_index| {
+                        let index = shard_index.read();
+                        search_index_with_dynamic_fallback(
+                            &index,
+                            &request.vector,
+                            request.k,
+                            request.ef,
+                            allow_bitmap.as_ref(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for results in hot_results {
+                for (id, score) in results {
+                    merge_best(&mut best, id, score);
+                }
             }
         }
 
@@ -584,41 +604,51 @@ impl ProductionState {
         };
 
         if !matches!(request.search_tier, SearchTier::Archive) {
-            let hot_bounds = {
+            let hot_snapshot = {
                 let hot = self.hot_vectors.read();
                 if hot.is_empty() {
                     None
                 } else {
                     let mut min_id = usize::MAX;
                     let mut max_id = 0usize;
+                    let mut ids = HashSet::with_capacity(hot.len());
                     for id in hot.keys().copied() {
                         min_id = min_id.min(id);
                         max_id = max_id.max(id);
+                        ids.insert(id);
                     }
-                    Some((min_id, max_id))
+                    Some((min_id, max_id, Arc::new(ids)))
                 }
             };
 
-            if let Some((min_id, max_id)) = hot_bounds {
+            if let Some((min_id, max_id, hot_ids)) = hot_snapshot {
                 let total_vectors = max_id.saturating_add(1);
-                let results = {
-                    let index = self.hot_index.read();
-                    index.search_subsequence(
-                        &request.vectors,
-                        request.k,
-                        request.ef.max(request.k),
-                        total_vectors,
-                    )
-                };
-                let hot = self.hot_vectors.read();
-                for (start_id, score) in results {
-                    if start_id < min_id || start_id.saturating_add(seq_len) > total_vectors {
-                        continue;
+                let results = self.query_pool.install(|| {
+                    self.hot_indices
+                        .par_iter()
+                        .map(|shard_index| {
+                            let index = shard_index.read();
+                            let hot_ids = hot_ids.clone();
+                            index.search_subsequence_with_predicate(
+                                &request.vectors,
+                                request.k,
+                                request.ef.max(request.k),
+                                total_vectors,
+                                move |id| hot_ids.contains(&id),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                for shard_results in results {
+                    for (start_id, score) in shard_results {
+                        if start_id < min_id || start_id.saturating_add(seq_len) > total_vectors {
+                            continue;
+                        }
+                        if (0..seq_len).any(|offset| !hot_ids.contains(&(start_id + offset))) {
+                            continue;
+                        }
+                        merge_best(&mut best, start_id, score);
                     }
-                    if (0..seq_len).any(|offset| !hot.contains_key(&(start_id + offset))) {
-                        continue;
-                    }
-                    merge_best(&mut best, start_id, score);
                 }
             }
 
@@ -1055,7 +1085,18 @@ impl ProductionState {
         })?;
 
         let result = (|| -> Result<JobResponseV2> {
-            let (ids, vectors, metadata) = wal_to_arrays(&pending);
+            let (ids_raw, vectors_raw, metadata_raw) = wal_to_arrays(&pending);
+            for pair in ids_raw.windows(2) {
+                if pair[1] > pair[0].saturating_add(1) {
+                    tracing::warn!(
+                        "checkpoint gap detected between vector_id {} and {}; filling tombstones",
+                        pair[0],
+                        pair[1]
+                    );
+                }
+            }
+            let (ids, vectors, metadata) =
+                densify_id_space(self.collection.dim, ids_raw, vectors_raw, metadata_raw)?;
             let hnsw = build_index_from_pairs(
                 self.config.hnsw_m,
                 self.config.hnsw_ef_construction,
@@ -1248,18 +1289,44 @@ impl ProductionState {
         let result = (|| -> Result<JobResponseV2> {
             let mut ordered_segments = candidates.clone();
             ordered_segments.sort_by_key(|seg| seg.record.vector_id_start);
+            for pair in ordered_segments.windows(2) {
+                let prev = &pair[0].record;
+                let next = &pair[1].record;
+                if next.vector_id_start <= prev.vector_id_end {
+                    return Err(anyhow!(
+                        "compaction candidates overlap: {} [{}..={}] and {} [{}..={}]",
+                        prev.id,
+                        prev.vector_id_start,
+                        prev.vector_id_end,
+                        next.id,
+                        next.vector_id_start,
+                        next.vector_id_end
+                    ));
+                }
+                if next.vector_id_start != prev.vector_id_end.saturating_add(1) {
+                    tracing::warn!(
+                        "compaction gap detected between {} [{}..={}] and {} [{}..={}]; filling tombstones",
+                        prev.id,
+                        prev.vector_id_start,
+                        prev.vector_id_end,
+                        next.id,
+                        next.vector_id_start,
+                        next.vector_id_end
+                    );
+                }
+            }
             let total_rows = ordered_segments
                 .iter()
                 .map(|seg| seg.record.row_count)
                 .sum::<usize>();
-            let mut ids = Vec::with_capacity(total_rows);
-            let mut vectors = Vec::with_capacity(total_rows);
+            let mut ids_raw = Vec::with_capacity(total_rows);
+            let mut vectors_raw = Vec::with_capacity(total_rows);
             let mut read_bytes_budget = 0u64;
             for seg in &ordered_segments {
                 for offset in 0..seg.record.row_count {
                     let vector_id = seg.record.vector_id_start + offset;
-                    ids.push(vector_id);
-                    vectors.push(seg.store.get(offset).to_vec());
+                    ids_raw.push(vector_id);
+                    vectors_raw.push(seg.store.get(offset).to_vec());
                     read_bytes_budget += (self.collection.dim as u64) * 4;
                     if read_bytes_budget >= 1 * 1024 * 1024 {
                         self.throttle_background_io(read_bytes_budget);
@@ -1270,11 +1337,13 @@ impl ProductionState {
             if read_bytes_budget > 0 {
                 self.throttle_background_io(read_bytes_budget);
             }
-            let metadata_map = self.catalog.fetch_metadata(&self.collection.id, &ids)?;
-            let metadata = ids
+            let metadata_map = self.catalog.fetch_metadata(&self.collection.id, &ids_raw)?;
+            let metadata_raw = ids_raw
                 .iter()
                 .map(|id| metadata_map.get(id).cloned().unwrap_or_default())
                 .collect::<Vec<_>>();
+            let (ids, vectors, metadata) =
+                densify_id_space(self.collection.dim, ids_raw, vectors_raw, metadata_raw)?;
             let use_archive_pq =
                 output_level >= 2 && should_use_archive_pq(self.collection.dim, vectors.len());
             let write_budget = if use_archive_pq {
@@ -1475,16 +1544,18 @@ impl ProductionState {
             }
         }
 
-        let new_index = HNSW::new_with_accessor(
-            self.config.hnsw_m,
-            self.config.hnsw_ef_construction,
-            make_hot_accessor(self.hot_vectors.clone(), self.collection.dim),
-        );
-        {
-            let mut idx = self.hot_index.write();
-            *idx = new_index;
-            for e in &pending {
-                idx.insert(e.vector_id);
+        for shard in &self.hot_indices {
+            let mut idx = shard.write();
+            *idx = HNSW::new_with_accessor(
+                self.config.hnsw_m,
+                self.config.hnsw_ef_construction,
+                make_hot_accessor(self.hot_vectors.clone(), self.collection.dim),
+            );
+        }
+        for e in &pending {
+            let shard = e.vector_id & self.shard_mask;
+            if let Some(idx) = self.hot_indices.get(shard) {
+                idx.write().insert(e.vector_id);
             }
         }
         Ok(())
@@ -1963,6 +2034,75 @@ fn wal_to_arrays(entries: &[WalEntry]) -> (Vec<usize>, Vec<Vec<f32>>, Vec<Vector
     (ids, vectors, metadata)
 }
 
+fn tombstone_metadata() -> VectorMetadata {
+    VectorMetadata {
+        source_file: "__vibrato_tombstone__".to_string(),
+        start_time_ms: 0,
+        duration_ms: 0,
+        bpm: 0.0,
+        tags: vec!["__vibrato_tombstone__".to_string()],
+    }
+}
+
+fn densify_id_space(
+    dim: usize,
+    ids: Vec<usize>,
+    vectors: Vec<Vec<f32>>,
+    metadata: Vec<VectorMetadata>,
+) -> Result<(Vec<usize>, Vec<Vec<f32>>, Vec<VectorMetadata>)> {
+    if ids.len() != vectors.len() || ids.len() != metadata.len() {
+        return Err(anyhow!(
+            "id/vector/metadata length mismatch: ids={} vectors={} metadata={}",
+            ids.len(),
+            vectors.len(),
+            metadata.len()
+        ));
+    }
+    if ids.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+
+    let mut rows = ids
+        .into_iter()
+        .zip(vectors)
+        .zip(metadata)
+        .map(|((id, vector), meta)| (id, vector, meta))
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(id, _, _)| *id);
+
+    for pair in rows.windows(2) {
+        if pair[1].0 == pair[0].0 {
+            return Err(anyhow!(
+                "duplicate vector_id {} while densifying",
+                pair[0].0
+            ));
+        }
+    }
+
+    let start_id = rows.first().map(|r| r.0).unwrap_or(0);
+    let end_id = rows.last().map(|r| r.0).unwrap_or(start_id);
+    let dense_len = end_id.saturating_sub(start_id) + 1;
+    let mut out_ids = Vec::with_capacity(dense_len);
+    let mut out_vectors = Vec::with_capacity(dense_len);
+    let mut out_metadata = Vec::with_capacity(dense_len);
+
+    let mut cursor = start_id;
+    for (id, vector, meta) in rows {
+        while cursor < id {
+            out_ids.push(cursor);
+            out_vectors.push(vec![0.0f32; dim]);
+            out_metadata.push(tombstone_metadata());
+            cursor = cursor.saturating_add(1);
+        }
+        out_ids.push(id);
+        out_vectors.push(vector);
+        out_metadata.push(meta);
+        cursor = id.saturating_add(1);
+    }
+
+    Ok((out_ids, out_vectors, out_metadata))
+}
+
 fn merge_best(best: &mut HashMap<usize, f32>, id: usize, score: f32) {
     match best.get_mut(&id) {
         Some(existing) => {
@@ -2361,6 +2501,15 @@ fn make_hot_accessor(
         } else {
             sink(&zero_fallback);
         }
+    }
+}
+
+fn next_power_of_two_at_least_one(v: usize) -> usize {
+    let n = v.max(1);
+    if n.is_power_of_two() {
+        n
+    } else {
+        n.next_power_of_two()
     }
 }
 
