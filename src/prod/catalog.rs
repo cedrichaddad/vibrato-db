@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use vibrato_core::metadata::VectorMetadata;
 
+use super::model::AuditEvent;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
     Query,
@@ -1793,6 +1795,49 @@ impl CatalogStore for SqliteCatalog {
             latency_ms,
             sql_quote(&details.to_string())
         ))
+    }
+}
+
+impl SqliteCatalog {
+    pub fn audit_events_batch(&self, events: &[AuditEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let now = now_unix_ts();
+        let mut sql = String::with_capacity(events.len() * 200 + 50);
+        sql.push_str("BEGIN IMMEDIATE;");
+        sql.push_str("INSERT INTO audit_events(ts, request_id, api_key_id, endpoint, action, status_code, latency_ms, client_ip, details_json) VALUES ");
+        
+        for (i, event) in events.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('(');
+            sql.push_str(&now.to_string());
+            sql.push_str(", '");
+            sql.push_str(&sql_quote(&event.request_id));
+            sql.push_str("', ");
+            if let Some(ak) = &event.api_key_id {
+                sql.push('\'');
+                sql.push_str(&sql_quote(ak));
+                sql.push('\'');
+            } else {
+                sql.push_str("NULL");
+            }
+            sql.push_str(", '");
+            sql.push_str(&sql_quote(&event.endpoint));
+            sql.push_str("', '");
+            sql.push_str(&sql_quote(&event.action));
+            sql.push_str("', ");
+            sql.push_str(&event.status_code.to_string());
+            sql.push_str(", ");
+            sql.push_str(&event.latency_ms.to_string());
+            sql.push_str(", NULL, '");
+            sql.push_str(&sql_quote(&event.details.to_string()));
+            sql.push_str("')");
+        }
+        sql.push_str("; COMMIT;");
+        self.exec(&sql)
     }
 }
 

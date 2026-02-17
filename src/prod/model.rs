@@ -15,6 +15,17 @@ pub struct ApiResponse<T> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub request_id: String,
+    pub api_key_id: Option<String>,
+    pub endpoint: String,
+    pub action: String,
+    pub status_code: u16,
+    pub latency_ms: f64,
+    pub details: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestRequestV2 {
     pub vector: Vec<f32>,
     #[serde(default)]

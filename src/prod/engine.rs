@@ -28,8 +28,8 @@ use super::catalog::{
 };
 use super::filter::{BitmapSet, FilterIndex};
 use super::model::{
-    IdentifyRequestV2, IdentifyResponseV2, IdentifyResultV2, JobResponseV2, QueryRequestV2,
-    QueryResponseV2, QueryResultV2, SearchTier, StatsResponseV2,
+    AuditEvent, IdentifyRequestV2, IdentifyResponseV2, IdentifyResultV2, JobResponseV2,
+    QueryRequestV2, QueryResponseV2, QueryResultV2, SearchTier, StatsResponseV2,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,16 +137,7 @@ pub struct ArchivePqSegment {
     pub num_subspaces: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct AuditEvent {
-    pub request_id: String,
-    pub api_key_id: Option<String>,
-    pub endpoint: String,
-    pub action: String,
-    pub status_code: u16,
-    pub latency_ms: f64,
-    pub details: Value,
-}
+
 
 pub struct ProductionState {
     pub config: ProductionConfig,
@@ -156,7 +147,7 @@ pub struct ProductionState {
     pub ready: AtomicBool,
     pub recovery_report: RwLock<String>,
 
-    pub hot_vector_shards: Vec<Arc<RwLock<HashMap<usize, Vec<f32>>>>>,
+    pub hot_vector_shards: Vec<ArcSwap<RwLock<HashMap<usize, Vec<f32>>>>>,
     pub hot_indices: Vec<RwLock<HNSW>>,
     pub shard_mask: usize,
     pub metadata_cache: Arc<RwLock<HashMap<usize, VectorMetadata>>>,
@@ -223,12 +214,12 @@ impl ProductionState {
         let shard_count = next_power_of_two_at_least_one(config.hot_index_shards);
         let shard_mask = shard_count - 1;
         let hot_vector_shards = (0..shard_count)
-            .map(|_| Arc::new(RwLock::new(HashMap::new())))
+            .map(|_| ArcSwap::new(Arc::new(RwLock::new(HashMap::new()))))
             .collect::<Vec<_>>();
         let hot_indices = hot_vector_shards
             .iter()
             .map(|shard_vectors| {
-                let accessor = make_hot_accessor(shard_vectors.clone(), config.dim);
+                let accessor = make_hot_accessor(shard_vectors.load_full(), config.dim);
                 RwLock::new(HNSW::new_with_accessor(
                     config.hnsw_m,
                     config.hnsw_ef_construction,
@@ -370,32 +361,16 @@ impl ProductionState {
 
     pub fn insert_hot_vector(&self, vector_id: usize, vector: Vec<f32>, metadata: VectorMetadata) {
         let shard = vector_id & self.shard_mask;
-        let t0 = Instant::now();
         if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
-            shard_vectors.write().insert(vector_id, vector);
+            shard_vectors.load().write().insert(vector_id, vector);
         }
-        let t1 = Instant::now();
         if let Some(index) = self.hot_indices.get(shard) {
             index.write().insert(vector_id);
         }
-        let t2 = Instant::now();
         self.metadata_cache
             .write()
             .insert(vector_id, metadata.clone());
-        let t3 = Instant::now();
         self.filter_index.write().add(vector_id, &metadata);
-        let t4 = Instant::now();
-        let total = t4.duration_since(t0);
-        if total > Duration::from_secs(1) {
-            tracing::warn!(
-                "insert_hot_vector SLOW vid={} shard={} total={:?} shard_vec={:?} hnsw={:?} meta={:?} filter={:?}",
-                vector_id, shard, total,
-                t1.duration_since(t0),
-                t2.duration_since(t1),
-                t3.duration_since(t2),
-                t4.duration_since(t3)
-            );
-        }
     }
 
     pub fn ingest_vector(
@@ -412,29 +387,17 @@ impl ProductionState {
             ));
         }
 
-        let t0 = Instant::now();
         let ingest = self.catalog.ingest_wal_atomic(
             &self.collection.id,
             vector,
             metadata,
             idempotency_key,
         )?;
-        let t1 = Instant::now();
         if ingest.created {
             self.insert_hot_vector(ingest.vector_id, vector.to_vec(), metadata.clone());
             self.metrics
                 .ingest_total
                 .fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        let t2 = Instant::now();
-        let total = t2.duration_since(t0);
-        if total > Duration::from_secs(1) {
-            tracing::warn!(
-                "ingest_vector SLOW vid={} total={:?} wal={:?} hot={:?}",
-                ingest.vector_id, total,
-                t1.duration_since(t0),
-                t2.duration_since(t1)
-            );
         }
         Ok((ingest.vector_id, ingest.created))
     }
@@ -641,7 +604,7 @@ impl ProductionState {
                 let total_hot = self
                     .hot_vector_shards
                     .iter()
-                    .map(|shard| shard.read().len())
+                    .map(|shard| shard.load().read().len())
                     .sum::<usize>();
                 if total_hot == 0 {
                     None
@@ -650,7 +613,8 @@ impl ProductionState {
                     let mut max_id = 0usize;
                     let mut ids = HashSet::with_capacity(total_hot);
                     for shard in &self.hot_vector_shards {
-                        let guard = shard.read();
+                        let arc_guard = shard.load();
+                        let guard = arc_guard.read();
                         for id in guard.keys().copied() {
                             min_id = min_id.min(id);
                             max_id = max_id.max(id);
@@ -850,7 +814,7 @@ impl ProductionState {
         let hot_vectors = self
             .hot_vector_shards
             .iter()
-            .map(|shard| shard.read().len())
+            .map(|shard| shard.load().read().len())
             .sum();
         let wal_pending = self.catalog.count_wal_pending(&self.collection.id)?;
         let total_vectors = self.catalog.total_vectors(&self.collection.id)?;
@@ -1586,10 +1550,16 @@ impl ProductionState {
         let mut pending = self.catalog.pending_wal_after_lsn(&self.collection.id, 0)?;
         // Enforce LSN order even if upstream query ordering changes.
         pending.sort_by_key(|e| e.lsn);
-        for shard in &self.hot_vector_shards {
-            shard.write().clear();
+
+        // 1. Create shadow shards (Arc<RwLock<HashMap>>)
+        let mut new_shards = Vec::with_capacity(self.hot_vector_shards.len());
+        for _ in 0..self.hot_vector_shards.len() {
+            new_shards.push(Arc::new(RwLock::new(HashMap::new())));
         }
-        for (shard_idx, shard_vectors) in self.hot_vector_shards.iter().enumerate() {
+
+        // 2. Populate shadow shards
+        // This is done without holding any locks on the main index
+        for (shard_idx, shard_vectors) in new_shards.iter().enumerate() {
             let mut vectors = shard_vectors.write();
             for e in &pending {
                 if (e.vector_id & self.shard_mask) == shard_idx {
@@ -1598,24 +1568,36 @@ impl ProductionState {
             }
         }
 
-        for (shard_index, shard_vectors) in
-            self.hot_indices.iter().zip(self.hot_vector_shards.iter())
-        {
-            let mut idx = shard_index.write();
-            *idx = HNSW::new_with_accessor(
+        // 3. Build shadow HNSW indices
+        // HNSW is built against the SHADOW shards
+        let mut new_indices = Vec::with_capacity(self.hot_indices.len());
+        for (shard_idx, shard_vectors) in new_shards.iter().enumerate() {
+            let mut hnsw = HNSW::new_with_accessor(
                 self.config.hnsw_m,
                 self.config.hnsw_ef_construction,
                 make_hot_accessor(shard_vectors.clone(), self.collection.dim),
             );
-        }
-        for (shard_idx, shard_index) in self.hot_indices.iter().enumerate() {
-            let mut idx = shard_index.write();
+            // Populate HNSW from pending
             for e in &pending {
                 if (e.vector_id & self.shard_mask) == shard_idx {
-                    idx.insert(e.vector_id);
+                    hnsw.insert(e.vector_id);
                 }
             }
+            new_indices.push(hnsw);
         }
+
+        // 4. Atomic Swap
+        // We swap the vector shards FIRST, then the indices.
+        // HNSW indices hold a reference to the vector shards they were built with.
+        // By swapping the shards into the global ArcSwap, we ensure new ingests
+        // go to the same place the new indices are reading from.
+        for (i, shard) in new_shards.into_iter().enumerate() {
+             self.hot_vector_shards[i].store(shard);
+        }
+        for (i, hnsw) in new_indices.into_iter().enumerate() {
+             *self.hot_indices[i].write() = hnsw;
+        }
+
         Ok(())
     }
 
@@ -2518,31 +2500,58 @@ fn compaction_loop(state: Arc<ProductionState>) {
 }
 
 fn audit_worker_loop(state: Arc<ProductionState>, rx: Receiver<AuditEvent>) {
-    while let Ok(event) = rx.recv() {
-        let mut written = false;
-        for attempt in 0..3 {
-            let result = state.catalog.audit_event(
-                &event.request_id,
-                event.api_key_id.as_deref(),
-                &event.endpoint,
-                &event.action,
-                event.status_code,
-                event.latency_ms,
-                event.details.clone(),
-            );
-            if result.is_ok() {
-                written = true;
+    let mut buffer = Vec::with_capacity(100);
+    let batch_size = 100;
+    let batch_timeout = Duration::from_millis(50);
+    let mut last_flush = Instant::now();
+
+    loop {
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_flush);
+        let timeout = if elapsed >= batch_timeout {
+            Duration::from_millis(0)
+        } else {
+            batch_timeout - elapsed
+        };
+
+        match rx.recv_timeout(timeout) {
+            Ok(event) => {
+                buffer.push(event);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Continue to flush check
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if !buffer.is_empty() {
+                    if let Err(e) = state.catalog.audit_events_batch(&buffer) {
+                         tracing::error!("final audit batch failed: {}", e);
+                         state.metrics.audit_failures_total.fetch_add(buffer.len() as u64, AtomicOrdering::Relaxed);
+                    }
+                }
                 break;
             }
-            if attempt < 2 {
-                std::thread::sleep(Duration::from_millis(20 * (attempt + 1) as u64));
-            }
         }
-        if !written {
-            state
-                .metrics
-                .audit_failures_total
-                .fetch_add(1, AtomicOrdering::Relaxed);
+
+        if !buffer.is_empty() && (buffer.len() >= batch_size || last_flush.elapsed() >= batch_timeout) {
+            let mut written = false;
+            for attempt in 0..3 {
+                if state.catalog.audit_events_batch(&buffer).is_ok() {
+                    written = true;
+                    break;
+                }
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(20 * (attempt + 1) as u64));
+                }
+            }
+            if !written {
+                tracing::error!("audit batch failed after 3 attempts, dropped {} events", buffer.len());
+                state
+                    .metrics
+                    .audit_failures_total
+                    .fetch_add(buffer.len() as u64, AtomicOrdering::Relaxed);
+            }
+            buffer.clear();
+            last_flush = Instant::now();
         }
     }
 }
