@@ -843,6 +843,7 @@ pub struct HNSWStats {
 mod tests {
     use super::*;
     use crate::simd::l2_normalized;
+    use std::collections::HashMap;
 
     fn random_vector(dim: usize) -> Vec<f32> {
         use rand::Rng;
@@ -1242,6 +1243,39 @@ mod tests {
         assert!(
             results.iter().all(|(start, _)| seen.insert(*start)),
             "multi-probe merge should dedupe repeated start_ids"
+        );
+    }
+
+    #[test]
+    fn test_search_with_sparse_ids_is_safe() {
+        let ids = [0usize, 1024, 1028, 2056];
+        let mut map = HashMap::new();
+        for id in ids {
+            map.insert(id, random_vector(32));
+        }
+
+        let map_for_accessor = map.clone();
+        let zero = vec![0.0f32; 32];
+        let mut hnsw = HNSW::new_with_accessor(16, 100, move |id, sink| {
+            if let Some(v) = map_for_accessor.get(&id) {
+                sink(v);
+            } else {
+                sink(&zero);
+            }
+        });
+        for id in [0usize, 1024, 1028, 2056] {
+            hnsw.insert(id);
+        }
+
+        let query = map.get(&1028).unwrap().clone();
+        let results = hnsw.search(&query, 3, 128);
+        assert!(
+            !results.is_empty(),
+            "sparse-id search should return results"
+        );
+        assert_eq!(
+            results[0].0, 1028,
+            "exact sparse-id vector should be top-1 result"
         );
     }
 

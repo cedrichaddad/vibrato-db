@@ -100,7 +100,28 @@ async fn test_persistence_integrity_across_process_restart() {
         .send()
         .await
         .expect("flush request");
-    assert_eq!(flush_resp.status(), StatusCode::OK);
+    if flush_resp.status() == StatusCode::ACCEPTED {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("flush timed out");
+            }
+            let status_resp = client
+                .get(format!("{}/flush/status", base_url))
+                .send()
+                .await
+                .expect("flush status request");
+            assert_eq!(status_resp.status(), StatusCode::OK);
+            let status: serde_json::Value = status_resp.json().await.expect("flush status json");
+            match status["state"].as_str().unwrap_or("unknown") {
+                "completed" | "idle" => break,
+                "failed" => panic!("flush failed: {:?}", status),
+                _ => sleep(Duration::from_millis(100)).await,
+            }
+        }
+    } else {
+        assert_eq!(flush_resp.status(), StatusCode::OK);
+    }
 
     stop_server(&mut server).await;
 

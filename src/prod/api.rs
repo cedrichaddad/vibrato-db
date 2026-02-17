@@ -56,7 +56,17 @@ async fn v2_ingest(
     };
 
     let metadata = body.metadata.into();
-    let result = state.ingest_vector(&body.vector, &metadata, body.idempotency_key.as_deref());
+    let idempotency_key = body.idempotency_key.clone();
+    let vector = body.vector.clone();
+    let state_bg = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        state_bg.ingest_vector(&vector, &metadata, idempotency_key.as_deref())
+    })
+    .await;
+    let result = match result {
+        Ok(inner) => inner,
+        Err(e) => Err(anyhow::anyhow!("ingest join error: {}", e)),
+    };
 
     match result {
         Ok((id, created)) => {
@@ -118,7 +128,14 @@ async fn v2_query(
         }
     };
 
-    match state.query(&body) {
+    let state_bg = state.clone();
+    let body_clone = body.clone();
+    let result = tokio::task::spawn_blocking(move || state_bg.query(&body_clone)).await;
+    let result = match result {
+        Ok(inner) => inner,
+        Err(e) => Err(anyhow::anyhow!("query join error: {}", e)),
+    };
+    match result {
         Ok(query) => {
             let payload = ApiResponse { data: query };
             let resp = json_response(StatusCode::OK, &request_id, &payload);
@@ -183,7 +200,14 @@ async fn v2_identify(
         }
     };
 
-    match state.identify(&body) {
+    let state_bg = state.clone();
+    let body_clone = body.clone();
+    let result = tokio::task::spawn_blocking(move || state_bg.identify(&body_clone)).await;
+    let result = match result {
+        Ok(inner) => inner,
+        Err(e) => Err(anyhow::anyhow!("identify join error: {}", e)),
+    };
+    match result {
         Ok(result) => {
             let payload = ApiResponse { data: result };
             let resp = json_response(StatusCode::OK, &request_id, &payload);
@@ -247,7 +271,13 @@ async fn v2_admin_checkpoint(
         }
     };
 
-    match state.checkpoint_once() {
+    let state_bg = state.clone();
+    let result = tokio::task::spawn_blocking(move || state_bg.checkpoint_once()).await;
+    let result = match result {
+        Ok(inner) => inner,
+        Err(e) => Err(anyhow::anyhow!("checkpoint join error: {}", e)),
+    };
+    match result {
         Ok(job) => {
             let payload = ApiResponse::<JobResponseV2> { data: job };
             let resp = json_response(StatusCode::OK, &request_id, &payload);
@@ -316,7 +346,13 @@ async fn v2_admin_compact(
         }
     };
 
-    match state.compact_once() {
+    let state_bg = state.clone();
+    let result = tokio::task::spawn_blocking(move || state_bg.compact_once()).await;
+    let result = match result {
+        Ok(inner) => inner,
+        Err(e) => Err(anyhow::anyhow!("compact join error: {}", e)),
+    };
+    match result {
         Ok(job) => {
             let payload = ApiResponse::<JobResponseV2> { data: job };
             let resp = json_response(StatusCode::OK, &request_id, &payload);

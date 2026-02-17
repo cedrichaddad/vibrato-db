@@ -370,16 +370,32 @@ impl ProductionState {
 
     pub fn insert_hot_vector(&self, vector_id: usize, vector: Vec<f32>, metadata: VectorMetadata) {
         let shard = vector_id & self.shard_mask;
+        let t0 = Instant::now();
         if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
             shard_vectors.write().insert(vector_id, vector);
         }
+        let t1 = Instant::now();
         if let Some(index) = self.hot_indices.get(shard) {
             index.write().insert(vector_id);
         }
+        let t2 = Instant::now();
         self.metadata_cache
             .write()
             .insert(vector_id, metadata.clone());
+        let t3 = Instant::now();
         self.filter_index.write().add(vector_id, &metadata);
+        let t4 = Instant::now();
+        let total = t4.duration_since(t0);
+        if total > Duration::from_secs(1) {
+            tracing::warn!(
+                "insert_hot_vector SLOW vid={} shard={} total={:?} shard_vec={:?} hnsw={:?} meta={:?} filter={:?}",
+                vector_id, shard, total,
+                t1.duration_since(t0),
+                t2.duration_since(t1),
+                t3.duration_since(t2),
+                t4.duration_since(t3)
+            );
+        }
     }
 
     pub fn ingest_vector(
@@ -396,17 +412,29 @@ impl ProductionState {
             ));
         }
 
+        let t0 = Instant::now();
         let ingest = self.catalog.ingest_wal_atomic(
             &self.collection.id,
             vector,
             metadata,
             idempotency_key,
         )?;
+        let t1 = Instant::now();
         if ingest.created {
             self.insert_hot_vector(ingest.vector_id, vector.to_vec(), metadata.clone());
             self.metrics
                 .ingest_total
                 .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        let t2 = Instant::now();
+        let total = t2.duration_since(t0);
+        if total > Duration::from_secs(1) {
+            tracing::warn!(
+                "ingest_vector SLOW vid={} total={:?} wal={:?} hot={:?}",
+                ingest.vector_id, total,
+                t1.duration_since(t0),
+                t2.duration_since(t1)
+            );
         }
         Ok((ingest.vector_id, ingest.created))
     }
@@ -1561,10 +1589,12 @@ impl ProductionState {
         for shard in &self.hot_vector_shards {
             shard.write().clear();
         }
-        for e in &pending {
-            let shard = e.vector_id & self.shard_mask;
-            if let Some(vectors) = self.hot_vector_shards.get(shard) {
-                vectors.write().insert(e.vector_id, e.vector.clone());
+        for (shard_idx, shard_vectors) in self.hot_vector_shards.iter().enumerate() {
+            let mut vectors = shard_vectors.write();
+            for e in &pending {
+                if (e.vector_id & self.shard_mask) == shard_idx {
+                    vectors.insert(e.vector_id, e.vector.clone());
+                }
             }
         }
 
@@ -1578,10 +1608,12 @@ impl ProductionState {
                 make_hot_accessor(shard_vectors.clone(), self.collection.dim),
             );
         }
-        for e in &pending {
-            let shard = e.vector_id & self.shard_mask;
-            if let Some(idx) = self.hot_indices.get(shard) {
-                idx.write().insert(e.vector_id);
+        for (shard_idx, shard_index) in self.hot_indices.iter().enumerate() {
+            let mut idx = shard_index.write();
+            for e in &pending {
+                if (e.vector_id & self.shard_mask) == shard_idx {
+                    idx.insert(e.vector_id);
+                }
             }
         }
         Ok(())

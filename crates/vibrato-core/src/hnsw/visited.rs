@@ -34,12 +34,24 @@ impl VisitedSet {
     /// Check if a node has been visited
     #[inline(always)]
     pub fn is_visited(&self, id: usize) -> bool {
+        if id >= self.set.len() {
+            return false;
+        }
         self.set.contains(id)
     }
 
     /// Mark a node as visited
     #[inline(always)]
     pub fn visit(&mut self, id: usize) {
+        if id >= self.set.len() {
+            // HNSW can be traversed with sparse/global IDs (e.g. sharded indexes),
+            // so grow on demand when IDs exceed the initial node-count estimate.
+            let current = self.set.len().max(1);
+            let target = id.saturating_add(1);
+            let required = current.max(target);
+            let new_len = required.checked_next_power_of_two().unwrap_or(required);
+            self.set.grow(new_len);
+        }
         self.set.insert(id);
     }
 
@@ -182,5 +194,13 @@ mod tests {
         assert!(guard.is_visited(0));
         assert!(guard.is_visited(99_999));
         assert!(!guard.is_visited(50_000));
+    }
+
+    #[test]
+    fn test_visited_grows_for_sparse_ids() {
+        let mut guard = VisitedGuard::new(16);
+        guard.visit(1028);
+        assert!(guard.is_visited(1028));
+        assert!(!guard.is_visited(1029));
     }
 }
