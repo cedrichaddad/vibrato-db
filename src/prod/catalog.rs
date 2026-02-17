@@ -273,7 +273,7 @@ impl RawSqliteConnection {
         conn.exec("PRAGMA foreign_keys=ON;")?;
         conn.exec("PRAGMA temp_store=MEMORY;")?;
         unsafe {
-            let _ = sqlite3_busy_timeout(conn.db, 5000);
+            let _ = sqlite3_busy_timeout(conn.db, 30000);
         }
         Ok(conn)
     }

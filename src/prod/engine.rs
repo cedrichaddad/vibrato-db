@@ -2500,9 +2500,9 @@ fn compaction_loop(state: Arc<ProductionState>) {
 }
 
 fn audit_worker_loop(state: Arc<ProductionState>, rx: Receiver<AuditEvent>) {
-    let mut buffer = Vec::with_capacity(100);
-    let batch_size = 100;
-    let batch_timeout = Duration::from_millis(50);
+    let mut buffer = Vec::with_capacity(1000);
+    let batch_size = 500;
+    let batch_timeout = Duration::from_millis(250);
     let mut last_flush = Instant::now();
 
     loop {
@@ -2533,18 +2533,10 @@ fn audit_worker_loop(state: Arc<ProductionState>, rx: Receiver<AuditEvent>) {
         }
 
         if !buffer.is_empty() && (buffer.len() >= batch_size || last_flush.elapsed() >= batch_timeout) {
-            let mut written = false;
-            for attempt in 0..3 {
-                if state.catalog.audit_events_batch(&buffer).is_ok() {
-                    written = true;
-                    break;
-                }
-                if attempt < 2 {
-                    std::thread::sleep(Duration::from_millis(20 * (attempt + 1) as u64));
-                }
-            }
-            if !written {
-                tracing::error!("audit batch failed after 3 attempts, dropped {} events", buffer.len());
+            // Optimization: No retries. If the DB is locked for 30s, retrying for 20ms is useless.
+            // Drop the batch to save the system.
+            if let Err(e) = state.catalog.audit_events_batch(&buffer) {
+                tracing::error!("audit batch failed, dropped {} events: {}", buffer.len(), e);
                 state
                     .metrics
                     .audit_failures_total
