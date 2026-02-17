@@ -41,6 +41,8 @@ pub struct VectorStore {
     pub dim: usize,
     /// Byte offset where vector data begins
     pub(crate) data_offset: usize,
+    /// Optional byte range containing serialized metadata.
+    pub(crate) metadata_range: Option<(usize, usize)>,
 }
 
 impl VectorStore {
@@ -58,25 +60,71 @@ impl VectorStore {
         let mmap = unsafe { Mmap::map(&file)? };
 
         // Check magic bytes to determine version
-        let (count, dim, data_offset) = if mmap.len() >= 8 && &mmap[0..8] == &MAGIC {
+        let (count, dim, data_offset, metadata_range) = if mmap.len() >= 8 && &mmap[0..8] == &MAGIC
+        {
             // V1
             let header = VdbHeader::from_bytes(&mmap)?;
-            (header.count as usize, header.dimensions as usize, HEADER_SIZE)
+            (
+                header.count as usize,
+                header.dimensions as usize,
+                HEADER_SIZE,
+                None,
+            )
         } else if mmap.len() >= 8 && &mmap[0..8] == &MAGIC_V2 {
             // V2
             let header = VdbHeaderV2::from_bytes(&mmap).map_err(|e| match e {
                 crate::format_v2::FormatV2Error::Io(io) => FormatError::Io(io),
-                crate::format_v2::FormatV2Error::DimensionMismatch { expected, actual } => FormatError::DimensionMismatch { expected, actual },
+                crate::format_v2::FormatV2Error::DimensionMismatch { expected, actual } => {
+                    FormatError::DimensionMismatch { expected, actual }
+                }
                 _ => FormatError::InvalidMagic, // Or wrap in IO error
             })?;
             if header.is_pq_enabled() {
                 // This store implementation expects raw f32 vectors
-                return Err(StoreError::Format(FormatError::DimensionMismatch { 
-                    expected: 0, 
-                    actual: 0 // TODO: Add specific error for PQ unsupported in raw store
+                return Err(StoreError::Format(FormatError::DimensionMismatch {
+                    expected: 0,
+                    actual: 0, // TODO: Add specific error for PQ unsupported in raw store
                 }));
             }
-            (header.count as usize, header.dimensions as usize, header.vectors_offset as usize)
+            let metadata_range = if header.has_metadata() && header.metadata_offset > 0 {
+                let start = header.metadata_offset as usize;
+                let end = if header.graph_offset > 0 {
+                    if header.graph_offset <= header.metadata_offset {
+                        return Err(StoreError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Invalid metadata/graph offsets: metadata={} graph={}",
+                                header.metadata_offset, header.graph_offset
+                            ),
+                        )));
+                    }
+                    header.graph_offset as usize
+                } else {
+                    mmap.len()
+                };
+
+                if start >= end || end > mmap.len() {
+                    return Err(StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Invalid metadata range: start={} end={} file_size={}",
+                            start,
+                            end,
+                            mmap.len()
+                        ),
+                    )));
+                }
+                Some((start, end))
+            } else {
+                None
+            };
+
+            (
+                header.count as usize,
+                header.dimensions as usize,
+                header.vectors_offset as usize,
+                metadata_range,
+            )
         } else {
             return Err(StoreError::Format(FormatError::InvalidMagic));
         };
@@ -100,6 +148,7 @@ impl VectorStore {
             count,
             dim,
             data_offset,
+            metadata_range,
         })
     }
 
@@ -139,6 +188,23 @@ impl VectorStore {
     /// Get the total memory footprint of the mapped file
     pub fn memory_bytes(&self) -> usize {
         self.mmap.len()
+    }
+
+    /// Return the serialized metadata section, if present.
+    pub fn metadata_bytes(&self) -> Option<&[u8]> {
+        self.metadata_range
+            .map(|(start, end)| &self.mmap[start..end])
+    }
+
+    /// Return the raw mapped file bytes.
+    pub fn mapped_bytes(&self) -> &[u8] {
+        &self.mmap
+    }
+
+    /// Return the contiguous vector payload bytes (f32 region).
+    pub fn vector_bytes(&self) -> &[u8] {
+        let len = self.count * self.dim * std::mem::size_of::<f32>();
+        &self.mmap[self.data_offset..self.data_offset + len]
     }
 
     /// Get an iterator over all vectors
@@ -229,11 +295,7 @@ mod tests {
 
     #[test]
     fn test_iterator() {
-        let vectors = vec![
-            vec![1.0, 2.0],
-            vec![3.0, 4.0],
-            vec![5.0, 6.0],
-        ];
+        let vectors = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
         let dir = create_test_vdb(&vectors);
         let path = dir.path().join("test.vdb");
 

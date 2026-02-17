@@ -56,7 +56,7 @@ Implements a multi-layered graph traversal algorithm for Approximate Nearest Nei
 
 - **Diversity Heuristic**: Neighbor selection logic actively prunes redundant connections.
 - **BitSet Visited Pool**: Uses thread-local `FixedBitSet` pools to eliminate hashing overhead.
-- **Persistence**: The graph structure is serialized to a compact `.idx` binary format.
+- **Persistence**: Vectors, metadata, and graph are persisted in one `.vdb` container.
 
 ### 3. SIMD-Accelerated Math
 
@@ -78,12 +78,21 @@ Vibrato-DB runs as a standalone HTTP service.
 git clone https://github.com/cedrichaddad/vibrato-db.git
 cd vibrato-db
 
-# Run the server (auto-builds index if missing)
+# Run the server (auto-builds graph if missing)
 cargo run --release -- serve \
   --data ./data/music.vdb \
-  --index ./data/music.idx \
   --port 8080
 ```
+
+Optional (for audio ingest with `audio_path`):
+
+```bash
+# Download model artifacts once
+cargo run --release -- setup-models --model-dir ./models
+```
+
+`setup-models` now writes a local `model-manifest.json` with SHA-256 hashes and
+`serve` verifies model integrity against that manifest on startup.
 
 ### 2. CLI Tools
 
@@ -98,7 +107,32 @@ cargo run --release -- ingest --input vectors.json --output data.vdb
 cargo run --release -- search --query "0.1,0.2,..." --k 5
 ```
 
-### 3. Python Bindings
+### 3. Production v2 Control Plane
+
+`v2` adds SQLite catalog, WAL ingest, immutable segment lifecycle, admin auth, and recovery/orphan handling.
+It also includes roaring-style bitmap filter acceleration and PQ-encoded L2 archive segments for archive-tier search.
+
+```bash
+# Start production server
+cargo run --release -- serve-v2 \
+  --data-dir ./vibrato_data \
+  --collection default \
+  --dim 128 \
+  --bootstrap-admin-key true
+
+# Create/revoke API keys
+cargo run --release -- key-create --data-dir ./vibrato_data --name ops --roles admin,query,ingest
+cargo run --release -- key-revoke --data-dir ./vibrato_data --key-id <vbk_id>
+
+# Snapshot / restore / replay
+cargo run --release -- snapshot-create --data-dir ./vibrato_data --collection default
+cargo run --release -- snapshot-restore --data-dir ./vibrato_data --snapshot-dir ./vibrato_data/snapshots/<snapshot_id>
+cargo run --release -- replay-to-lsn --data-dir ./vibrato_data --collection default --target-lsn 1000
+```
+
+See `/Users/cedrichaddad/vibrato-db/docs/PRODUCTION_RUNBOOK_V21.md` for full operations guidance.
+
+### 4. Python Bindings
 
 Vibrato-DB exposes a high-performance Python API via PyO3.
 
@@ -113,7 +147,7 @@ results = index.search(query_vector, k=10)
 print(results) # [(id, score), ...]
 ```
 
-### 4. HTTP API
+### 5. HTTP API
 
 Search for similar vectors using a simple REST API.
 
@@ -149,7 +183,7 @@ Verify the full ingestion and search pipeline using the provided Python script:
 python3 demo.py
 ```
 
-> **Note on Inference**: The neural pipeline strictly mocks the inference step due to unstable `ort` 2.x dependencies on current compilers. The system architecture is fully wired (ingest handler -> resize/decode logic -> inference engine), but the embedding vector is currently a deterministic pseudo-random signal.
+> **Note on Inference**: `serve` runs in search-only mode if model files are missing or fail manifest verification. Run `setup-models` first to enable `/ingest` with `audio_path`.
 
 
 ## File Structure

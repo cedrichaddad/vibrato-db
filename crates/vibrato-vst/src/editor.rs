@@ -1,11 +1,11 @@
+use crate::commands::{GuiCommand, SearchResult, WorkerResponse};
+use crate::VibratoParams;
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
 use nih_plug::prelude::*;
 use nih_plug_egui::create_egui_editor;
-use std::sync::Arc;
 use parking_lot::RwLock;
-use crossbeam_channel::Sender;
-use crate::commands::{GuiCommand, WorkerResponse, SearchResult};
-use crossbeam_channel::Receiver;
-use crate::VibratoParams;
+use std::sync::Arc;
 
 pub fn create_editor(
     params: Arc<VibratoParams>,
@@ -34,7 +34,7 @@ pub fn create_editor(
 
             egui::CentralPanel::default().show(egui_ctx, |ui: &mut egui::Ui| {
                 ui.heading("Vibrato AI");
-                
+
                 // Status Bar
                 let status = status_msg.read().clone();
                 ui.label(format!("Status: {}", status));
@@ -47,17 +47,19 @@ pub fn create_editor(
 
                 // Search Bar
                 ui.horizontal(|ui| {
-                     let mut text = search_text.write();
-                     
-                     if ui.text_edit_singleline(&mut *text).lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                         job_sender.send(GuiCommand::SearchText(text.clone())).ok();
-                     }
-                     
-                     if ui.button("Search").clicked() {
-                         job_sender.send(GuiCommand::SearchText(text.clone())).ok();
-                     }
+                    let mut text = search_text.write();
+
+                    if ui.text_edit_singleline(&mut *text).lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        job_sender.send(GuiCommand::SearchText(text.clone())).ok();
+                    }
+
+                    if ui.button("Search").clicked() {
+                        job_sender.send(GuiCommand::SearchText(text.clone())).ok();
+                    }
                 });
-                
+
                 ui.separator();
 
                 // Results List
@@ -72,7 +74,10 @@ pub fn create_editor(
                                 // Ghost Dragging removed in favor of reliable Copy Path
                                 if let Some(path_str) = result.path.to_str() {
                                     ui.horizontal(|ui| {
-                                        ui.label(format!("{:?}", result.path.file_name().unwrap_or_default()));
+                                        ui.label(format!(
+                                            "{:?}",
+                                            result.path.file_name().unwrap_or_default()
+                                        ));
                                         if ui.button("Copy Path").clicked() {
                                             ui.ctx().copy_text(path_str.to_string());
                                         }

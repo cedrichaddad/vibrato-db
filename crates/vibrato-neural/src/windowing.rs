@@ -121,8 +121,8 @@ impl TransientAwareWindower {
 
         // Find threshold as mean + sensitivity * std
         let mean: f32 = flux.iter().sum::<f32>() / flux.len().max(1) as f32;
-        let variance: f32 = flux.iter().map(|&f| (f - mean) * (f - mean)).sum::<f32>()
-            / flux.len().max(1) as f32;
+        let variance: f32 =
+            flux.iter().map(|&f| (f - mean) * (f - mean)).sum::<f32>() / flux.len().max(1) as f32;
         let threshold = mean + self.sensitivity * variance.sqrt();
 
         // Start with fixed-stride windows

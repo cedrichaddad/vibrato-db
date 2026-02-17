@@ -302,7 +302,7 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
             let ptr_a = a.as_ptr() as usize;
             let ptr_b = b.as_ptr() as usize;
             let byte_len = a.len() * 4;
-            
+
             if ptr_a % 32 == 0 && ptr_b % 32 == 0 && byte_len % 32 == 0 {
                 return unsafe { dot_product_avx2_aligned(a, b) };
             } else {
@@ -331,7 +331,7 @@ pub fn l2_distance_squared(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-             // Check for 32-byte alignment of both pointers AND stride alignment
+            // Check for 32-byte alignment of both pointers AND stride alignment
             let ptr_a = a.as_ptr() as usize;
             let ptr_b = b.as_ptr() as usize;
             let byte_len = a.len() * 4;
@@ -362,7 +362,10 @@ pub fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 /// is compared against all 256 centroids. Keeping the query in registers
 /// across iterations avoids repeated loads.
 pub fn l2_distance_squared_batch(query: &[f32], targets: &[&[f32]]) -> Vec<f32> {
-    targets.iter().map(|t| l2_distance_squared(query, t)).collect()
+    targets
+        .iter()
+        .map(|t| l2_distance_squared(query, t))
+        .collect()
 }
 
 /// L2 normalize a vector in place
@@ -493,16 +496,22 @@ mod tests {
         // Zero vector should remain zero (avoid division by zero)
         let mut v = vec![0.0f32; 64];
         l2_normalize(&mut v);
-        
-        assert!(v.iter().all(|&x| x == 0.0), "Zero vector should remain zero");
+
+        assert!(
+            v.iter().all(|&x| x == 0.0),
+            "Zero vector should remain zero"
+        );
     }
 
     #[test]
     fn test_l2_normalized_zero_vector() {
         let v = vec![0.0f32; 64];
         let result = l2_normalized(&v);
-        
-        assert!(result.iter().all(|&x| x == 0.0), "Zero vector should remain zero");
+
+        assert!(
+            result.iter().all(|&x| x == 0.0),
+            "Zero vector should remain zero"
+        );
     }
 
     #[test]
@@ -523,11 +532,11 @@ mod tests {
         // Exactly normalized
         let unit_x = [1.0f32, 0.0, 0.0];
         assert!(is_normalized(&unit_x, 1e-6));
-        
+
         // Very close to normalized
         let almost = [0.9999999f32, 0.0, 0.0];
         assert!(is_normalized(&almost, 1e-5));
-        
+
         // Not normalized
         let half = [0.5f32, 0.0, 0.0];
         assert!(!is_normalized(&half, 1e-5));
@@ -538,10 +547,9 @@ mod tests {
         // Test with high dimensions (768 like BERT, 1536 like ada-002)
         let a: Vec<f32> = (0..1536).map(|i| (i as f32) / 1536.0).collect();
         let b: Vec<f32> = (0..1536).map(|i| ((1536 - i) as f32) / 1536.0).collect();
-        
+
         // Just verify it completes and returns reasonable value
         let result = dot_product(&a, &b);
         assert!(result.is_finite(), "Result should be finite");
     }
 }
-

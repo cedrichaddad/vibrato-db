@@ -27,8 +27,9 @@ use std::fs::File;
 use std::io::{self, BufWriter, Seek, Write};
 use std::path::Path;
 
-use crate::store::VectorStore;
 use crate::hnsw::HNSW;
+use crate::metadata::{MetadataBuilder, VectorMetadata};
+use crate::store::VectorStore;
 
 use thiserror::Error;
 
@@ -66,6 +67,9 @@ pub enum FormatV2Error {
     #[error("Dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: usize, actual: usize },
 
+    #[error("Metadata count mismatch: expected {expected}, got {actual}")]
+    MetadataCountMismatch { expected: usize, actual: usize },
+
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 }
@@ -90,7 +94,11 @@ impl VdbHeaderV2 {
         if bytes.len() < HEADER_V2_SIZE {
             return Err(FormatV2Error::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("File too small for V2 header: {} < {}", bytes.len(), HEADER_V2_SIZE),
+                format!(
+                    "File too small for V2 header: {} < {}",
+                    bytes.len(),
+                    HEADER_V2_SIZE
+                ),
             )));
         }
 
@@ -189,7 +197,8 @@ impl VdbHeaderV2 {
         if self.is_pq_enabled() {
             self.vectors_offset as usize + index * self.pq_subspaces as usize
         } else {
-            self.vectors_offset as usize + index * self.dimensions as usize * std::mem::size_of::<f32>()
+            self.vectors_offset as usize
+                + index * self.dimensions as usize * std::mem::size_of::<f32>()
         }
     }
 }
@@ -218,6 +227,21 @@ pub struct VdbWriterV2 {
 }
 
 impl VdbWriterV2 {
+    #[inline]
+    fn write_f32_slice(writer: &mut impl Write, vector: &[f32]) -> Result<(), io::Error> {
+        #[cfg(target_endian = "little")]
+        {
+            writer.write_all(bytemuck::cast_slice(vector))
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            for &val in vector {
+                writer.write_all(&val.to_le_bytes())?;
+            }
+            Ok(())
+        }
+    }
+
     /// Create a new V2 .vdb file writer for raw f32 vectors
     pub fn new_raw<P: AsRef<Path>>(path: P, dimensions: usize) -> Result<Self, FormatV2Error> {
         let file = File::create(path)?;
@@ -292,9 +316,7 @@ impl VdbWriterV2 {
             });
         }
 
-        for &val in vector {
-            self.writer.write_all(&val.to_le_bytes())?;
-        }
+        Self::write_f32_slice(&mut self.writer, vector)?;
         self.count += 1;
         Ok(())
     }
@@ -320,23 +342,44 @@ impl VdbWriterV2 {
     }
 
     /// Finalize the file, updating the header with actual counts
-    pub fn finish(mut self) -> Result<u32, FormatV2Error> {
+    pub fn finish(self) -> Result<u32, FormatV2Error> {
+        self.finish_with_sections(None, None)
+    }
+
+    /// Finalize the file with optional metadata and graph sections
+    pub fn finish_with_sections(
+        mut self,
+        metadata_offset: Option<u64>,
+        graph_offset: Option<u64>,
+    ) -> Result<u32, FormatV2Error> {
         self.writer.flush()?;
 
         // Seek back and rewrite header with final count
         let file = self.writer.get_mut();
         file.seek(io::SeekFrom::Start(0))?;
 
+        let mut flags = if self.pq_enabled {
+            flags::PQ_ENABLED
+        } else {
+            0
+        };
+        if metadata_offset.is_some() {
+            flags |= flags::HAS_METADATA;
+        }
+        if graph_offset.is_some() {
+            flags |= flags::HAS_GRAPH;
+        }
+
         let header = VdbHeaderV2 {
             version: 2,
-            flags: if self.pq_enabled { flags::PQ_ENABLED } else { 0 },
+            flags,
             count: self.count,
             dimensions: self.dimensions as u32,
             pq_subspaces: self.pq_subspaces,
             vectors_offset: HEADER_V2_SIZE as u64,
             codebook_offset: 0,
-            metadata_offset: 0,
-            graph_offset: 0,
+            metadata_offset: metadata_offset.unwrap_or(0),
+            graph_offset: graph_offset.unwrap_or(0),
         };
         file.write_all(&header.to_bytes())?;
         file.sync_all()?;
@@ -345,28 +388,8 @@ impl VdbWriterV2 {
     }
 
     /// Finalize the file with a graph section
-    pub fn finish_with_graph(mut self, graph_offset: u64) -> Result<u32, FormatV2Error> {
-        self.writer.flush()?;
-
-        // Seek back and rewrite header with final count
-        let file = self.writer.get_mut();
-        file.seek(io::SeekFrom::Start(0))?;
-
-        let header = VdbHeaderV2 {
-            version: 2,
-            flags: (if self.pq_enabled { flags::PQ_ENABLED } else { 0 }) | flags::HAS_GRAPH,
-            count: self.count,
-            dimensions: self.dimensions as u32,
-            pq_subspaces: self.pq_subspaces,
-            vectors_offset: HEADER_V2_SIZE as u64,
-            codebook_offset: 0,
-            metadata_offset: 0,
-            graph_offset,
-        };
-        file.write_all(&header.to_bytes())?;
-        file.sync_all()?;
-
-        Ok(self.count)
+    pub fn finish_with_graph(self, graph_offset: u64) -> Result<u32, FormatV2Error> {
+        self.finish_with_sections(None, Some(graph_offset))
     }
 
     /// Merge an existing Valid V2 store with new vectors and a graph
@@ -378,15 +401,35 @@ impl VdbWriterV2 {
         graph: &HNSW,
         path: &Path,
     ) -> Result<(), FormatV2Error> {
+        let metadata: Vec<VectorMetadata> =
+            vec![VectorMetadata::default(); base_store.count + new_vectors.len()];
+        Self::merge_with_metadata(base_store, new_vectors, &metadata, graph, path)
+    }
+
+    /// Merge an existing valid store with new vectors, metadata, and graph.
+    pub fn merge_with_metadata(
+        base_store: &VectorStore,
+        new_vectors: &[Vec<f32>],
+        metadata: &[VectorMetadata],
+        graph: &HNSW,
+        path: &Path,
+    ) -> Result<(), FormatV2Error> {
+        let expected_count = base_store.count + new_vectors.len();
+        if metadata.len() != expected_count {
+            return Err(FormatV2Error::MetadataCountMismatch {
+                expected: expected_count,
+                actual: metadata.len(),
+            });
+        }
+
         let mut writer = VdbWriterV2::new_raw(path, base_store.dim)?;
 
         // --- OPTIMIZATION: ZERO-COPY BLIT ---
         // 1. Copy old vectors directly from raw mmap bytes
         // We trust the base_store is valid.
         let old_vector_bytes_len = base_store.count * base_store.dim * std::mem::size_of::<f32>();
-        let old_bytes_slice = &base_store.mmap[
-            base_store.data_offset .. base_store.data_offset + old_vector_bytes_len
-        ];
+        let old_bytes_slice =
+            &base_store.mmap[base_store.data_offset..base_store.data_offset + old_vector_bytes_len];
         writer.writer.write_all(old_bytes_slice)?;
         writer.count += base_store.count as u32;
 
@@ -395,12 +438,35 @@ impl VdbWriterV2 {
             writer.write_vector(vec)?;
         }
 
-        // 3. Serialize Graph
+        // 3. Serialize metadata section.
+        let mut metadata_builder = MetadataBuilder::new();
+        for item in metadata {
+            let tags: Vec<&str> = item.tags.iter().map(|s| s.as_str()).collect();
+            metadata_builder.add_entry(
+                &item.source_file,
+                item.start_time_ms,
+                item.duration_ms,
+                item.bpm,
+                &tags,
+            );
+        }
+
+        let metadata_offset = if metadata_builder.is_empty() {
+            None
+        } else {
+            let offset = writer.writer.stream_position()?;
+            metadata_builder
+                .write_to(&mut writer.writer)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Some(offset)
+        };
+
+        // 4. Serialize graph.
         let graph_offset = writer.writer.stream_position()?;
         graph.serialize(&mut writer.writer)?;
 
-        // 4. Finish (Updates Header with offsets)
-        writer.finish_with_graph(graph_offset)?;
+        // 5. Finish (updates header with section offsets)
+        writer.finish_with_sections(metadata_offset, Some(graph_offset))?;
         Ok(())
     }
 }
@@ -444,7 +510,7 @@ mod tests {
         let mut bytes = [0u8; 64];
         bytes[0..8].copy_from_slice(b"VIBDB002");
         bytes[8..12].copy_from_slice(&2u32.to_le_bytes()); // version
-        // Set vectors_offset to 17 (misaligned)
+                                                           // Set vectors_offset to 17 (misaligned)
         bytes[28..36].copy_from_slice(&17u64.to_le_bytes());
 
         let result = VdbHeaderV2::from_bytes(&bytes);
@@ -482,7 +548,8 @@ mod tests {
         // Verify vector data at offset 64
         let v0_start = 64;
         let v0_bytes = &bytes[v0_start..v0_start + 16];
-        let v0: Vec<f32> = v0_bytes.chunks(4)
+        let v0: Vec<f32> = v0_bytes
+            .chunks(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(v0, vec![1.0, 2.0, 3.0, 4.0]);
@@ -494,7 +561,9 @@ mod tests {
         let path = dir.path().join("test_v2_pq.vdb");
 
         let mut writer = VdbWriterV2::new_pq(&path, 128, 16).unwrap();
-        writer.write_pq_codes(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]).unwrap();
+        writer
+            .write_pq_codes(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+            .unwrap();
         let count = writer.finish().unwrap();
         assert_eq!(count, 1);
 
@@ -515,22 +584,37 @@ mod tests {
 
         let mut writer = VdbWriterV2::new_raw(&path, 4).unwrap();
         let result = writer.write_vector(&[1.0, 2.0, 3.0]); // Wrong dim
-        assert!(matches!(result, Err(FormatV2Error::DimensionMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(FormatV2Error::DimensionMismatch { .. })
+        ));
     }
 
     #[test]
     fn test_vectors_section_size() {
         let raw_header = VdbHeaderV2 {
-            version: 2, flags: 0, count: 1000, dimensions: 128,
-            pq_subspaces: 0, vectors_offset: 64,
-            codebook_offset: 0, metadata_offset: 0, graph_offset: 0,
+            version: 2,
+            flags: 0,
+            count: 1000,
+            dimensions: 128,
+            pq_subspaces: 0,
+            vectors_offset: 64,
+            codebook_offset: 0,
+            metadata_offset: 0,
+            graph_offset: 0,
         };
         assert_eq!(raw_header.vectors_section_size(), 1000 * 128 * 4); // 512KB
 
         let pq_header = VdbHeaderV2 {
-            version: 2, flags: flags::PQ_ENABLED, count: 1000, dimensions: 128,
-            pq_subspaces: 16, vectors_offset: 64,
-            codebook_offset: 0, metadata_offset: 0, graph_offset: 0,
+            version: 2,
+            flags: flags::PQ_ENABLED,
+            count: 1000,
+            dimensions: 128,
+            pq_subspaces: 16,
+            vectors_offset: 64,
+            codebook_offset: 0,
+            metadata_offset: 0,
+            graph_offset: 0,
         };
         assert_eq!(pq_header.vectors_section_size(), 1000 * 16); // 16KB (32x compression)
     }

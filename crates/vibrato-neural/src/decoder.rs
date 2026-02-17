@@ -41,7 +41,12 @@ pub fn decode_file(path: &Path) -> Result<AudioBuffer, NeuralError> {
     }
 
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| NeuralError::Decoder(format!("Failed to probe format: {}", e)))?;
 
     let mut format = probed.format;
@@ -106,7 +111,10 @@ pub fn decode_file(path: &Path) -> Result<AudioBuffer, NeuralError> {
 
         // Reuse sample buffer
         if sample_buf.is_none() || sample_buf.as_ref().unwrap().capacity() < decoded.capacity() {
-            sample_buf = Some(SampleBuffer::new(decoded.capacity() as u64, *decoded.spec()));
+            sample_buf = Some(SampleBuffer::new(
+                decoded.capacity() as u64,
+                *decoded.spec(),
+            ));
         }
 
         if let Some(ref mut buf) = sample_buf {

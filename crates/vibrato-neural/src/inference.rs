@@ -5,15 +5,15 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use ort::session::{Session, builder::SessionBuilder};
-use ort::value::Value;
 use ort::inputs;
+use ort::session::{builder::SessionBuilder, Session};
+use ort::value::Value;
 use thiserror::Error;
-use tokio::task;
 use tokenizers::Tokenizer;
+use tokio::task;
 
-use crate::spectrogram::Spectrogram;
 use crate::models::ModelManager;
+use crate::spectrogram::Spectrogram;
 
 #[derive(Error, Debug)]
 pub enum InferenceError {
@@ -41,22 +41,20 @@ pub struct InferenceEngine {
 }
 
 impl InferenceEngine {
-    /// Create a new inference engine
+    /// Create a new inference engine from pre-downloaded local model files.
     ///
-    /// Downloads models if missing.
-    pub fn new(_model_dir: &Path) -> Result<Self, InferenceError> {
-        let manager = ModelManager::new();
-        
-        // Ensure audio model is available
-        let audio_model_path = manager.get_clap_audio()?;
-        let text_model_path = manager.get_clap_text()?;
-        let tokenizer_path = manager.get_tokenizer()?;
-        
+    /// This method is intentionally offline-only. Use `setup_models()` first.
+    pub fn new(model_dir: &Path) -> Result<Self, InferenceError> {
+        let manager = ModelManager::from_dir(model_dir.to_path_buf());
+
+        // Resolve artifacts without network side effects.
+        let audio_model_path = manager.get_clap_audio_offline()?;
+        let text_model_path = manager.get_clap_text_offline()?;
+        let tokenizer_path = manager.get_tokenizer_offline()?;
+
         // Initialize ORT environment (global)
         // We ignore error if already initialized
-        let _ = ort::init()
-            .with_name("vibrato")
-            .commit();
+        let _ = ort::init().with_name("vibrato").commit();
 
         // Load models
         // Optimizations: intra_threads=1 to avoid oversubscription in async context
@@ -79,6 +77,13 @@ impl InferenceEngine {
         })
     }
 
+    /// Explicitly download and stage all model artifacts in `model_dir`.
+    pub fn setup_models(model_dir: &Path) -> Result<(), InferenceError> {
+        let manager = ModelManager::from_dir(model_dir.to_path_buf());
+        manager.setup_models()?;
+        Ok(())
+    }
+
     /// Embed an audio buffer
     ///
     /// 1. Resample to 48kHz (caller responsibility, widely assumed)
@@ -94,21 +99,21 @@ impl InferenceEngine {
             // 1. Compute Mel Spectrogram
             // Matches Librosa: [n_mels, time]
             let mel_spec = spectrogram.compute(&audio);
-            
+
             // 2. Prepare Input Tensor
             let (n_mels, time) = mel_spec.dim();
-            
+
             // CLAP expects [Batch, 1, Freq, Time] or similar.
             // Let's assume [1, 1, 64, T] based on standard image-like input.
             let input_shape = vec![1, 1, n_mels, time];
-            
+
             // ndarray is row-major. mel_spec is [n_mels, time].
             // To flatten correctly to [1, 1, 64, T], the memory layout must match.
             // default into_raw_vec() iterates rows then cols, which matches
             // [row0_col0, row0_col1, ... row1_col0 ...]
             // So this should be correct.
             let input_value = Value::from_array((input_shape, mel_spec.into_raw_vec()))?;
-            
+
             // 3. Inference with Panic Safety
             // If the model crashes (e.g. shape mismatch), we don't want to kill the worker thread.
             let embedding = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -118,9 +123,10 @@ impl InferenceEngine {
                 Ok::<Vec<f32>, InferenceError>(embedding_tensor.1.to_vec())
             }))
             .map_err(|_| InferenceError::Other("Inference panicked".to_string()))??;
-            
+
             Ok(normalize(&embedding))
-        }).await?
+        })
+        .await?
     }
 
     /// Embed audio from file
@@ -131,21 +137,22 @@ impl InferenceEngine {
     pub async fn embed_audio_file(&self, path: &Path) -> Result<Vec<f32>, InferenceError> {
         let path = path.to_path_buf();
         let engine = self.clone();
-        
+
         // Offload decoding (blocking I/O) to thread pool
         let samples = task::spawn_blocking(move || {
             // 1. Decode
             let buffer = crate::decoder::decode_file(&path)
                 .map_err(|e| InferenceError::Other(e.to_string()))?;
-            
+
             // 2. Resample if needed
             if buffer.sample_rate != 48000 {
-                 crate::resampler::resample(&buffer.samples, buffer.sample_rate, 48000)
+                crate::resampler::resample(&buffer.samples, buffer.sample_rate, 48000)
                     .map_err(|e| InferenceError::Other(e.to_string()))
             } else {
                 Ok(buffer.samples)
             }
-        }).await??;
+        })
+        .await??;
 
         // 3. Embed
         engine.embed_audio(samples).await
@@ -159,15 +166,20 @@ impl InferenceEngine {
 
         task::spawn_blocking(move || {
             // 1. Tokenize
-            let encoding = tokenizer.encode(text, true)
+            let encoding = tokenizer
+                .encode(text, true)
                 .map_err(|e| InferenceError::Other(e.to_string()))?;
 
             let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
-            let attention_mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&x| x as i64).collect();
-            
+            let attention_mask: Vec<i64> = encoding
+                .get_attention_mask()
+                .iter()
+                .map(|&x| x as i64)
+                .collect();
+
             let seq_len = input_ids.len();
             let shape = vec![1, seq_len];
-            
+
             let input_ids_val = Value::from_array((shape.clone(), input_ids))?;
             let attention_mask_val = Value::from_array((shape, attention_mask))?;
 
@@ -179,9 +191,10 @@ impl InferenceEngine {
                 Ok::<Vec<f32>, InferenceError>(embedding_tensor.1.to_vec())
             }))
             .map_err(|_| InferenceError::Other("Inference panicked".to_string()))??;
-            
+
             Ok(normalize(&embedding))
-        }).await?
+        })
+        .await?
     }
 }
 

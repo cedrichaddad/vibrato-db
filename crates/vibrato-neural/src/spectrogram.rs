@@ -29,9 +29,7 @@ impl Spectrogram {
 
         // Window (Hann)
         let window: Vec<f32> = (0..n_fft)
-            .map(|i| {
-                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n_fft as f32).cos())
-            })
+            .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n_fft as f32).cos()))
             .collect();
 
         // FFT Planner
@@ -60,12 +58,12 @@ impl Spectrogram {
         let n_fft = self.n_fft;
         let hop_length = self.hop_length;
         let n_mels = self.mel_basis.nrows();
-        
+
         // 1. Center Padding (Reflect Mode)
         // Librosa pads input with n_fft / 2 on both sides using reflection
         let pad_len = n_fft / 2;
         let mut padded = Vec::with_capacity(samples.len() + pad_len * 2);
-        
+
         // Reflect start: [3, 2, 1 | 1, 2, 3 ...]
         // Take first pad_len items, reverse them
         if samples.len() > 0 {
@@ -86,32 +84,33 @@ impl Spectrogram {
         };
 
         if n_frames == 0 {
-             return Array2::zeros((n_mels, 0));
+            return Array2::zeros((n_mels, 0));
         }
 
         // Pre-allocate STFT matrix (Complex)
-        // We do this row-by-row or col-by-col? 
+        // We do this row-by-row or col-by-col?
         // Ndarray is row-major by default. Librosa is col-major (F, T).
         // Let's store as [Freq, Time]
         let num_bins = n_fft / 2 + 1;
         // Optimization: Recycle scratch buffers if we made this mutable/internal workspace
         // For now, allocate per call is safer for Sync.
-        
+
         let mut frames = Vec::with_capacity(n_frames);
         let mut scratch = vec![Complex::new(0.0, 0.0); self.fft.get_inplace_scratch_len()];
         let mut frame_buffer = vec![Complex::new(0.0, 0.0); n_fft];
 
         for frame_idx in 0..n_frames {
             let start = frame_idx * hop_length;
-            
+
             // Apply Window
             for (j, &sample) in padded[start..start + n_fft].iter().enumerate() {
                 frame_buffer[j] = Complex::new(sample * self.window[j], 0.0);
             }
-            
+
             // FFT
-            self.fft.process_with_scratch(&mut frame_buffer, &mut scratch);
-            
+            self.fft
+                .process_with_scratch(&mut frame_buffer, &mut scratch);
+
             // Compute Magnitude^2 (Power Spectrogram)
             let power_frame: Vec<f32> = frame_buffer[..num_bins]
                 .iter()
@@ -124,10 +123,10 @@ impl Spectrogram {
         // Mel Basis: [n_mels, num_bins]
         // Power Spec: [n_frames, num_bins] (conceptually)
         // Result: [n_mels, n_frames]
-        
+
         // Naive matrix multiplication loop
         let mut mel_spec = Array2::<f32>::zeros((n_mels, n_frames));
-        
+
         for (t, power_frame) in frames.iter().enumerate() {
             for m in 0..n_mels {
                 let mut dot = 0.0;
@@ -140,10 +139,10 @@ impl Spectrogram {
                 // Usually: log10(mel + 1e-6)
                 // For simplicity/parity with typical CLAP implementations, we often see:
                 // log(mel + epsilon)
-                mel_spec[[m, t]] = (dot.max(1e-10)).ln(); 
+                mel_spec[[m, t]] = (dot.max(1e-10)).ln();
             }
         }
-        
+
         mel_spec
     }
 }
@@ -198,26 +197,26 @@ fn create_mel_filterbank(sample_rate: u32, fft_size: usize, n_mels: usize) -> Ar
             } else {
                 0.0
             };
-            
+
             // Slaney normalization (Librosa default: norm='slaney')
             // Divide by width of mel band
             // width = 2 / (right_hz - left_hz) ?
-            // For now, stick to simple triangle. 
-            // TODO: verify if CLAP used Slaney norm. 
+            // For now, stick to simple triangle.
+            // TODO: verify if CLAP used Slaney norm.
             // Most PyTorch audio impls use Slaney.
-            
+
             filterbank[[m, b]] = weight;
         }
-        
+
         // Slaney normalization
         // The area of the triangle should be 1? Or peak 1?
         // Librosa norm='slaney': divide triangular weights by the width of the mel band (area normalization)
         // width = hz_points[m+2] - hz_points[m]
-        let width = hz_points[m+2] - hz_points[m];
+        let width = hz_points[m + 2] - hz_points[m];
         let norm_factor = 2.0 / width;
-        
+
         for b in 0..num_bins {
-             filterbank[[m, b]] *= norm_factor;
+            filterbank[[m, b]] *= norm_factor;
         }
     }
 
@@ -227,7 +226,6 @@ fn create_mel_filterbank(sample_rate: u32, fft_size: usize, n_mels: usize) -> Ar
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::arr2;
 
     #[test]
     fn test_mel_spectrogram_sine_wave() {
@@ -254,8 +252,14 @@ mod tests {
         }
 
         // Basic check: values should be mostly negative after log, and not all zero
-        assert!(mel_spec.iter().any(|&x| x < 0.0), "Mel spec should contain negative values after log");
-        assert!(mel_spec.iter().any(|&x| x != mel_spec[[0,0]]), "Mel spec should not be uniform");
+        assert!(
+            mel_spec.iter().any(|&x| x < 0.0),
+            "Mel spec should contain negative values after log"
+        );
+        assert!(
+            mel_spec.iter().any(|&x| x != mel_spec[[0, 0]]),
+            "Mel spec should not be uniform"
+        );
     }
 
     #[test]
@@ -269,17 +273,20 @@ mod tests {
     }
 
     #[test]
-fn test_mel_spectrogram_too_short_audio() {
-    // Audio shorter than n_fft (1024)
-    let audio = vec![1.0; 500]; 
-    let processor = Spectrogram::new();
-    let mel_spec = processor.compute(&audio);
-    
-    // With center padding, even short audio produces frames
-    assert!(!mel_spec.is_empty(), "Should produce frames with center padding");
-    assert_eq!(mel_spec.nrows(), 64);
-    assert!(mel_spec.ncols() > 0);
-}
+    fn test_mel_spectrogram_too_short_audio() {
+        // Audio shorter than n_fft (1024)
+        let audio = vec![1.0; 500];
+        let processor = Spectrogram::new();
+        let mel_spec = processor.compute(&audio);
+
+        // With center padding, even short audio produces frames
+        assert!(
+            !mel_spec.is_empty(),
+            "Should produce frames with center padding"
+        );
+        assert_eq!(mel_spec.nrows(), 64);
+        assert!(mel_spec.ncols() > 0);
+    }
 
     #[test]
     fn test_hz_mel_roundtrip() {

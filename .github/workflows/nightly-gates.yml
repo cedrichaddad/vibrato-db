@@ -1,0 +1,64 @@
+name: Nightly Gates
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      crash_seeds:
+        description: "Crash matrix seed count"
+        required: false
+        default: "100"
+      enforce_madvise_gate:
+        description: "Set to 1 to fail on madvise random regression threshold"
+        required: false
+        default: "0"
+      run_soak:
+        description: "Run soak harness (manual only)"
+        required: false
+        default: "false"
+      soak_secs:
+        description: "Soak runtime in seconds for manual runs"
+        required: false
+        default: "7200"
+
+jobs:
+  crash-matrix-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Crash matrix full
+        env:
+          VIBRATO_CRASH_SEEDS: ${{ github.event.inputs.crash_seeds || '100' }}
+        run: bash scripts/ci/run_crash_matrix.sh
+
+  perf-and-recall:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Recall gate
+        run: cargo test -p vibrato-core hnsw::index::tests::test_recall -- --exact
+      - name: madvise A/B gate harness
+        env:
+          VIBRATO_ENFORCE_MADVISE_GATE: ${{ github.event.inputs.enforce_madvise_gate || '0' }}
+        run: bash scripts/perf/run_madvise_ab.sh
+
+  soak-manual:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_soak == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Mixed workload soak harness (manual)
+        env:
+          VIBRATO_SOAK_SECS: ${{ github.event.inputs.soak_secs || '7200' }}
+          VIBRATO_SOAK_SEED: "42"
+        run: bash scripts/soak/run_mixed_workload_soak.sh

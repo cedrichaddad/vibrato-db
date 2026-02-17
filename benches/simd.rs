@@ -18,7 +18,7 @@ fn bench_dot_product(c: &mut Criterion) {
 
     for dim in dims {
         group.throughput(Throughput::Elements(dim as u64));
-        
+
         let a = random_vector(dim);
         let b = random_vector(dim);
 
@@ -37,7 +37,7 @@ fn bench_l2_distance(c: &mut Criterion) {
 
     for dim in dims {
         group.throughput(Throughput::Elements(dim as u64));
-        
+
         let a = random_vector(dim);
         let b = random_vector(dim);
 
