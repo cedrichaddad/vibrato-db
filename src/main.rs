@@ -187,7 +187,7 @@ enum Commands {
         public_health_metrics: bool,
 
         /// Catalog read timeout in ms (guards against stuck readers / WAL bloat)
-        #[arg(long, default_value = "500")]
+        #[arg(long, default_value = "5000")]
         catalog_read_timeout_ms: u64,
 
         /// SQLite internal WAL autocheckpoint pages

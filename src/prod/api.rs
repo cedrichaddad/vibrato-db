@@ -483,15 +483,23 @@ async fn v2_admin_stats(State(state): State<Arc<ProductionState>>, headers: Head
         Some(Role::Admin),
         &state.config.api_pepper,
     ) {
-        Ok(_) => match state.stats() {
-            Ok(stats) => json_response(StatusCode::OK, &request_id, &ApiResponse { data: stats }),
-            Err(e) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &request_id,
-                "stats_failed",
-                e.to_string(),
-                None,
-            ),
+        Ok(_) => {
+            let state_bg = state.clone();
+            let result = tokio::task::spawn_blocking(move || state_bg.stats()).await;
+            let result = match result {
+                Ok(inner) => inner,
+                Err(e) => Err(anyhow::anyhow!("stats join error: {}", e)),
+            };
+            match result {
+                Ok(stats) => json_response(StatusCode::OK, &request_id, &ApiResponse { data: stats }),
+                Err(e) => error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &request_id,
+                    "stats_failed",
+                    e.to_string(),
+                    None,
+                ),
+            }
         },
         Err(_) => error_response(
             StatusCode::UNAUTHORIZED,

@@ -190,7 +190,7 @@ impl ProductionConfig {
             orphan_ttl: Duration::from_secs(168 * 3600),
             audio_colocated: true,
             public_health_metrics: true,
-            catalog_read_timeout_ms: 500,
+            catalog_read_timeout_ms: 5_000,
             sqlite_wal_autocheckpoint_pages: 1000,
             quarantine_max_files: 50,
             quarantine_max_bytes: 5 * 1024 * 1024 * 1024,
@@ -1253,13 +1253,18 @@ impl ProductionState {
             .cloned()
             .collect::<Vec<_>>();
 
-        let (candidates, output_level) = if l0.len() >= 2 {
+        const MAX_COMPACTION_CANDIDATES: usize = 8;
+        let (mut candidates, output_level) = if l0.len() >= 2 {
             (l0, 1_i64)
         } else if l1.len() >= 2 {
             (l1, 2_i64)
         } else {
             (Vec::new(), 0_i64)
         };
+        // Sort by vector_id_start for contiguous selection, then cap to bound
+        // memory, SQL query size, and lock-hold duration.
+        candidates.sort_by_key(|s| s.record.vector_id_start);
+        candidates.truncate(MAX_COMPACTION_CANDIDATES);
 
         if candidates.len() < 2 {
             return Ok(JobResponseV2 {
@@ -1301,23 +1306,22 @@ impl ProductionState {
         })?;
 
         let result = (|| -> Result<JobResponseV2> {
-            let mut ordered_segments = candidates.clone();
-            ordered_segments.sort_by_key(|seg| seg.record.vector_id_start);
+            // Candidates are already sorted by vector_id_start from the cap logic above.
+            let ordered_segments = candidates.clone();
             for pair in ordered_segments.windows(2) {
                 let prev = &pair[0].record;
                 let next = &pair[1].record;
                 if next.vector_id_start <= prev.vector_id_end {
-                    return Err(anyhow!(
-                        "compaction candidates overlap: {} [{}..={}] and {} [{}..={}]",
+                    tracing::warn!(
+                        "compaction candidates overlap: {} [{}..={}] and {} [{}..={}]; dedup merge will resolve",
                         prev.id,
                         prev.vector_id_start,
                         prev.vector_id_end,
                         next.id,
                         next.vector_id_start,
                         next.vector_id_end
-                    ));
-                }
-                if next.vector_id_start != prev.vector_id_end.saturating_add(1) {
+                    );
+                } else if next.vector_id_start != prev.vector_id_end.saturating_add(1) {
                     tracing::warn!(
                         "compaction gap detected between {} [{}..={}] and {} [{}..={}]; filling tombstones",
                         prev.id,
@@ -1333,14 +1337,13 @@ impl ProductionState {
                 .iter()
                 .map(|seg| seg.record.row_count)
                 .sum::<usize>();
-            let mut ids_raw = Vec::with_capacity(total_rows);
-            let mut vectors_raw = Vec::with_capacity(total_rows);
+            // Collect all (id, vector) pairs; later segments win on overlap (newest-wins).
+            let mut merged: HashMap<usize, Vec<f32>> = HashMap::with_capacity(total_rows);
             let mut read_bytes_budget = 0u64;
             for seg in &ordered_segments {
                 for offset in 0..seg.record.row_count {
                     let vector_id = seg.record.vector_id_start + offset;
-                    ids_raw.push(vector_id);
-                    vectors_raw.push(seg.store.get(offset).to_vec());
+                    merged.insert(vector_id, seg.store.get(offset).to_vec());
                     read_bytes_budget += (self.collection.dim as u64) * 4;
                     if read_bytes_budget >= 1 * 1024 * 1024 {
                         self.throttle_background_io(read_bytes_budget);
@@ -1351,7 +1354,15 @@ impl ProductionState {
             if read_bytes_budget > 0 {
                 self.throttle_background_io(read_bytes_budget);
             }
-            let metadata_map = self.catalog.fetch_metadata(&self.collection.id, &ids_raw)?;
+            // Sort by ID for deterministic output.
+            let mut ids_raw: Vec<usize> = merged.keys().copied().collect();
+            ids_raw.sort_unstable();
+            let vectors_raw: Vec<Vec<f32>> = ids_raw.iter().map(|id| merged.remove(id).unwrap()).collect();
+            drop(merged);
+            // Use range-based metadata fetch: single SQL query per range.
+            let range_start = *ids_raw.first().unwrap_or(&0);
+            let range_end = *ids_raw.last().unwrap_or(&0);
+            let metadata_map = self.catalog.fetch_metadata_range(&self.collection.id, range_start, range_end)?;
             let metadata_raw = ids_raw
                 .iter()
                 .map(|id| metadata_map.get(id).cloned().unwrap_or_default())

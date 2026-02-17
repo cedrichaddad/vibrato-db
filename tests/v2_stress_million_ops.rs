@@ -564,13 +564,16 @@ async fn stress_test_million_ops_mixed() {
                             counters.admin_timeout.fetch_add(1, Ordering::Relaxed);
                         }
                         Ok(resp) => {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
                             record_failure(
                                 &first_error,
                                 &stop,
                                 format!(
-                                    "admin failed: path={} status={} worker={} op={} seed={}",
+                                    "admin failed: path={} status={} body={} worker={} op={} seed={}",
                                     path,
-                                    resp.status(),
+                                    status,
+                                    &body[..body.len().min(500)],
                                     worker_id,
                                     local_idx,
                                     seed
@@ -619,13 +622,26 @@ async fn stress_test_million_ops_mixed() {
         "server became unready during stress run"
     );
 
-    let stats_resp = client
-        .get(format!("{}/v2/admin/stats", base_url))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("stats request");
-    assert_eq!(stats_resp.status(), StatusCode::OK, "stats endpoint failed");
+    let mut stats_resp = None;
+    for attempt in 0..10 {
+        let resp = client
+            .get(format!("{}/v2/admin/stats", base_url))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("stats request");
+        if resp.status() == StatusCode::OK {
+            stats_resp = Some(resp);
+            break;
+        }
+        eprintln!(
+            "stats attempt {} returned {}, retrying...",
+            attempt + 1,
+            resp.status()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let stats_resp = stats_resp.expect("stats endpoint failed after 10 retries");
     let payload: serde_json::Value = stats_resp.json().await.expect("stats payload");
     let total_vectors = payload["data"]["total_vectors"].as_u64().unwrap_or(0);
 

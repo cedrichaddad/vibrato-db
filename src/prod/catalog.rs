@@ -128,7 +128,7 @@ pub struct CatalogOptions {
 impl Default for CatalogOptions {
     fn default() -> Self {
         Self {
-            read_timeout_ms: 500,
+            read_timeout_ms: 5_000,
             wal_autocheckpoint_pages: 1000,
         }
     }
@@ -1799,6 +1799,35 @@ impl CatalogStore for SqliteCatalog {
 }
 
 impl SqliteCatalog {
+    /// Range-based metadata fetch: single SQL query using BETWEEN instead of
+    /// an unbounded IN(...) clause. Extra rows outside the exact ID set are
+    /// harmless — callers look up by ID from the returned HashMap.
+    pub fn fetch_metadata_range(
+        &self,
+        collection_id: &str,
+        start_id: usize,
+        end_id: usize,
+    ) -> Result<HashMap<usize, VectorMetadata>> {
+        if start_id > end_id {
+            return Ok(HashMap::new());
+        }
+        let rows = self.query_rows::<MetadataRow>(&format!(
+            "SELECT vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json
+             FROM vector_metadata
+             WHERE collection_id='{}' AND vector_id >= {} AND vector_id <= {}
+             ORDER BY vector_id ASC;",
+            sql_quote(collection_id),
+            start_id,
+            end_id
+        ))?;
+
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in rows {
+            out.insert(row.vector_id, row.metadata);
+        }
+        Ok(out)
+    }
+
     pub fn audit_events_batch(&self, events: &[AuditEvent]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
