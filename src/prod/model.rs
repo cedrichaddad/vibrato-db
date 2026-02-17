@@ -75,6 +75,16 @@ pub struct IngestResponseV2 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestBatchRequestV2 {
+    pub vectors: Vec<IngestRequestV2>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestBatchResponseV2 {
+    pub results: Vec<IngestResponseV2>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRequestV2 {
     pub vector: Vec<f32>,
     #[serde(default = "default_k")]

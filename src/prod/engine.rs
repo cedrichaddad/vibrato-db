@@ -402,6 +402,83 @@ impl ProductionState {
         Ok((ingest.vector_id, ingest.created))
     }
 
+    /// Batch ingest: single SQLite transaction for N vectors, shard-grouped
+    /// hot index updates. Returns (vector_id, created) for each entry.
+    pub fn ingest_batch(
+        &self,
+        entries: &[(Vec<f32>, VectorMetadata, Option<String>)],
+    ) -> Result<Vec<(usize, bool)>> {
+        // Validate dimensions up front
+        for (i, (vector, _, _)) in entries.iter().enumerate() {
+            if vector.len() != self.collection.dim {
+                return Err(anyhow!(
+                    "dimension mismatch at index {}: expected {}, got {}",
+                    i,
+                    self.collection.dim,
+                    vector.len()
+                ));
+            }
+        }
+
+        // 1. Bulk catalog write — single BEGIN...COMMIT
+        let wal_results = self.catalog.ingest_wal_batch(
+            &self.collection.id,
+            entries,
+        )?;
+
+        // 2. Group by shard for efficient lock acquisition
+        let mut by_shard: HashMap<usize, Vec<(usize, &[f32], &VectorMetadata)>> = HashMap::new();
+        for (i, result) in wal_results.iter().enumerate() {
+            if result.created {
+                let shard = result.vector_id & self.shard_mask;
+                let (ref vec, ref meta, _) = entries[i];
+                by_shard
+                    .entry(shard)
+                    .or_default()
+                    .push((result.vector_id, vec.as_slice(), meta));
+            }
+        }
+
+        // 3. Insert into hot index shards — one lock acquisition per shard
+        for (shard, items) in &by_shard {
+            if let Some(shard_vectors) = self.hot_vector_shards.get(*shard) {
+                let guard = shard_vectors.load();
+                let mut vec_guard = guard.write();
+                for &(vid, vec, _) in items {
+                    vec_guard.insert(vid, vec.to_vec());
+                }
+            }
+            if let Some(index) = self.hot_indices.get(*shard) {
+                let mut idx_guard = index.write();
+                for &(vid, _, _) in items {
+                    idx_guard.insert(vid);
+                }
+            }
+        }
+
+        // 4. Update metadata cache + filter index in one pass
+        let created_count = by_shard.values().map(|v| v.len()).sum::<usize>();
+        if created_count > 0 {
+            let mut meta_cache = self.metadata_cache.write();
+            let mut filter_idx = self.filter_index.write();
+            for items in by_shard.values() {
+                for &(vid, _, meta) in items {
+                    meta_cache.insert(vid, meta.clone());
+                    filter_idx.add(vid, meta);
+                }
+            }
+            self.metrics
+                .ingest_total
+                .fetch_add(created_count as u64, AtomicOrdering::Relaxed);
+        }
+
+        // 5. Build output
+        Ok(wal_results
+            .iter()
+            .map(|r| (r.vector_id, r.created))
+            .collect())
+    }
+
     pub fn query(&self, request: &QueryRequestV2) -> Result<QueryResponseV2> {
         let start = Instant::now();
         if request.vector.len() != self.collection.dim {

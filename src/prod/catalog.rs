@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+use std::fmt::Write as FmtWrite;
 use std::os::raw::{c_char, c_int, c_uchar, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
@@ -285,7 +286,10 @@ impl RawSqliteConnection {
             "PRAGMA wal_autocheckpoint={};",
             wal_autocheckpoint_pages
         ))?;
-        self.exec("PRAGMA mmap_size=268435456;")?;
+        // 30 GB mmap — zero-copy reads bypass syscall boundary on 64-bit
+        self.exec("PRAGMA mmap_size=30000000000;")?;
+        // 64 MB page cache — keeps B-Tree internal nodes in RAM
+        self.exec("PRAGMA cache_size=-64000;")?;
         Ok(())
     }
 
@@ -1987,14 +1991,23 @@ impl SqliteCatalog {
         self.query_rows::<WalEntry>(sql)
     }
 
-    fn ingest_wal_internal(
-        &self,
+    /// Pure SQL builder for a single ingest row. Produces SQL that:
+    /// - Sets up temp tables (_ingest_res, _ingest_alloc)
+    /// - Handles idempotency lookup
+    /// - Allocates vector ID
+    /// - Inserts into wal_entries + vector_metadata + tags
+    /// - Selects the result row
+    ///
+    /// Does NOT include BEGIN/COMMIT — the caller manages the transaction.
+    /// Uses `write!` on a pre-allocated buffer to avoid per-call heap allocations.
+    fn build_ingest_row_sql(
+        sql: &mut String,
         collection_id: &str,
         vector_id: Option<usize>,
         vector: &[f32],
         metadata: &VectorMetadata,
         idempotency_key: Option<&str>,
-    ) -> Result<WalIngestResult> {
+    ) -> Result<()> {
         let normalized_key = idempotency_key.and_then(|k| {
             let trimmed = k.trim();
             if trimmed.is_empty() {
@@ -2014,20 +2027,32 @@ impl SqliteCatalog {
             .map(|k| format!("'{}'", sql_quote(k)))
             .unwrap_or_else(|| "NULL".to_string());
 
-        let idempotency_lookup = if let Some(key) = &normalized_key {
-            format!(
-                "INSERT INTO _ingest_res(vector_id, created, lsn)
-                 SELECT vector_id, 0, NULL
-                 FROM wal_entries
-                 WHERE collection_id='{}' AND idempotency_key='{}'
-                 LIMIT 1;",
-                collection,
-                sql_quote(key)
-            )
-        } else {
-            String::new()
-        };
+        // Temp table setup + clear
+        write!(
+            sql,
+            "CREATE TEMP TABLE IF NOT EXISTS _ingest_res(\
+               vector_id INTEGER NOT NULL, created INTEGER NOT NULL, lsn INTEGER);\
+             CREATE TEMP TABLE IF NOT EXISTS _ingest_alloc(\
+               vector_id INTEGER NOT NULL);\
+             DELETE FROM _ingest_res;\
+             DELETE FROM _ingest_alloc;"
+        ).unwrap();
 
+        // Idempotency lookup
+        if let Some(key) = &normalized_key {
+            let key_q = sql_quote(key);
+            write!(
+                sql,
+                "INSERT INTO _ingest_res(vector_id, created, lsn) \
+                 SELECT vector_id, 0, NULL \
+                 FROM wal_entries \
+                 WHERE collection_id='{}' AND idempotency_key='{}' \
+                 LIMIT 1;",
+                collection, key_q
+            ).unwrap();
+        }
+
+        // Normalize tags
         let mut normalized_tags = metadata
             .tags
             .iter()
@@ -2042,112 +2067,132 @@ impl SqliteCatalog {
         let metadata_json = sql_quote(&serde_json::to_string(&normalized_metadata)?);
         let tags_json = sql_quote(&serde_json::to_string(&normalized_tags)?);
 
-        let mut tag_sql = String::new();
-        if !normalized_tags.is_empty() {
-            tag_sql.push_str(&format!(
-                "DELETE FROM vector_tags
-                 WHERE collection_id='{collection}'
-                   AND vector_id IN (SELECT vector_id FROM _ingest_res WHERE created = 1);"
-            ));
-            for tag in normalized_tags {
-                let tag_q = sql_quote(&tag);
-                tag_sql.push_str(&format!(
-                    "INSERT INTO tag_ids(collection_id, id, tag, created_at)
-                     SELECT '{collection}',
-                            COALESCE((SELECT MAX(id) + 1 FROM tag_ids WHERE collection_id='{collection}'), 1),
-                            '{tag_q}',
-                            {now}
-                     WHERE NOT EXISTS (
-                       SELECT 1 FROM tag_ids WHERE collection_id='{collection}' AND tag='{tag_q}'
-                     );
-                     INSERT OR IGNORE INTO vector_tags(collection_id, vector_id, tag_id, created_at)
-                     SELECT '{collection}', vector_id,
-                            (SELECT id FROM tag_ids WHERE collection_id='{collection}' AND tag='{tag_q}' LIMIT 1),
-                            {now}
-                     FROM _ingest_res
-                     WHERE created = 1;"
-                ));
+        // ID allocation
+        write!(
+            sql,
+            "INSERT OR IGNORE INTO vector_id_counters(collection_id, next_id) \
+             SELECT '{collection}', COALESCE(MAX(vector_id) + 1, 0) \
+             FROM vector_metadata \
+             WHERE collection_id='{collection}';"
+        ).unwrap();
+
+        match vector_id {
+            Some(v) => {
+                let next = v + 1;
+                write!(
+                    sql,
+                    "INSERT INTO _ingest_alloc(vector_id) \
+                     SELECT {v} \
+                     WHERE NOT EXISTS (SELECT 1 FROM _ingest_res);\
+                     UPDATE vector_id_counters \
+                     SET next_id = CASE WHEN next_id <= {v} THEN {next} ELSE next_id END \
+                     WHERE collection_id='{collection}' AND NOT EXISTS (SELECT 1 FROM _ingest_res);"
+                ).unwrap();
+            }
+            None => {
+                write!(
+                    sql,
+                    "UPDATE vector_id_counters \
+                     SET next_id = next_id + 1 \
+                     WHERE collection_id='{collection}' AND NOT EXISTS (SELECT 1 FROM _ingest_res);\
+                     INSERT INTO _ingest_alloc(vector_id) \
+                     SELECT next_id - 1 \
+                     FROM vector_id_counters \
+                     WHERE collection_id='{collection}' AND NOT EXISTS (SELECT 1 FROM _ingest_res);"
+                ).unwrap();
             }
         }
 
-        let counter_init_sql = format!(
-            "INSERT OR IGNORE INTO vector_id_counters(collection_id, next_id)
-             SELECT '{collection}', COALESCE(MAX(vector_id) + 1, 0)
-             FROM vector_metadata
-             WHERE collection_id='{collection}';"
-        );
+        // WAL insert
+        write!(
+            sql,
+            "INSERT INTO wal_entries(collection_id, vector_id, vector_json, metadata_json, \
+             idempotency_key, checkpointed_at, created_at) \
+             SELECT '{collection}', vector_id, '{vector_json}', '{metadata_json}', \
+             {key_sql}, NULL, {now} \
+             FROM _ingest_alloc \
+             WHERE NOT EXISTS (SELECT 1 FROM _ingest_res) \
+             LIMIT 1;"
+        ).unwrap();
 
-        let alloc_sql = match vector_id {
-            Some(v) => format!(
-                "INSERT INTO _ingest_alloc(vector_id)
-                 SELECT {v}
-                 WHERE NOT EXISTS (SELECT 1 FROM _ingest_res);
-                 {counter_init_sql}
-                 UPDATE vector_id_counters
-                 SET next_id = CASE WHEN next_id <= {v} THEN {next} ELSE next_id END
-                 WHERE collection_id='{collection}' AND NOT EXISTS (SELECT 1 FROM _ingest_res);",
-                next = v + 1
-            ),
-            None => format!(
-                "{counter_init_sql}
-                 UPDATE vector_id_counters
-                 SET next_id = next_id + 1
-                 WHERE collection_id='{collection}' AND NOT EXISTS (SELECT 1 FROM _ingest_res);
-                 INSERT INTO _ingest_alloc(vector_id)
-                 SELECT next_id - 1
-                 FROM vector_id_counters
-                 WHERE collection_id='{collection}' AND NOT EXISTS (SELECT 1 FROM _ingest_res);"
-            ),
-        };
+        // Result capture
+        write!(
+            sql,
+            "INSERT INTO _ingest_res(vector_id, created, lsn) \
+             SELECT vector_id, 1, lsn \
+             FROM wal_entries \
+             WHERE lsn = last_insert_rowid() \
+               AND changes() > 0 \
+               AND NOT EXISTS (SELECT 1 FROM _ingest_res);"
+        ).unwrap();
 
-        let sql = format!(
-            "BEGIN IMMEDIATE;
-             CREATE TEMP TABLE IF NOT EXISTS _ingest_res(
-               vector_id INTEGER NOT NULL,
-               created INTEGER NOT NULL,
-               lsn INTEGER
-             );
-             CREATE TEMP TABLE IF NOT EXISTS _ingest_alloc(
-               vector_id INTEGER NOT NULL
-             );
-             DELETE FROM _ingest_res;
-             DELETE FROM _ingest_alloc;
-             {}
-             {}
-             INSERT INTO wal_entries(collection_id, vector_id, vector_json, metadata_json, idempotency_key, checkpointed_at, created_at)
-             SELECT '{}', vector_id, '{}', '{}', {}, NULL, {}
-             FROM _ingest_alloc
-             WHERE NOT EXISTS (SELECT 1 FROM _ingest_res)
-             LIMIT 1;
-             INSERT INTO _ingest_res(vector_id, created, lsn)
-             SELECT vector_id, 1, lsn
-             FROM wal_entries
-             WHERE lsn = last_insert_rowid()
-               AND changes() > 0
-               AND NOT EXISTS (SELECT 1 FROM _ingest_res);
-             INSERT OR REPLACE INTO vector_metadata(collection_id, vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json, created_at)
-             SELECT '{}', vector_id, '{}', {}, {}, {}, '{}', {}
-             FROM _ingest_res
-             WHERE created = 1;
-             {}
-             SELECT vector_id, created, lsn FROM _ingest_res LIMIT 1;
-             COMMIT;",
-            idempotency_lookup,
-            alloc_sql,
-            collection,
-            vector_json,
-            metadata_json,
-            key_sql,
-            now,
-            collection,
-            source_file,
-            metadata.start_time_ms,
-            metadata.duration_ms,
-            metadata.bpm,
-            tags_json,
-            now,
-            tag_sql
-        );
+        // Metadata insert
+        write!(
+            sql,
+            "INSERT OR REPLACE INTO vector_metadata(\
+             collection_id, vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json, created_at) \
+             SELECT '{collection}', vector_id, '{source_file}', {start_time}, {duration}, {bpm}, '{tags_json}', {now} \
+             FROM _ingest_res \
+             WHERE created = 1;",
+            start_time = metadata.start_time_ms,
+            duration = metadata.duration_ms,
+            bpm = metadata.bpm
+        ).unwrap();
+
+        // Tag inserts
+        if !normalized_tags.is_empty() {
+            write!(
+                sql,
+                "DELETE FROM vector_tags \
+                 WHERE collection_id='{collection}' \
+                   AND vector_id IN (SELECT vector_id FROM _ingest_res WHERE created = 1);"
+            ).unwrap();
+            for tag in &normalized_tags {
+                let tag_q = sql_quote(tag);
+                write!(
+                    sql,
+                    "INSERT INTO tag_ids(collection_id, id, tag, created_at) \
+                     SELECT '{collection}', \
+                            COALESCE((SELECT MAX(id) + 1 FROM tag_ids WHERE collection_id='{collection}'), 1), \
+                            '{tag_q}', {now} \
+                     WHERE NOT EXISTS ( \
+                       SELECT 1 FROM tag_ids WHERE collection_id='{collection}' AND tag='{tag_q}' \
+                     );\
+                     INSERT OR IGNORE INTO vector_tags(collection_id, vector_id, tag_id, created_at) \
+                     SELECT '{collection}', vector_id, \
+                            (SELECT id FROM tag_ids WHERE collection_id='{collection}' AND tag='{tag_q}' LIMIT 1), \
+                            {now} \
+                     FROM _ingest_res \
+                     WHERE created = 1;"
+                ).unwrap();
+            }
+        }
+
+        // Result row
+        sql.push_str("SELECT vector_id, created, lsn FROM _ingest_res LIMIT 1;");
+
+        Ok(())
+    }
+
+    fn ingest_wal_internal(
+        &self,
+        collection_id: &str,
+        vector_id: Option<usize>,
+        vector: &[f32],
+        metadata: &VectorMetadata,
+        idempotency_key: Option<&str>,
+    ) -> Result<WalIngestResult> {
+        let mut sql = String::with_capacity(4096);
+        sql.push_str("BEGIN IMMEDIATE;");
+        Self::build_ingest_row_sql(
+            &mut sql,
+            collection_id,
+            vector_id,
+            vector,
+            metadata,
+            idempotency_key,
+        )?;
+        sql.push_str("COMMIT;");
 
         let rows = self.query_rows::<WalIngestResult>(&sql)?;
         let Some(row) = rows.first() else {
@@ -2155,6 +2200,53 @@ impl SqliteCatalog {
         };
 
         Ok(row.clone())
+    }
+
+    /// Batch ingest: single BEGIN...COMMIT wrapping N row insertions.
+    /// Holds the writer lock for the entire batch to amortize transaction cost.
+    /// Preserves idempotency per-row.
+    pub fn ingest_wal_batch(
+        &self,
+        collection_id: &str,
+        entries: &[(Vec<f32>, VectorMetadata, Option<String>)],
+    ) -> Result<Vec<WalIngestResult>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let guard = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        guard.exec("BEGIN IMMEDIATE;")?;
+
+        let mut results = Vec::with_capacity(entries.len());
+        let mut sql_buf = String::with_capacity(4096);
+
+        for (vector, metadata, idempotency_key) in entries {
+            sql_buf.clear();
+            Self::build_ingest_row_sql(
+                &mut sql_buf,
+                collection_id,
+                None,
+                vector,
+                metadata,
+                idempotency_key.as_deref(),
+            )?;
+
+            let rows = guard.query_rows::<WalIngestResult>(&sql_buf, None)?;
+            match rows.into_iter().next() {
+                Some(row) => results.push(row),
+                None => {
+                    // Rollback and bail
+                    let _ = guard.exec("ROLLBACK;");
+                    return Err(anyhow!("batch ingest row produced no result"));
+                }
+            }
+        }
+
+        guard.exec("COMMIT;")?;
+        Ok(results)
     }
 }
 

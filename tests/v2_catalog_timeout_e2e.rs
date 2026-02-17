@@ -23,7 +23,7 @@ fn catalog_read_timeout_bounds_slow_metadata_scan() {
         .ensure_collection(&config.collection_name, config.dim)
         .expect("ensure collection");
 
-    for i in 0..3000usize {
+    for i in 0..20_000usize {
         let meta = VectorMetadata {
             source_file: format!("timeout-{i}.wav"),
             start_time_ms: i as u32,
@@ -34,7 +34,7 @@ fn catalog_read_timeout_bounds_slow_metadata_scan() {
         let _ = catalog
             .ingest_wal_atomic(
                 &collection.id,
-                &[i as f32 / 3000.0, 1.0 - (i as f32 / 3000.0)],
+                &[i as f32 / 20_000.0, 1.0 - (i as f32 / 20_000.0)],
                 &meta,
                 Some(&format!("timeout-key-{i}")),
             )

@@ -11,14 +11,15 @@ use super::auth::{authorize, AuthError};
 use super::catalog::Role;
 use super::engine::ProductionState;
 use super::model::{
-    ApiResponse, ErrorBody, HealthResponseV2, IdentifyRequestV2, IngestRequestV2, IngestResponseV2,
-    JobResponseV2, QueryRequestV2,
+    ApiResponse, ErrorBody, HealthResponseV2, IdentifyRequestV2, IngestBatchRequestV2,
+    IngestBatchResponseV2, IngestRequestV2, IngestResponseV2, JobResponseV2, QueryRequestV2,
 };
 use super::snapshot::create_snapshot;
 
 pub fn create_v2_router(state: Arc<ProductionState>) -> Router {
     Router::new()
         .route("/v2/vectors", post(v2_ingest))
+        .route("/v2/vectors/batch", post(v2_ingest_batch))
         .route("/v2/query", post(v2_query))
         .route("/v2/identify", post(v2_identify))
         .route("/v2/health/live", get(v2_health_live))
@@ -95,6 +96,96 @@ async fn v2_ingest(
                 auth.as_deref(),
                 "/v2/vectors",
                 "ingest",
+                status.as_u16(),
+                started.elapsed().as_secs_f64() * 1000.0,
+                serde_json::json!({"error": e.to_string()}),
+            );
+            resp
+        }
+    }
+}
+
+async fn v2_ingest_batch(
+    State(state): State<Arc<ProductionState>>,
+    headers: HeaderMap,
+    Json(body): Json<IngestBatchRequestV2>,
+) -> Response {
+    let request_id = request_id(&headers);
+    let started = Instant::now();
+
+    let auth = match authorize(
+        state.catalog.as_ref(),
+        &headers,
+        Some(Role::Ingest),
+        &state.config.api_pepper,
+    ) {
+        Ok(auth) => auth,
+        Err(e) => {
+            state
+                .metrics
+                .auth_failures_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return auth_error_response(&state, &request_id, "/v2/vectors/batch", "ingest_batch", started, e);
+        }
+    };
+
+    let batch_len = body.vectors.len();
+    if batch_len == 0 {
+        let payload = ApiResponse {
+            data: IngestBatchResponseV2 { results: vec![] },
+        };
+        return json_response(StatusCode::CREATED, &request_id, &payload);
+    }
+
+    // Convert to engine format
+    let entries: Vec<_> = body
+        .vectors
+        .into_iter()
+        .map(|req| {
+            let meta = req.metadata.into();
+            (req.vector, meta, req.idempotency_key)
+        })
+        .collect();
+
+    let state_bg = state.clone();
+    let result = tokio::task::spawn_blocking(move || state_bg.ingest_batch(&entries)).await;
+    let result = match result {
+        Ok(inner) => inner,
+        Err(e) => Err(anyhow::anyhow!("batch ingest join error: {}", e)),
+    };
+
+    match result {
+        Ok(results) => {
+            let payload = ApiResponse {
+                data: IngestBatchResponseV2 {
+                    results: results
+                        .iter()
+                        .map(|&(id, created)| IngestResponseV2 { id, created })
+                        .collect(),
+                },
+            };
+            let resp = json_response(StatusCode::CREATED, &request_id, &payload);
+            audit_best_effort(
+                &state,
+                &request_id,
+                auth.as_deref(),
+                "/v2/vectors/batch",
+                "ingest_batch",
+                201,
+                started.elapsed().as_secs_f64() * 1000.0,
+                serde_json::json!({"count": batch_len}),
+            );
+            resp
+        }
+        Err(e) => {
+            let (status, code) = classify_ingest_error(&e);
+            let resp = error_response(status, &request_id, code, e.to_string(), None);
+            audit_best_effort(
+                &state,
+                &request_id,
+                auth.as_deref(),
+                "/v2/vectors/batch",
+                "ingest_batch",
                 status.as_u16(),
                 started.elapsed().as_secs_f64() * 1000.0,
                 serde_json::json!({"error": e.to_string()}),
