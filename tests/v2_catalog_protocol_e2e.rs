@@ -391,6 +391,113 @@ fn monotonic_id_counter_is_atomic_with_wal_and_metadata() {
 }
 
 #[test]
+fn ingest_wal_batch_preserves_idempotency_and_catalog_consistency() {
+    let dir = tempdir().expect("tempdir");
+    let config = test_config(dir.path().join("catalog_protocol_batch"));
+    bootstrap_data_dirs(&config).expect("bootstrap dirs");
+
+    let catalog = SqliteCatalog::open(&config.catalog_path()).expect("open catalog");
+    let collection = catalog
+        .ensure_collection(&config.collection_name, config.dim)
+        .expect("ensure collection");
+
+    let entry = |source: &str, bpm: f32, tags: &[&str]| VectorMetadata {
+        source_file: source.to_string(),
+        start_time_ms: 0,
+        duration_ms: 100,
+        bpm,
+        tags: tags.iter().map(|t| t.to_string()).collect(),
+    };
+
+    let batch_one = vec![
+        (
+            vec![0.1, 0.9],
+            entry("a.wav", 120.0, &["Batch", "One"]),
+            Some("batch-k1".to_string()),
+        ),
+        (
+            vec![0.2, 0.8],
+            entry("b.wav", 121.0, &["batch", "Two"]),
+            Some("batch-k2".to_string()),
+        ),
+        (
+            vec![0.3, 0.7],
+            entry("dup.wav", 122.0, &["dup"]),
+            Some("batch-k1".to_string()),
+        ),
+        (
+            vec![0.4, 0.6],
+            entry("nokey.wav", 123.0, &["batch", "NoKey"]),
+            None,
+        ),
+    ];
+    let r1 = catalog
+        .ingest_wal_batch(&collection.id, &batch_one)
+        .expect("batch one ingest");
+    assert_eq!(r1.len(), 4);
+    assert!(r1[0].created);
+    assert!(r1[1].created);
+    assert!(
+        !r1[2].created,
+        "duplicate key in same batch must be idempotent"
+    );
+    assert_eq!(r1[2].vector_id, r1[0].vector_id);
+    assert!(r1[3].created);
+
+    let batch_two = vec![
+        (
+            vec![0.25, 0.75],
+            entry("b-overwrite.wav", 150.0, &["should_not_apply"]),
+            Some("batch-k2".to_string()),
+        ),
+        (
+            vec![0.5, 0.5],
+            entry("new.wav", 124.0, &["batch", "new"]),
+            Some("batch-k3".to_string()),
+        ),
+    ];
+    let r2 = catalog
+        .ingest_wal_batch(&collection.id, &batch_two)
+        .expect("batch two ingest");
+    assert_eq!(r2.len(), 2);
+    assert!(!r2[0].created, "existing key must remain idempotent");
+    assert_eq!(r2[0].vector_id, r1[1].vector_id);
+    assert!(r2[1].created);
+
+    let total = catalog
+        .total_vectors(&collection.id)
+        .expect("total vectors after batches");
+    assert_eq!(total, 4, "only four unique vectors should be persisted");
+
+    let pending = catalog
+        .pending_wal_after_lsn(&collection.id, 0)
+        .expect("pending wal after batch ingest");
+    assert_eq!(pending.len(), 4, "WAL should contain only created rows");
+
+    let metadata = catalog
+        .fetch_metadata(&collection.id, &[r1[1].vector_id])
+        .expect("fetch metadata for idempotent row");
+    let existing = metadata
+        .get(&r1[1].vector_id)
+        .expect("metadata for idempotent row");
+    assert_eq!(
+        existing.source_file, "b.wav",
+        "duplicate idempotent ingest must not overwrite metadata"
+    );
+
+    let tags = catalog
+        .fetch_tag_dictionary(&collection.id)
+        .expect("fetch tag dictionary");
+    assert!(tags.contains_key("batch"));
+    assert!(tags.contains_key("new"));
+
+    let filter_rows = catalog
+        .fetch_filter_rows(&collection.id)
+        .expect("fetch filter rows");
+    assert_eq!(filter_rows.len(), 4);
+}
+
+#[test]
 fn tag_dictionary_and_vector_tags_are_stable_across_restart() {
     let dir = tempdir().expect("tempdir");
     let config = test_config(dir.path().join("catalog_protocol_tags"));

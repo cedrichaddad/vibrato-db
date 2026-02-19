@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use parking_lot::RwLock;
 use tracing_subscriber::EnvFilter;
 
@@ -179,11 +179,23 @@ enum Commands {
         orphan_ttl_hours: u64,
 
         /// Assume co-location with audio workloads and lower maintenance worker priority
-        #[arg(long, default_value_t = true)]
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = ArgAction::Set
+        )]
         audio_colocated: bool,
 
         /// If false, /v2/health/* and /v2/metrics require API auth
-        #[arg(long, default_value_t = true)]
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = ArgAction::Set
+        )]
         public_health_metrics: bool,
 
         /// Catalog read timeout in ms (guards against stuck readers / WAL bloat)

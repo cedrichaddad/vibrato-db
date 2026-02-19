@@ -137,8 +137,6 @@ pub struct ArchivePqSegment {
     pub num_subspaces: usize,
 }
 
-
-
 pub struct ProductionState {
     pub config: ProductionConfig,
     pub catalog: Arc<SqliteCatalog>,
@@ -147,7 +145,7 @@ pub struct ProductionState {
     pub ready: AtomicBool,
     pub recovery_report: RwLock<String>,
 
-    pub hot_vector_shards: Vec<ArcSwap<RwLock<HashMap<usize, Vec<f32>>>>>,
+    pub hot_vector_shards: Vec<ArcSwap<RwLock<HashMap<usize, Arc<Vec<f32>>>>>>,
     pub hot_indices: Vec<RwLock<HNSW>>,
     pub shard_mask: usize,
     pub metadata_cache: Arc<RwLock<HashMap<usize, VectorMetadata>>>,
@@ -157,6 +155,7 @@ pub struct ProductionState {
     pub retired_segments: std::sync::Mutex<HashMap<String, Weak<SegmentHandle>>>,
 
     pub metrics: Metrics,
+    pub admin_ops_lock: std::sync::Mutex<()>,
     pub checkpoint_lock: std::sync::Mutex<()>,
     pub compaction_lock: std::sync::Mutex<()>,
     pub background_pool: std::sync::Mutex<Option<Arc<ThreadPool>>>,
@@ -265,6 +264,7 @@ impl ProductionState {
             filter_index: Arc::new(RwLock::new(FilterIndex::default())),
             retired_segments: std::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
+            admin_ops_lock: std::sync::Mutex::new(()),
             checkpoint_lock: std::sync::Mutex::new(()),
             compaction_lock: std::sync::Mutex::new(()),
             background_pool: std::sync::Mutex::new(None),
@@ -362,7 +362,10 @@ impl ProductionState {
     pub fn insert_hot_vector(&self, vector_id: usize, vector: Vec<f32>, metadata: VectorMetadata) {
         let shard = vector_id & self.shard_mask;
         if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
-            shard_vectors.load().write().insert(vector_id, vector);
+            shard_vectors
+                .load()
+                .write()
+                .insert(vector_id, Arc::new(vector));
         }
         if let Some(index) = self.hot_indices.get(shard) {
             index.write().insert(vector_id);
@@ -421,10 +424,9 @@ impl ProductionState {
         }
 
         // 1. Bulk catalog write — single BEGIN...COMMIT
-        let wal_results = self.catalog.ingest_wal_batch(
-            &self.collection.id,
-            entries,
-        )?;
+        let wal_results = self
+            .catalog
+            .ingest_wal_batch(&self.collection.id, entries)?;
 
         // 2. Group by shard for efficient lock acquisition
         let mut by_shard: HashMap<usize, Vec<(usize, &[f32], &VectorMetadata)>> = HashMap::new();
@@ -439,13 +441,13 @@ impl ProductionState {
             }
         }
 
-        // 3. Insert into hot index shards — one lock acquisition per shard
-        for (shard, items) in &by_shard {
+        // 3. Insert into hot index shards in parallel — one lock acquisition per shard
+        by_shard.par_iter().for_each(|(shard, items)| {
             if let Some(shard_vectors) = self.hot_vector_shards.get(*shard) {
                 let guard = shard_vectors.load();
                 let mut vec_guard = guard.write();
                 for &(vid, vec, _) in items {
-                    vec_guard.insert(vid, vec.to_vec());
+                    vec_guard.insert(vid, Arc::new(vec.to_vec()));
                 }
             }
             if let Some(index) = self.hot_indices.get(*shard) {
@@ -454,7 +456,7 @@ impl ProductionState {
                     idx_guard.insert(vid);
                 }
             }
-        }
+        });
 
         // 4. Update metadata cache + filter index in one pass
         let created_count = by_shard.values().map(|v| v.len()).sum::<usize>();
@@ -1132,6 +1134,10 @@ impl ProductionState {
     }
 
     pub fn checkpoint_once(&self) -> Result<JobResponseV2> {
+        let _admin_guard = self
+            .admin_ops_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _guard = self
             .checkpoint_lock
             .lock()
@@ -1312,6 +1318,10 @@ impl ProductionState {
     }
 
     pub fn compact_once(&self) -> Result<JobResponseV2> {
+        let _admin_guard = self
+            .admin_ops_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _guard = self
             .compaction_lock
             .lock()
@@ -1434,12 +1444,17 @@ impl ProductionState {
             // Sort by ID for deterministic output.
             let mut ids_raw: Vec<usize> = merged.keys().copied().collect();
             ids_raw.sort_unstable();
-            let vectors_raw: Vec<Vec<f32>> = ids_raw.iter().map(|id| merged.remove(id).unwrap()).collect();
+            let vectors_raw: Vec<Vec<f32>> = ids_raw
+                .iter()
+                .map(|id| merged.remove(id).unwrap())
+                .collect();
             drop(merged);
             // Use range-based metadata fetch: single SQL query per range.
             let range_start = *ids_raw.first().unwrap_or(&0);
             let range_end = *ids_raw.last().unwrap_or(&0);
-            let metadata_map = self.catalog.fetch_metadata_range(&self.collection.id, range_start, range_end)?;
+            let metadata_map =
+                self.catalog
+                    .fetch_metadata_range(&self.collection.id, range_start, range_end)?;
             let metadata_raw = ids_raw
                 .iter()
                 .map(|id| metadata_map.get(id).cloned().unwrap_or_default())
@@ -1651,7 +1666,7 @@ impl ProductionState {
             let mut vectors = shard_vectors.write();
             for e in &pending {
                 if (e.vector_id & self.shard_mask) == shard_idx {
-                    vectors.insert(e.vector_id, e.vector.clone());
+                    vectors.insert(e.vector_id, Arc::new(e.vector.clone()));
                 }
             }
         }
@@ -1680,10 +1695,10 @@ impl ProductionState {
         // By swapping the shards into the global ArcSwap, we ensure new ingests
         // go to the same place the new indices are reading from.
         for (i, shard) in new_shards.into_iter().enumerate() {
-             self.hot_vector_shards[i].store(shard);
+            self.hot_vector_shards[i].store(shard);
         }
         for (i, hnsw) in new_indices.into_iter().enumerate() {
-             *self.hot_indices[i].write() = hnsw;
+            *self.hot_indices[i].write() = hnsw;
         }
 
         Ok(())
@@ -2612,15 +2627,20 @@ fn audit_worker_loop(state: Arc<ProductionState>, rx: Receiver<AuditEvent>) {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 if !buffer.is_empty() {
                     if let Err(e) = state.catalog.audit_events_batch(&buffer) {
-                         tracing::error!("final audit batch failed: {}", e);
-                         state.metrics.audit_failures_total.fetch_add(buffer.len() as u64, AtomicOrdering::Relaxed);
+                        tracing::error!("final audit batch failed: {}", e);
+                        state
+                            .metrics
+                            .audit_failures_total
+                            .fetch_add(buffer.len() as u64, AtomicOrdering::Relaxed);
                     }
                 }
                 break;
             }
         }
 
-        if !buffer.is_empty() && (buffer.len() >= batch_size || last_flush.elapsed() >= batch_timeout) {
+        if !buffer.is_empty()
+            && (buffer.len() >= batch_size || last_flush.elapsed() >= batch_timeout)
+        {
             // Optimization: No retries. If the DB is locked for 30s, retrying for 20ms is useless.
             // Drop the batch to save the system.
             if let Err(e) = state.catalog.audit_events_batch(&buffer) {
@@ -2637,16 +2657,21 @@ fn audit_worker_loop(state: Arc<ProductionState>, rx: Receiver<AuditEvent>) {
 }
 
 fn make_hot_accessor(
-    hot_vector_shard: Arc<RwLock<HashMap<usize, Vec<f32>>>>,
+    hot_vector_shard: Arc<RwLock<HashMap<usize, Arc<Vec<f32>>>>>,
     dim: usize,
 ) -> impl Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static {
-    let zero_fallback = vec![0.0f32; dim];
+    let zero_fallback = Arc::new(vec![0.0f32; dim]);
     move |id, sink| {
-        let guard = hot_vector_shard.read();
-        if let Some(v) = guard.get(&id) {
-            sink(v);
+        // Important: do not hold the shard lock while executing `sink`.
+        // HNSW insert/search can invoke nested accessor callbacks.
+        let maybe_vec = {
+            let guard = hot_vector_shard.read();
+            guard.get(&id).cloned()
+        };
+        if let Some(v) = maybe_vec {
+            sink(v.as_slice());
         } else {
-            sink(&zero_fallback);
+            sink(zero_fallback.as_slice());
         }
     }
 }
