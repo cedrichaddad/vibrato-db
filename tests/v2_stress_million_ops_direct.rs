@@ -394,7 +394,11 @@ fn stress_test_million_ops_direct_engine() {
                 ef: 256,
                 include_metadata: false,
                 filter: None,
-                search_tier: SearchTier::Active,
+                search_tier: if enable_admin_chaos {
+                    SearchTier::All
+                } else {
+                    SearchTier::Active
+                },
             };
             let response = state.query(&request).expect("direct verify query");
             let found = response.results.iter().any(|r| r.id == *expected_id);

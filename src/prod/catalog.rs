@@ -273,10 +273,19 @@ impl RawSqliteConnection {
         let conn = Self { db };
         conn.exec("PRAGMA foreign_keys=ON;")?;
         conn.exec("PRAGMA temp_store=MEMORY;")?;
-        unsafe {
-            let _ = sqlite3_busy_timeout(conn.db, 30000);
-        }
+        conn.set_busy_timeout(30_000)?;
         Ok(conn)
+    }
+
+    fn set_busy_timeout(&self, ms: u64) -> Result<()> {
+        let clamped = ms.max(1).min(c_int::MAX as u64) as c_int;
+        let rc = unsafe { sqlite3_busy_timeout(self.db, clamped) };
+        if rc != SQLITE_OK {
+            return Err(anyhow!("sqlite busy_timeout failed: {}", unsafe {
+                c_ptr_to_string(sqlite3_errmsg(self.db))
+            }));
+        }
+        Ok(())
     }
 
     fn configure_writer(&self, wal_autocheckpoint_pages: u32) -> Result<()> {
@@ -447,7 +456,11 @@ impl RawSqliteConnection {
                 let step_result = loop {
                     let step_rc = unsafe { sqlite3_step(stmt) };
                     if step_rc == SQLITE_ROW {
-                        rows.push(unsafe { T::from_row(stmt)? });
+                        let decoded = unsafe { T::from_row(stmt) };
+                        match decoded {
+                            Ok(row) => rows.push(row),
+                            Err(err) => break Err(err),
+                        }
                         continue;
                     }
                     if step_rc == SQLITE_DONE {
@@ -834,10 +847,11 @@ impl SqliteCatalog {
     fn init_readers(&mut self, count: usize) -> Result<()> {
         self.readers.clear();
         for _ in 0..count {
-            self.readers
-                .push(std::sync::Mutex::new(RawSqliteConnection::open(
-                    &self.path, true,
-                )?));
+            let conn = RawSqliteConnection::open(&self.path, true)?;
+            // Bound lock wait on read handles to the catalog read timeout so
+            // lock contention cannot stall reads for the full writer busy timeout.
+            conn.set_busy_timeout(self.options.read_timeout_ms.max(1))?;
+            self.readers.push(std::sync::Mutex::new(conn));
         }
         Ok(())
     }

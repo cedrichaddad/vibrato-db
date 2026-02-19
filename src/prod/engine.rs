@@ -155,6 +155,7 @@ pub struct ProductionState {
     pub retired_segments: std::sync::Mutex<HashMap<String, Weak<SegmentHandle>>>,
 
     pub metrics: Metrics,
+    pub admin_ops_lock: std::sync::Mutex<()>,
     pub checkpoint_lock: std::sync::Mutex<()>,
     pub compaction_lock: std::sync::Mutex<()>,
     pub background_pool: std::sync::Mutex<Option<Arc<ThreadPool>>>,
@@ -263,6 +264,7 @@ impl ProductionState {
             filter_index: Arc::new(RwLock::new(FilterIndex::default())),
             retired_segments: std::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
+            admin_ops_lock: std::sync::Mutex::new(()),
             checkpoint_lock: std::sync::Mutex::new(()),
             compaction_lock: std::sync::Mutex::new(()),
             background_pool: std::sync::Mutex::new(None),
@@ -1132,6 +1134,10 @@ impl ProductionState {
     }
 
     pub fn checkpoint_once(&self) -> Result<JobResponseV2> {
+        let _admin_guard = self
+            .admin_ops_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _guard = self
             .checkpoint_lock
             .lock()
@@ -1312,6 +1318,10 @@ impl ProductionState {
     }
 
     pub fn compact_once(&self) -> Result<JobResponseV2> {
+        let _admin_guard = self
+            .admin_ops_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _guard = self
             .compaction_lock
             .lock()

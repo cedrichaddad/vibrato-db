@@ -831,7 +831,8 @@ async fn stress_test_million_ops_mixed() {
                 "vector": vector,
                 "k": 20,
                 "ef": 256,
-                "include_metadata": false
+                "include_metadata": false,
+                "search_tier": if enable_admin_chaos { "all" } else { "active" }
             });
             let resp = client
                 .post(format!("{}/v2/query", base_url))
