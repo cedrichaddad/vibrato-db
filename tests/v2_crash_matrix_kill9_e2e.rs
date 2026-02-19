@@ -10,6 +10,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tempfile::tempdir;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
@@ -20,6 +21,17 @@ const DIM: usize = 16;
 #[derive(Clone, Debug)]
 struct AckRecord {
     vector_id: usize,
+    idempotency_key: String,
+    vector: Vec<f32>,
+    source_file: String,
+    start_time_ms: u32,
+    duration_ms: u16,
+    bpm: f32,
+    tags: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ReplayRecord {
     idempotency_key: String,
     vector: Vec<f32>,
     source_file: String,
@@ -227,7 +239,7 @@ async fn ingest_batch(
     worker_id: usize,
     start_idx: usize,
     count: usize,
-) -> Vec<AckRecord> {
+) -> (Vec<AckRecord>, Vec<ReplayRecord>) {
     let mut requests = Vec::with_capacity(count);
     let mut template = Vec::with_capacity(count);
     for i in 0..count {
@@ -254,8 +266,7 @@ async fn ingest_batch(
             }),
             idempotency_key: Some(idempotency_key.clone()),
         });
-        template.push(AckRecord {
-            vector_id: 0,
+        template.push(ReplayRecord {
             idempotency_key,
             vector,
             source_file: format!("jepsen_seed{seed}_w{worker_id}_{idx}.wav"),
@@ -279,28 +290,36 @@ async fn ingest_batch(
         .await
     {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), template),
     };
     if response.status() != StatusCode::CREATED {
-        return Vec::new();
+        return (Vec::new(), template);
     }
     let parsed: IngestBatchResponseEnvelope = match response.json().await {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), template),
     };
     if parsed.data.results.len() != template.len() {
-        return Vec::new();
+        return (Vec::new(), template);
     }
 
     let mut out = Vec::with_capacity(template.len());
-    for (mut rec, result) in template.into_iter().zip(parsed.data.results.into_iter()) {
+    for (rec, result) in template.iter().zip(parsed.data.results.into_iter()) {
         if !result.created {
             continue;
         }
-        rec.vector_id = result.id;
-        out.push(rec);
+        out.push(AckRecord {
+            vector_id: result.id,
+            idempotency_key: rec.idempotency_key.clone(),
+            vector: rec.vector.clone(),
+            source_file: rec.source_file.clone(),
+            start_time_ms: rec.start_time_ms,
+            duration_ms: rec.duration_ms,
+            bpm: rec.bpm,
+            tags: rec.tags.clone(),
+        });
     }
-    out
+    (out, template)
 }
 
 async fn admin_post(client: &reqwest::Client, base_url: &str, token: &str, path: &str) {
@@ -356,6 +375,49 @@ async fn verify_ack_records(
             rec.idempotency_key
         );
     }
+}
+
+async fn replay_attempted_records(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    records: &[ReplayRecord],
+) -> anyhow::Result<(usize, usize)> {
+    let mut existing = 0usize;
+    let mut inserted = 0usize;
+    for rec in records {
+        let body = serde_json::json!({
+            "vector": rec.vector,
+            "metadata": {
+                "source_file": rec.source_file,
+                "start_time_ms": rec.start_time_ms,
+                "duration_ms": rec.duration_ms,
+                "bpm": rec.bpm,
+                "tags": rec.tags
+            },
+            "idempotency_key": rec.idempotency_key
+        });
+
+        let resp = client
+            .post(format!("{}/v2/vectors", base_url))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            resp.status() == StatusCode::CREATED,
+            "replay ingest failed for {}: status={}",
+            rec.idempotency_key,
+            resp.status()
+        );
+        let payload: serde_json::Value = resp.json().await?;
+        if payload["data"]["created"].as_bool() == Some(false) {
+            existing += 1;
+        } else {
+            inserted += 1;
+        }
+    }
+    Ok((existing, inserted))
 }
 
 fn verify_metadata_integrity(data_dir: &Path, records: &[AckRecord]) -> anyhow::Result<()> {
@@ -531,6 +593,7 @@ async fn run_jepsen_seed(seed: u64) -> anyhow::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let next_idx = Arc::new(AtomicUsize::new(0));
     let acked = Arc::new(Mutex::new(Vec::<AckRecord>::new()));
+    let attempted = Arc::new(Mutex::new(Vec::<ReplayRecord>::new()));
 
     let mut writers = Vec::with_capacity(writer_concurrency);
     for worker_id in 0..writer_concurrency {
@@ -540,20 +603,22 @@ async fn run_jepsen_seed(seed: u64) -> anyhow::Result<()> {
         let stop = stop.clone();
         let next_idx = next_idx.clone();
         let acked = acked.clone();
+        let attempted = attempted.clone();
         writers.push(tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
                 let start = next_idx.fetch_add(batch_size, Ordering::Relaxed);
-                let batch = ingest_batch(
+                let (batch, attempted_batch) = ingest_batch(
                     &client, &base_url, &token, seed, worker_id, start, batch_size,
                 )
                 .await;
-                if batch.is_empty() {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    continue;
+                if !attempted_batch.is_empty() {
+                    attempted.lock().extend(attempted_batch);
                 }
-                acked.lock().extend(batch);
+                if !batch.is_empty() {
+                    acked.lock().extend(batch);
+                } else if stop.load(Ordering::Relaxed) {
+                    break;
+                }
             }
         }));
     }
@@ -573,6 +638,18 @@ async fn run_jepsen_seed(seed: u64) -> anyhow::Result<()> {
     }
     let acked_records = acked.lock().clone();
     let acked_count = acked_records.len();
+    let attempted_records = attempted.lock().clone();
+    let attempted_unique = {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for rec in attempted_records {
+            if seen.insert(rec.idempotency_key.clone()) {
+                out.push(rec);
+            }
+        }
+        out
+    };
+    let attempted_unique_count = attempted_unique.len();
 
     let Some(restart_port) = reserve_local_port() else {
         return Ok(());
@@ -582,27 +659,6 @@ async fn run_jepsen_seed(seed: u64) -> anyhow::Result<()> {
     wait_for_ready(&restart_url)
         .await
         .map_err(anyhow::Error::msg)?;
-
-    let stats_resp = client
-        .get(format!("{}/v2/admin/stats", restart_url))
-        .bearer_auth(&token)
-        .send()
-        .await?;
-    anyhow::ensure!(
-        stats_resp.status() == StatusCode::OK,
-        "stats endpoint failed after restart: status={}",
-        stats_resp.status()
-    );
-    let stats: serde_json::Value = stats_resp.json().await?;
-    let total_vectors = stats["data"]["total_vectors"].as_u64().unwrap_or(0) as usize;
-    anyhow::ensure!(
-        total_vectors == acked_count,
-        "durability mismatch after kill-9: seed={} kill_delay_ms={} acked_count={} total_vectors={}",
-        seed,
-        kill_delay_ms,
-        acked_count,
-        total_vectors
-    );
 
     let verify_cap = std::env::var("VIBRATO_JEPSEN_VERIFY_CAP")
         .ok()
@@ -622,6 +678,72 @@ async fn run_jepsen_seed(seed: u64) -> anyhow::Result<()> {
 
     verify_ack_records(&client, &restart_url, &token, &verify_records).await;
     verify_metadata_integrity(&data_dir, &verify_records)?;
+
+    let stats_before_replay_resp = client
+        .get(format!("{}/v2/admin/stats", restart_url))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        stats_before_replay_resp.status() == StatusCode::OK,
+        "stats endpoint failed after restart: status={}",
+        stats_before_replay_resp.status()
+    );
+    let stats_before_replay: serde_json::Value = stats_before_replay_resp.json().await?;
+    let total_vectors_before_replay = stats_before_replay["data"]["total_vectors"]
+        .as_u64()
+        .unwrap_or(0) as usize;
+
+    let (replay_existing, replay_inserted) =
+        replay_attempted_records(&client, &restart_url, &token, &attempted_unique).await?;
+
+    anyhow::ensure!(
+        replay_existing == total_vectors_before_replay,
+        "jepsen mismatch before replay: seed={} kill_delay_ms={} total_vectors_before_replay={} replay_existing={}",
+        seed,
+        kill_delay_ms,
+        total_vectors_before_replay,
+        replay_existing
+    );
+    anyhow::ensure!(
+        replay_existing >= acked_count,
+        "acked durability violated: seed={} kill_delay_ms={} acked_count={} replay_existing={}",
+        seed,
+        kill_delay_ms,
+        acked_count,
+        replay_existing
+    );
+    anyhow::ensure!(
+        replay_existing + replay_inserted == attempted_unique_count,
+        "attempt ledger mismatch: seed={} attempted_unique={} replay_existing={} replay_inserted={}",
+        seed,
+        attempted_unique_count,
+        replay_existing,
+        replay_inserted
+    );
+
+    let stats_after_replay_resp = client
+        .get(format!("{}/v2/admin/stats", restart_url))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        stats_after_replay_resp.status() == StatusCode::OK,
+        "stats endpoint failed after replay: status={}",
+        stats_after_replay_resp.status()
+    );
+    let stats_after_replay: serde_json::Value = stats_after_replay_resp.json().await?;
+    let total_vectors_after_replay = stats_after_replay["data"]["total_vectors"]
+        .as_u64()
+        .unwrap_or(0) as usize;
+    anyhow::ensure!(
+        total_vectors_after_replay == attempted_unique_count,
+        "replay final count mismatch: seed={} expected={} actual={}",
+        seed,
+        attempted_unique_count,
+        total_vectors_after_replay
+    );
+
     stop_server(&mut restarted).await;
     Ok(())
 }

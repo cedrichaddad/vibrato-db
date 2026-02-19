@@ -27,17 +27,20 @@ docker run -d \
     --checkpoint-interval-secs 3600 \
     --compaction-interval-secs 3600 >/dev/null
 
-echo "[smoke] waiting for readiness"
+echo "[smoke] waiting for server process"
 for _ in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:${PORT}/v2/health/ready" >/dev/null 2>&1; then
+  if [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null || true)" != "true" ]]; then
+    echo "[smoke] container exited unexpectedly"
+    docker logs "${CONTAINER_NAME}" || true
+    exit 1
+  fi
+
+  status="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/v2/health/live" || true)"
+  if [[ "${status}" == "200" || "${status}" == "401" ]]; then
     break
   fi
   sleep 1
 done
-
-curl -fsS "http://127.0.0.1:${PORT}/v2/health/live" >/dev/null
-curl -fsS "http://127.0.0.1:${PORT}/v2/health/ready" >/dev/null
-curl -fsS "http://127.0.0.1:${PORT}/v2/metrics" >/dev/null
 
 echo "[smoke] creating API key"
 token="$(docker exec "${CONTAINER_NAME}" vibrato-db key-create --data-dir /var/lib/vibrato --name smoke --roles admin,query,ingest \
@@ -45,8 +48,24 @@ token="$(docker exec "${CONTAINER_NAME}" vibrato-db key-create --data-dir /var/l
 
 if [[ -z "${token}" ]]; then
   echo "[smoke] failed to create token"
+  docker logs "${CONTAINER_NAME}" || true
   exit 1
 fi
+
+echo "[smoke] waiting for authenticated readiness"
+for _ in $(seq 1 60); do
+  status="$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" \
+    "http://127.0.0.1:${PORT}/v2/health/ready" || true)"
+  if [[ "${status}" == "200" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+curl -fsS -H "Authorization: Bearer ${token}" "http://127.0.0.1:${PORT}/v2/health/live" >/dev/null
+curl -fsS -H "Authorization: Bearer ${token}" "http://127.0.0.1:${PORT}/v2/health/ready" >/dev/null
+curl -fsS -H "Authorization: Bearer ${token}" "http://127.0.0.1:${PORT}/v2/metrics" >/dev/null
 
 echo "[smoke] ingest + query roundtrip"
 curl -fsS -X POST "http://127.0.0.1:${PORT}/v2/vectors" \

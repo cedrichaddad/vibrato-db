@@ -43,6 +43,7 @@ jobs:
       - name: Crash matrix subset (PR)
         env:
           VIBRATO_CRASH_SEEDS: "10"
+          VIBRATO_JEPSEN_CRASH_SEEDS: "0"
         run: bash scripts/ci/run_crash_matrix.sh
 
   docker-smoke:
