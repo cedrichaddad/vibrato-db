@@ -1,0 +1,29 @@
+[package]
+name = "vibrato-db-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vibrato-db = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "read_v2_header"
+path = "fuzz_targets/read_v2_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "load_archive_segment_handle"
+path = "fuzz_targets/load_archive_segment_handle.rs"
+test = false
+doc = false
+bench = false

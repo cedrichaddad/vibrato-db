@@ -1909,56 +1909,12 @@ impl ProductionState {
     fn load_archive_segment_handle(&self, seg: &SegmentRecord) -> Result<Arc<ArchivePqSegment>> {
         let bytes = std::fs::read(&seg.path)
             .with_context(|| format!("reading archive segment {:?}", seg.path))?;
-        let header = VdbHeaderV2::from_bytes(&bytes)?;
-        if !header.is_pq_enabled() {
-            return Err(anyhow!("segment {} is not pq-enabled archive data", seg.id));
-        }
-
-        let nsub = header.pq_subspaces as usize;
-        let code_len = header.count as usize * nsub;
-        let codes_start = header.vectors_offset as usize;
-        let codes_end = codes_start + code_len;
-        if codes_end > bytes.len() {
-            return Err(anyhow!(
-                "invalid pq codes range in segment {}: {}..{} > {}",
-                seg.id,
-                codes_start,
-                codes_end,
-                bytes.len()
-            ));
-        }
-
-        if header.codebook_offset == 0 {
-            return Err(anyhow!("segment {} missing pq codebook section", seg.id));
-        }
-        let codebook_start = header.codebook_offset as usize;
-        let codebook_end = if header.metadata_offset > 0 {
-            header.metadata_offset as usize
-        } else if header.graph_offset > 0 {
-            header.graph_offset as usize
-        } else {
-            bytes.len()
-        };
-        if codebook_end <= codebook_start || codebook_end > bytes.len() {
-            return Err(anyhow!(
-                "invalid codebook range in segment {}: {}..{}",
-                seg.id,
-                codebook_start,
-                codebook_end
-            ));
-        }
-
-        let pq = ProductQuantizer::from_codebook_bytes(
-            header.dimensions as usize,
-            nsub,
-            &bytes[codebook_start..codebook_end],
-        )
-        .with_context(|| format!("decoding pq codebook for segment {}", seg.id))?;
+        let (pq, codes, nsub) = parse_archive_segment_bytes(&seg.id, &bytes)?;
 
         Ok(Arc::new(ArchivePqSegment {
             record: seg.clone(),
             pq,
-            codes: Arc::new(bytes[codes_start..codes_end].to_vec()),
+            codes: Arc::new(codes),
             num_subspaces: nsub,
         }))
     }
@@ -2136,6 +2092,96 @@ fn read_v2_header(path: &std::path::Path) -> Result<VdbHeaderV2> {
     file.read_exact(&mut header_bytes)?;
     let header = VdbHeaderV2::from_bytes(&header_bytes)?;
     Ok(header)
+}
+
+fn parse_archive_segment_bytes(
+    segment_label: &str,
+    bytes: &[u8],
+) -> Result<(ProductQuantizer, Vec<u8>, usize)> {
+    let header = VdbHeaderV2::from_bytes(bytes)?;
+    if !header.is_pq_enabled() {
+        return Err(anyhow!(
+            "segment {} is not pq-enabled archive data",
+            segment_label
+        ));
+    }
+
+    let nsub = header.pq_subspaces as usize;
+    if nsub == 0 {
+        return Err(anyhow!("segment {} has zero pq subspaces", segment_label));
+    }
+
+    let code_len = (header.count as usize)
+        .checked_mul(nsub)
+        .ok_or_else(|| anyhow!("segment {} pq code length overflow", segment_label))?;
+    let codes_start = usize::try_from(header.vectors_offset)
+        .map_err(|_| anyhow!("segment {} vectors_offset overflow", segment_label))?;
+    let codes_end = codes_start
+        .checked_add(code_len)
+        .ok_or_else(|| anyhow!("segment {} codes range overflow", segment_label))?;
+    if codes_end > bytes.len() {
+        return Err(anyhow!(
+            "invalid pq codes range in segment {}: {}..{} > {}",
+            segment_label,
+            codes_start,
+            codes_end,
+            bytes.len()
+        ));
+    }
+
+    if header.codebook_offset == 0 {
+        return Err(anyhow!(
+            "segment {} missing pq codebook section",
+            segment_label
+        ));
+    }
+    let codebook_start = usize::try_from(header.codebook_offset)
+        .map_err(|_| anyhow!("segment {} codebook_offset overflow", segment_label))?;
+    let codebook_end = if header.metadata_offset > 0 {
+        usize::try_from(header.metadata_offset)
+            .map_err(|_| anyhow!("segment {} metadata_offset overflow", segment_label))?
+    } else if header.graph_offset > 0 {
+        usize::try_from(header.graph_offset)
+            .map_err(|_| anyhow!("segment {} graph_offset overflow", segment_label))?
+    } else {
+        bytes.len()
+    };
+    if codebook_end <= codebook_start || codebook_end > bytes.len() {
+        return Err(anyhow!(
+            "invalid codebook range in segment {}: {}..{}",
+            segment_label,
+            codebook_start,
+            codebook_end
+        ));
+    }
+
+    let pq = ProductQuantizer::from_codebook_bytes(
+        header.dimensions as usize,
+        nsub,
+        &bytes[codebook_start..codebook_end],
+    )
+    .with_context(|| format!("decoding pq codebook for segment {}", segment_label))?;
+
+    Ok((pq, bytes[codes_start..codes_end].to_vec(), nsub))
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+pub fn fuzz_read_v2_header_bytes(bytes: &[u8]) -> Result<()> {
+    let mut path = std::env::temp_dir();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.push(format!("vibrato_fuzz_header_{nonce}.vdb"));
+    std::fs::write(&path, bytes)?;
+    let result = read_v2_header(&path).map(|_| ());
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+pub fn fuzz_parse_archive_segment_bytes(bytes: &[u8]) -> Result<()> {
+    parse_archive_segment_bytes("fuzz", bytes).map(|_| ())
 }
 
 fn build_index_from_pairs(

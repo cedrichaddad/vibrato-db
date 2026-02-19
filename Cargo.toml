@@ -19,6 +19,10 @@ edition.workspace = true
 license.workspace = true
 description = "A persistent, disk-backed vector search engine with HNSW indexing"
 
+[features]
+default = []
+fuzzing = []
+
 [dependencies]
 vibrato-core = { path = "crates/vibrato-core" }
 vibrato-neural = { path = "crates/vibrato-neural" }

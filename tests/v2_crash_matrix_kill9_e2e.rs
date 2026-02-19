@@ -1,11 +1,15 @@
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
@@ -23,6 +27,34 @@ struct AckRecord {
     duration_ms: u16,
     bpm: f32,
     tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct IngestRequest {
+    vector: Vec<f32>,
+    metadata: serde_json::Value,
+    idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct IngestBatchRequest {
+    vectors: Vec<IngestRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct IngestBatchResponseEnvelope {
+    data: IngestBatchResponseData,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct IngestBatchResponseData {
+    results: Vec<IngestBatchResult>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct IngestBatchResult {
+    id: usize,
+    created: bool,
 }
 
 fn reserve_local_port() -> Option<u16> {
@@ -185,6 +217,90 @@ async fn ingest_one(
         bpm,
         tags: vec!["drums".to_string(), format!("seed-{seed}")],
     })
+}
+
+async fn ingest_batch(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    seed: u64,
+    worker_id: usize,
+    start_idx: usize,
+    count: usize,
+) -> Vec<AckRecord> {
+    let mut requests = Vec::with_capacity(count);
+    let mut template = Vec::with_capacity(count);
+    for i in 0..count {
+        let idx = start_idx + i;
+        let vector = normalized_vector(seed ^ ((worker_id as u64) << 32), idx);
+        let source_file = format!("jepsen_seed{seed}_w{worker_id}_{idx}.wav");
+        let start_time_ms = idx as u32;
+        let duration_ms = 48u16;
+        let bpm = 95.0 + ((idx % 100) as f32) * 0.25;
+        let tags = vec![
+            "drums".to_string(),
+            "crash".to_string(),
+            format!("worker-{worker_id}"),
+        ];
+        let idempotency_key = format!("jepsen-{seed}-{worker_id}-{idx}");
+        requests.push(IngestRequest {
+            vector: vector.clone(),
+            metadata: serde_json::json!({
+                "source_file": source_file,
+                "start_time_ms": start_time_ms,
+                "duration_ms": duration_ms,
+                "bpm": bpm,
+                "tags": tags
+            }),
+            idempotency_key: Some(idempotency_key.clone()),
+        });
+        template.push(AckRecord {
+            vector_id: 0,
+            idempotency_key,
+            vector,
+            source_file: format!("jepsen_seed{seed}_w{worker_id}_{idx}.wav"),
+            start_time_ms,
+            duration_ms,
+            bpm,
+            tags: vec![
+                "drums".to_string(),
+                "crash".to_string(),
+                format!("worker-{worker_id}"),
+            ],
+        });
+    }
+
+    let payload = IngestBatchRequest { vectors: requests };
+    let response = match client
+        .post(format!("{}/v2/vectors/batch", base_url))
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    if response.status() != StatusCode::CREATED {
+        return Vec::new();
+    }
+    let parsed: IngestBatchResponseEnvelope = match response.json().await {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    if parsed.data.results.len() != template.len() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(template.len());
+    for (mut rec, result) in template.into_iter().zip(parsed.data.results.into_iter()) {
+        if !result.created {
+            continue;
+        }
+        rec.vector_id = result.id;
+        out.push(rec);
+    }
+    out
 }
 
 async fn admin_post(client: &reqwest::Client, base_url: &str, token: &str, path: &str) {
@@ -373,6 +489,143 @@ async fn run_seed(seed: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_jepsen_seed(seed: u64) -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let data_dir = dir.path().join(format!("jepsen_seed_{seed}"));
+    std::fs::create_dir_all(&data_dir)?;
+    let token = create_api_key(&data_dir)?;
+
+    let Some(port) = reserve_local_port() else {
+        return Ok(());
+    };
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    let mut server = start_server(&data_dir, port).await?;
+    wait_for_ready(&base_url)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let writer_concurrency = std::env::var("VIBRATO_JEPSEN_WRITERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+        .max(1);
+    let batch_size = std::env::var("VIBRATO_JEPSEN_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64)
+        .max(1);
+    let kill_min_ms = std::env::var("VIBRATO_JEPSEN_KILL_MIN_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(80);
+    let kill_max_ms = std::env::var("VIBRATO_JEPSEN_KILL_MAX_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1200)
+        .max(kill_min_ms);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let next_idx = Arc::new(AtomicUsize::new(0));
+    let acked = Arc::new(Mutex::new(Vec::<AckRecord>::new()));
+
+    let mut writers = Vec::with_capacity(writer_concurrency);
+    for worker_id in 0..writer_concurrency {
+        let client = client.clone();
+        let token = token.clone();
+        let base_url = base_url.clone();
+        let stop = stop.clone();
+        let next_idx = next_idx.clone();
+        let acked = acked.clone();
+        writers.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                let start = next_idx.fetch_add(batch_size, Ordering::Relaxed);
+                let batch = ingest_batch(
+                    &client, &base_url, &token, seed, worker_id, start, batch_size,
+                )
+                .await;
+                if batch.is_empty() {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    continue;
+                }
+                acked.lock().extend(batch);
+            }
+        }));
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x6EAF_D11D_55AA_9021);
+    let kill_delay_ms = if kill_max_ms == kill_min_ms {
+        kill_min_ms
+    } else {
+        rng.gen_range(kill_min_ms..=kill_max_ms)
+    };
+    sleep(Duration::from_millis(kill_delay_ms)).await;
+    kill_server(&mut server).await;
+    stop.store(true, Ordering::Relaxed);
+
+    for task in writers {
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+    let acked_records = acked.lock().clone();
+    let acked_count = acked_records.len();
+
+    let Some(restart_port) = reserve_local_port() else {
+        return Ok(());
+    };
+    let restart_url = format!("http://127.0.0.1:{}", restart_port);
+    let mut restarted = start_server(&data_dir, restart_port).await?;
+    wait_for_ready(&restart_url)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let stats_resp = client
+        .get(format!("{}/v2/admin/stats", restart_url))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        stats_resp.status() == StatusCode::OK,
+        "stats endpoint failed after restart: status={}",
+        stats_resp.status()
+    );
+    let stats: serde_json::Value = stats_resp.json().await?;
+    let total_vectors = stats["data"]["total_vectors"].as_u64().unwrap_or(0) as usize;
+    anyhow::ensure!(
+        total_vectors == acked_count,
+        "durability mismatch after kill-9: seed={} kill_delay_ms={} acked_count={} total_vectors={}",
+        seed,
+        kill_delay_ms,
+        acked_count,
+        total_vectors
+    );
+
+    let verify_cap = std::env::var("VIBRATO_JEPSEN_VERIFY_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(500);
+    let verify_records = if acked_records.len() > verify_cap {
+        let stride = (acked_records.len() / verify_cap).max(1);
+        acked_records
+            .iter()
+            .step_by(stride)
+            .take(verify_cap)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        acked_records.clone()
+    };
+
+    verify_ack_records(&client, &restart_url, &token, &verify_records).await;
+    verify_metadata_integrity(&data_dir, &verify_records)?;
+    stop_server(&mut restarted).await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "long-running crash-matrix suite; run in CI nightly or explicitly"]
 async fn crash_matrix_kill9_100_seed_integrity() {
@@ -385,5 +638,19 @@ async fn crash_matrix_kill9_100_seed_integrity() {
         run_seed(seed)
             .await
             .unwrap_or_else(|e| panic!("seed {} failed: {}", seed, e));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "jepsen-style kill-9 during active batch ingest; run in CI/nightly or explicitly"]
+async fn crash_matrix_kill9_random_ms_exact_ack_recovery() {
+    let seeds = std::env::var("VIBRATO_JEPSEN_CRASH_SEEDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(24);
+    for seed in 0..seeds {
+        run_jepsen_seed(seed)
+            .await
+            .unwrap_or_else(|e| panic!("jepsen seed {} failed: {}", seed, e));
     }
 }
