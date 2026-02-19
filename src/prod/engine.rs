@@ -145,7 +145,7 @@ pub struct ProductionState {
     pub ready: AtomicBool,
     pub recovery_report: RwLock<String>,
 
-    pub hot_vector_shards: Vec<ArcSwap<RwLock<HashMap<usize, Vec<f32>>>>>,
+    pub hot_vector_shards: Vec<ArcSwap<RwLock<HashMap<usize, Arc<Vec<f32>>>>>>,
     pub hot_indices: Vec<RwLock<HNSW>>,
     pub shard_mask: usize,
     pub metadata_cache: Arc<RwLock<HashMap<usize, VectorMetadata>>>,
@@ -360,7 +360,10 @@ impl ProductionState {
     pub fn insert_hot_vector(&self, vector_id: usize, vector: Vec<f32>, metadata: VectorMetadata) {
         let shard = vector_id & self.shard_mask;
         if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
-            shard_vectors.load().write().insert(vector_id, vector);
+            shard_vectors
+                .load()
+                .write()
+                .insert(vector_id, Arc::new(vector));
         }
         if let Some(index) = self.hot_indices.get(shard) {
             index.write().insert(vector_id);
@@ -442,7 +445,7 @@ impl ProductionState {
                 let guard = shard_vectors.load();
                 let mut vec_guard = guard.write();
                 for &(vid, vec, _) in items {
-                    vec_guard.insert(vid, vec.to_vec());
+                    vec_guard.insert(vid, Arc::new(vec.to_vec()));
                 }
             }
             if let Some(index) = self.hot_indices.get(*shard) {
@@ -1653,7 +1656,7 @@ impl ProductionState {
             let mut vectors = shard_vectors.write();
             for e in &pending {
                 if (e.vector_id & self.shard_mask) == shard_idx {
-                    vectors.insert(e.vector_id, e.vector.clone());
+                    vectors.insert(e.vector_id, Arc::new(e.vector.clone()));
                 }
             }
         }
@@ -2644,16 +2647,21 @@ fn audit_worker_loop(state: Arc<ProductionState>, rx: Receiver<AuditEvent>) {
 }
 
 fn make_hot_accessor(
-    hot_vector_shard: Arc<RwLock<HashMap<usize, Vec<f32>>>>,
+    hot_vector_shard: Arc<RwLock<HashMap<usize, Arc<Vec<f32>>>>>,
     dim: usize,
 ) -> impl Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static {
-    let zero_fallback = vec![0.0f32; dim];
+    let zero_fallback = Arc::new(vec![0.0f32; dim]);
     move |id, sink| {
-        let guard = hot_vector_shard.read();
-        if let Some(v) = guard.get(&id) {
-            sink(v);
+        // Important: do not hold the shard lock while executing `sink`.
+        // HNSW insert/search can invoke nested accessor callbacks.
+        let maybe_vec = {
+            let guard = hot_vector_shard.read();
+            guard.get(&id).cloned()
+        };
+        if let Some(v) = maybe_vec {
+            sink(v.as_slice());
         } else {
-            sink(&zero_fallback);
+            sink(zero_fallback.as_slice());
         }
     }
 }
