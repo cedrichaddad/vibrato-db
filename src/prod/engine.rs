@@ -137,8 +137,6 @@ pub struct ArchivePqSegment {
     pub num_subspaces: usize,
 }
 
-
-
 pub struct ProductionState {
     pub config: ProductionConfig,
     pub catalog: Arc<SqliteCatalog>,
@@ -421,10 +419,9 @@ impl ProductionState {
         }
 
         // 1. Bulk catalog write — single BEGIN...COMMIT
-        let wal_results = self.catalog.ingest_wal_batch(
-            &self.collection.id,
-            entries,
-        )?;
+        let wal_results = self
+            .catalog
+            .ingest_wal_batch(&self.collection.id, entries)?;
 
         // 2. Group by shard for efficient lock acquisition
         let mut by_shard: HashMap<usize, Vec<(usize, &[f32], &VectorMetadata)>> = HashMap::new();
@@ -439,8 +436,8 @@ impl ProductionState {
             }
         }
 
-        // 3. Insert into hot index shards — one lock acquisition per shard
-        for (shard, items) in &by_shard {
+        // 3. Insert into hot index shards in parallel — one lock acquisition per shard
+        by_shard.par_iter().for_each(|(shard, items)| {
             if let Some(shard_vectors) = self.hot_vector_shards.get(*shard) {
                 let guard = shard_vectors.load();
                 let mut vec_guard = guard.write();
@@ -454,7 +451,7 @@ impl ProductionState {
                     idx_guard.insert(vid);
                 }
             }
-        }
+        });
 
         // 4. Update metadata cache + filter index in one pass
         let created_count = by_shard.values().map(|v| v.len()).sum::<usize>();
@@ -1434,12 +1431,17 @@ impl ProductionState {
             // Sort by ID for deterministic output.
             let mut ids_raw: Vec<usize> = merged.keys().copied().collect();
             ids_raw.sort_unstable();
-            let vectors_raw: Vec<Vec<f32>> = ids_raw.iter().map(|id| merged.remove(id).unwrap()).collect();
+            let vectors_raw: Vec<Vec<f32>> = ids_raw
+                .iter()
+                .map(|id| merged.remove(id).unwrap())
+                .collect();
             drop(merged);
             // Use range-based metadata fetch: single SQL query per range.
             let range_start = *ids_raw.first().unwrap_or(&0);
             let range_end = *ids_raw.last().unwrap_or(&0);
-            let metadata_map = self.catalog.fetch_metadata_range(&self.collection.id, range_start, range_end)?;
+            let metadata_map =
+                self.catalog
+                    .fetch_metadata_range(&self.collection.id, range_start, range_end)?;
             let metadata_raw = ids_raw
                 .iter()
                 .map(|id| metadata_map.get(id).cloned().unwrap_or_default())
@@ -1680,10 +1682,10 @@ impl ProductionState {
         // By swapping the shards into the global ArcSwap, we ensure new ingests
         // go to the same place the new indices are reading from.
         for (i, shard) in new_shards.into_iter().enumerate() {
-             self.hot_vector_shards[i].store(shard);
+            self.hot_vector_shards[i].store(shard);
         }
         for (i, hnsw) in new_indices.into_iter().enumerate() {
-             *self.hot_indices[i].write() = hnsw;
+            *self.hot_indices[i].write() = hnsw;
         }
 
         Ok(())
@@ -2612,15 +2614,20 @@ fn audit_worker_loop(state: Arc<ProductionState>, rx: Receiver<AuditEvent>) {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 if !buffer.is_empty() {
                     if let Err(e) = state.catalog.audit_events_batch(&buffer) {
-                         tracing::error!("final audit batch failed: {}", e);
-                         state.metrics.audit_failures_total.fetch_add(buffer.len() as u64, AtomicOrdering::Relaxed);
+                        tracing::error!("final audit batch failed: {}", e);
+                        state
+                            .metrics
+                            .audit_failures_total
+                            .fetch_add(buffer.len() as u64, AtomicOrdering::Relaxed);
                     }
                 }
                 break;
             }
         }
 
-        if !buffer.is_empty() && (buffer.len() >= batch_size || last_flush.elapsed() >= batch_timeout) {
+        if !buffer.is_empty()
+            && (buffer.len() >= batch_size || last_flush.elapsed() >= batch_timeout)
+        {
             // Optimization: No retries. If the DB is locked for 30s, retrying for 20ms is useless.
             // Drop the batch to save the system.
             if let Err(e) = state.catalog.audit_events_batch(&buffer) {

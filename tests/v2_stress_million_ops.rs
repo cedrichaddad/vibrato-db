@@ -1,7 +1,7 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,10 +9,11 @@ use parking_lot::{Mutex, RwLock};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Semaphore};
 use tokio::time::sleep;
 
 const DIM: usize = 16;
@@ -20,7 +21,56 @@ const DEFAULT_TOTAL_OPS: usize = 1_000_000;
 const DEFAULT_CONCURRENCY: usize = 16;
 const DEFAULT_SEED: u64 = 42;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_BATCH_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_WRITE_FLUSH_PARALLELISM: usize = 4;
+const DEFAULT_WRITE_FLUSH_RETRIES: usize = 4;
+const DEFAULT_MAX_ELAPSED_SECS: u64 = 60;
 const QUERY_BANK_CAP: usize = 4096;
+const BATCH_SIZE: usize = 100;
+const VERIFY_SAMPLE_CAP: usize = 1024;
+const WARMUP_VECTORS: usize = 128;
+
+#[derive(Serialize, Clone)]
+struct IngestRequest {
+    vector: Vec<f32>,
+    metadata: serde_json::Value,
+    idempotency_key: Option<String>,
+}
+
+#[derive(Serialize)]
+struct IngestBatchRequest {
+    vectors: Vec<IngestRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IngestBatchResponseEnvelope {
+    data: IngestBatchResponseData,
+}
+
+#[derive(Debug, Deserialize)]
+struct IngestBatchResponseData {
+    results: Vec<IngestBatchResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IngestBatchResult {
+    id: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryResponseEnvelope {
+    data: QueryResponseData,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryResponseData {
+    results: Vec<QueryResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryResult {
+    id: usize,
+}
 
 fn reserve_local_port() -> Option<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
@@ -197,9 +247,7 @@ async fn start_ready_server_with_retry(
 struct Counters {
     read_ok: AtomicU64,
     write_ok: AtomicU64,
-    delete_attempted: AtomicU64,
-    delete_ok: AtomicU64,
-    delete_unsupported: AtomicU64,
+    write_batches_ok: AtomicU64,
     admin_skipped: AtomicU64,
     admin_timeout: AtomicU64,
     admin_ok: AtomicU64,
@@ -213,6 +261,146 @@ fn record_failure(first_error: &Mutex<Option<String>>, stop: &AtomicBool, msg: S
     stop.store(true, Ordering::SeqCst);
 }
 
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+async fn flush_write_buffer(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    buffer: &mut Vec<IngestRequest>,
+    write_flush_sem: &Arc<Semaphore>,
+    batch_timeout: Duration,
+    max_retries: usize,
+    query_bank: &Arc<RwLock<Vec<Vec<f32>>>>,
+    verification_samples: &Arc<Mutex<Vec<(usize, Vec<f32>)>>>,
+    max_seen_id: &Arc<AtomicUsize>,
+    counters: &Arc<Counters>,
+    rng: &mut StdRng,
+    worker_id: usize,
+    op_idx: usize,
+    seed: u64,
+) -> Result<(), String> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    let _permit = write_flush_sem
+        .acquire()
+        .await
+        .map_err(|_| "write flush semaphore closed".to_string())?;
+
+    let payload = IngestBatchRequest {
+        vectors: std::mem::take(buffer),
+    };
+    let sent = payload.vectors.len();
+    let mut parsed = None;
+    for attempt in 0..=max_retries {
+        let response = client
+            .post(format!("{}/v2/vectors/batch", base_url))
+            .bearer_auth(token)
+            .timeout(batch_timeout)
+            .json(&payload)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) if resp.status() == StatusCode::CREATED => {
+                let body: IngestBatchResponseEnvelope =
+                    resp.json().await.map_err(|e| {
+                        format!(
+                        "batch payload parse failed: {} worker={} op={} seed={} sent={} attempt={}",
+                        e, worker_id, op_idx, seed, sent, attempt + 1
+                    )
+                    })?;
+                parsed = Some(body);
+                break;
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                let retryable = is_retryable_status(status);
+                if retryable && attempt < max_retries {
+                    sleep(Duration::from_millis((attempt as u64 + 1) * 125)).await;
+                    continue;
+                }
+                return Err(format!(
+                    "batch write failed: status={} body={} worker={} op={} seed={} sent={} attempt={}",
+                    status,
+                    &body[..body.len().min(500)],
+                    worker_id,
+                    op_idx,
+                    seed,
+                    sent,
+                    attempt + 1
+                ));
+            }
+            Err(e) => {
+                if e.is_timeout() && attempt < max_retries {
+                    sleep(Duration::from_millis((attempt as u64 + 1) * 125)).await;
+                    continue;
+                }
+                return Err(format!(
+                    "batch write request error: {} worker={} op={} seed={} sent={} attempt={}",
+                    e,
+                    worker_id,
+                    op_idx,
+                    seed,
+                    sent,
+                    attempt + 1
+                ));
+            }
+        }
+    }
+
+    let parsed = parsed.ok_or_else(|| {
+        format!(
+            "batch write exhausted retries without response worker={} op={} seed={} sent={}",
+            worker_id, op_idx, seed, sent
+        )
+    })?;
+    if parsed.data.results.len() != sent {
+        return Err(format!(
+            "batch result length mismatch: sent={} got={} worker={} op={} seed={}",
+            sent,
+            parsed.data.results.len(),
+            worker_id,
+            op_idx,
+            seed
+        ));
+    }
+
+    {
+        let mut bank = query_bank.write();
+        let mut sample_pool = verification_samples.lock();
+        for (request, result) in payload.vectors.iter().zip(parsed.data.results.iter()) {
+            max_seen_id.fetch_max(result.id, Ordering::Relaxed);
+            if bank.len() < QUERY_BANK_CAP {
+                bank.push(request.vector.clone());
+            } else {
+                let slot = rng.gen_range(0..QUERY_BANK_CAP);
+                bank[slot] = request.vector.clone();
+            }
+            if sample_pool.len() < VERIFY_SAMPLE_CAP {
+                sample_pool.push((result.id, request.vector.clone()));
+            }
+        }
+    }
+
+    counters.write_ok.fetch_add(sent as u64, Ordering::Relaxed);
+    counters.write_batches_ok.fetch_add(1, Ordering::Relaxed);
+    *buffer = Vec::with_capacity(BATCH_SIZE);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "high-velocity stress harness; run explicitly with --ignored"]
 async fn stress_test_million_ops_mixed() {
@@ -224,6 +412,22 @@ async fn stress_test_million_ops_mixed() {
         DEFAULT_HTTP_TIMEOUT_SECS,
     )
     .max(1);
+    let batch_timeout_secs = env_u64(
+        "VIBRATO_STRESS_BATCH_TIMEOUT_SECS",
+        DEFAULT_BATCH_TIMEOUT_SECS,
+    )
+    .max(http_timeout_secs);
+    let write_flush_parallelism = env_usize(
+        "VIBRATO_STRESS_WRITE_FLUSH_PARALLELISM",
+        DEFAULT_WRITE_FLUSH_PARALLELISM,
+    )
+    .max(1);
+    let write_flush_retries = env_usize(
+        "VIBRATO_STRESS_WRITE_FLUSH_RETRIES",
+        DEFAULT_WRITE_FLUSH_RETRIES,
+    );
+    let enable_admin_chaos = env_usize("VIBRATO_STRESS_ENABLE_ADMIN_CHAOS", 0) > 0;
+    let max_elapsed_secs = env_u64("VIBRATO_STRESS_MAX_ELAPSED_SECS", DEFAULT_MAX_ELAPSED_SECS);
     if cfg!(debug_assertions) {
         eprintln!(
             "warning: stress test running in debug profile; use --release for realistic contention/latency behavior"
@@ -257,7 +461,7 @@ async fn stress_test_million_ops_mixed() {
 
     // Seed initial vectors so read pressure starts immediately.
     let query_bank = Arc::new(RwLock::new(Vec::<Vec<f32>>::new()));
-    for i in 0..128usize {
+    for i in 0..WARMUP_VECTORS {
         let vec = normalized_vector(seed ^ 0xA5A5_5A5A, 0, i);
         let body = serde_json::json!({
             "vector": vec.clone(),
@@ -285,9 +489,10 @@ async fn stress_test_million_ops_mixed() {
     let first_error = Arc::new(Mutex::new(None::<String>));
     let stop = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(concurrency));
-    let delete_support = Arc::new(AtomicI8::new(-1)); // -1 unknown, 0 unsupported, 1 supported
+    let write_flush_sem = Arc::new(Semaphore::new(write_flush_parallelism));
     let admin_in_flight = Arc::new(AtomicBool::new(false));
-    let max_seen_id = Arc::new(AtomicUsize::new(127));
+    let max_seen_id = Arc::new(AtomicUsize::new(WARMUP_VECTORS.saturating_sub(1)));
+    let verification_samples = Arc::new(Mutex::new(Vec::<(usize, Vec<f32>)>::new()));
     let started = Instant::now();
 
     let mut tasks = Vec::with_capacity(concurrency);
@@ -299,19 +504,25 @@ async fn stress_test_million_ops_mixed() {
         let first_error = first_error.clone();
         let stop = stop.clone();
         let barrier = barrier.clone();
+        let write_flush_sem = write_flush_sem.clone();
         let query_bank = query_bank.clone();
-        let delete_support = delete_support.clone();
         let admin_in_flight = admin_in_flight.clone();
         let max_seen_id = max_seen_id.clone();
+        let verification_samples = verification_samples.clone();
+        let batch_timeout = Duration::from_secs(batch_timeout_secs);
+        let write_flush_retries = write_flush_retries;
+        let write_threshold = if enable_admin_chaos { 99 } else { 100 };
 
         let worker_ops =
             total_ops / concurrency + usize::from(worker_id < (total_ops % concurrency));
 
         tasks.push(tokio::spawn(async move {
             let mut rng = StdRng::seed_from_u64(seed ^ ((worker_id as u64) << 32));
+            let mut buffered_writes = Vec::with_capacity(BATCH_SIZE);
             barrier.wait().await;
 
-            for local_idx in 0..worker_ops {
+            let mut local_idx = 0usize;
+            while local_idx < worker_ops {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -367,180 +578,78 @@ async fn stress_test_million_ops_mixed() {
                             );
                         }
                     }
-                } else if op_roll < 90 {
-                    // Write
+                    local_idx += 1;
+                } else if op_roll < write_threshold {
+                    // Write path (buffered and flushed to /v2/vectors/batch).
                     let vec = normalized_vector(seed, worker_id, local_idx + 1_000_000);
-                    let idempotency_key = format!("stress-{seed}-{worker_id}-{local_idx}");
-                    let body = serde_json::json!({
-                        "vector": vec,
-                        "metadata": {
+                    buffered_writes.push(IngestRequest {
+                        vector: vec,
+                        metadata: serde_json::json!({
                             "source_file": format!("stress_w{worker_id}_o{local_idx}.wav"),
                             "start_time_ms": local_idx as u32,
                             "duration_ms": 64,
                             "bpm": 100.0 + ((local_idx % 64) as f32),
                             "tags": ["stress", format!("worker-{worker_id}")]
-                        },
-                        "idempotency_key": idempotency_key
+                        }),
+                        idempotency_key: Some(format!("stress-{seed}-{worker_id}-{local_idx}")),
                     });
-                    match client
-                        .post(format!("{}/v2/vectors", base_url))
-                        .bearer_auth(&token)
-                        .json(&body)
-                        .send()
-                        .await
-                    {
-                        Ok(resp) if resp.status() == StatusCode::CREATED => {
-                            let payload: serde_json::Value = match resp.json().await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    record_failure(
-                                        &first_error,
-                                        &stop,
-                                        format!(
-                                            "write payload parse failed: {} worker={} op={} seed={}",
-                                            e, worker_id, local_idx, seed
-                                        ),
-                                    );
-                                    continue;
-                                }
-                            };
-                            if let Some(id) = payload["data"]["id"].as_u64() {
-                                max_seen_id.fetch_max(id as usize, Ordering::Relaxed);
-                            }
-                            counters.write_ok.fetch_add(1, Ordering::Relaxed);
-                            let mut bank = query_bank.write();
-                            if bank.len() < QUERY_BANK_CAP {
-                                bank.push(vec);
-                            } else {
-                                let slot = rng.gen_range(0..QUERY_BANK_CAP);
-                                bank[slot] = vec;
-                            }
-                        }
-                        Ok(resp) => {
-                            record_failure(
-                                &first_error,
-                                &stop,
-                                format!(
-                                    "write failed: status={} worker={} op={} seed={}",
-                                    resp.status(),
-                                    worker_id,
-                                    local_idx,
-                                    seed
-                                ),
-                            );
-                        }
-                        Err(e) => {
-                            record_failure(
-                                &first_error,
-                                &stop,
-                                format!(
-                                    "write request error: {} worker={} op={} seed={}",
-                                    e, worker_id, local_idx, seed
-                                ),
-                            );
-                        }
-                    }
-                } else if op_roll < 99 {
-                    // Delete if supported, else fallback to read to keep pressure high.
-                    counters.delete_attempted.fetch_add(1, Ordering::Relaxed);
-                    if delete_support.load(Ordering::Relaxed) == 0 {
-                        let fallback = normalized_vector(seed ^ 0xDEAD_BEEF, worker_id, local_idx);
-                        let body = serde_json::json!({
-                            "vector": fallback,
-                            "k": 5,
-                            "ef": 32,
-                            "include_metadata": false
-                        });
-                        match client
-                            .post(format!("{}/v2/query", base_url))
-                            .bearer_auth(&token)
-                            .json(&body)
-                            .send()
-                            .await
-                        {
-                            Ok(resp) if resp.status() == StatusCode::OK => {
-                                counters.read_ok.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Ok(resp) => {
-                                record_failure(
-                                    &first_error,
-                                    &stop,
-                                    format!(
-                                        "delete-fallback-read failed: status={} worker={} op={} seed={}",
-                                        resp.status(),
-                                        worker_id,
-                                        local_idx,
-                                        seed
-                                    ),
-                                );
-                            }
-                            Err(e) => {
-                                record_failure(
-                                    &first_error,
-                                    &stop,
-                                    format!(
-                                        "delete-fallback-read request error: {} worker={} op={} seed={}",
-                                        e, worker_id, local_idx, seed
-                                    ),
-                                );
-                            }
-                        }
-                        continue;
-                    }
+                    local_idx += 1;
 
-                    let target = rng.gen_range(0..=max_seen_id.load(Ordering::Relaxed).max(1));
-                    match client
-                        .delete(format!("{}/v2/vectors/{}", base_url, target))
-                        .bearer_auth(&token)
-                        .send()
+                    if buffered_writes.len() >= BATCH_SIZE {
+                        if let Err(msg) = flush_write_buffer(
+                            &client,
+                            &base_url,
+                            &token,
+                            &mut buffered_writes,
+                            &write_flush_sem,
+                            batch_timeout,
+                            write_flush_retries,
+                            &query_bank,
+                            &verification_samples,
+                            &max_seen_id,
+                            &counters,
+                            &mut rng,
+                            worker_id,
+                            local_idx,
+                            seed,
+                        )
                         .await
-                    {
-                        Ok(resp)
-                            if resp.status() == StatusCode::NOT_FOUND
-                                || resp.status() == StatusCode::METHOD_NOT_ALLOWED =>
                         {
-                            delete_support.store(0, Ordering::SeqCst);
-                            counters.delete_unsupported.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(resp)
-                            if resp.status() == StatusCode::OK
-                                || resp.status() == StatusCode::NO_CONTENT
-                                || resp.status() == StatusCode::ACCEPTED =>
-                        {
-                            delete_support.store(1, Ordering::SeqCst);
-                            counters.delete_ok.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(resp) => {
-                            record_failure(
-                                &first_error,
-                                &stop,
-                                format!(
-                                    "delete failed: status={} worker={} op={} seed={}",
-                                    resp.status(),
-                                    worker_id,
-                                    local_idx,
-                                    seed
-                                ),
-                            );
-                        }
-                        Err(e) => {
-                            record_failure(
-                                &first_error,
-                                &stop,
-                                format!(
-                                    "delete request error: {} worker={} op={} seed={}",
-                                    e, worker_id, local_idx, seed
-                                ),
-                            );
+                            record_failure(&first_error, &stop, msg);
+                            break;
                         }
                     }
                 } else {
                     // Admin chaos path.
+                    if let Err(msg) = flush_write_buffer(
+                        &client,
+                        &base_url,
+                        &token,
+                        &mut buffered_writes,
+                        &write_flush_sem,
+                        batch_timeout,
+                        write_flush_retries,
+                        &query_bank,
+                        &verification_samples,
+                        &max_seen_id,
+                        &counters,
+                        &mut rng,
+                        worker_id,
+                        local_idx,
+                        seed,
+                    )
+                    .await
+                    {
+                        record_failure(&first_error, &stop, msg);
+                        break;
+                    }
+
                     if admin_in_flight
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                         .is_err()
                     {
                         counters.admin_skipped.fetch_add(1, Ordering::Relaxed);
+                        local_idx += 1;
                         continue;
                     }
 
@@ -591,6 +700,34 @@ async fn stress_test_million_ops_mixed() {
                             );
                         }
                     }
+                    local_idx += 1;
+                }
+            }
+
+            if !stop.load(Ordering::Relaxed)
+                && !buffered_writes.is_empty()
+                && first_error.lock().is_none()
+            {
+                if let Err(msg) = flush_write_buffer(
+                    &client,
+                    &base_url,
+                    &token,
+                    &mut buffered_writes,
+                    &write_flush_sem,
+                    batch_timeout,
+                    write_flush_retries,
+                    &query_bank,
+                    &verification_samples,
+                    &max_seen_id,
+                    &counters,
+                    &mut rng,
+                    worker_id,
+                    local_idx,
+                    seed,
+                )
+                .await
+                {
+                    record_failure(&first_error, &stop, msg);
                 }
             }
         }));
@@ -646,38 +783,112 @@ async fn stress_test_million_ops_mixed() {
     let total_vectors = payload["data"]["total_vectors"].as_u64().unwrap_or(0);
 
     let writes = counters.write_ok.load(Ordering::Relaxed);
-    let deletes = counters.delete_ok.load(Ordering::Relaxed);
+    let write_batches = counters.write_batches_ok.load(Ordering::Relaxed);
     let admin_ok = counters.admin_ok.load(Ordering::Relaxed);
     let admin_timeout = counters.admin_timeout.load(Ordering::Relaxed);
-    let expected_min = (128_u64 + writes).saturating_sub(deletes);
+    let expected_total = WARMUP_VECTORS as u64 + writes;
     assert!(
-        total_vectors >= expected_min,
-        "vector count invariant failed: total_vectors={} expected_min={} writes={} deletes={} seed={} elapsed={:?}",
+        total_vectors == expected_total,
+        "vector count invariant failed: total_vectors={} expected_total={} writes={} seed={} elapsed={:?}",
         total_vectors,
-        expected_min,
+        expected_total,
         writes,
-        deletes,
         seed,
         started.elapsed()
     );
-    assert!(
-        admin_ok > 0 || admin_timeout > 0,
-        "admin chaos path did not execute (ok={}, timeout={})",
-        admin_ok,
-        admin_timeout
+    let max_observed = max_seen_id.load(Ordering::Relaxed) as u64;
+    assert_eq!(
+        max_observed + 1,
+        expected_total,
+        "max id invariant failed: max_seen_id={} expected_total={} writes={} seed={}",
+        max_observed,
+        expected_total,
+        writes,
+        seed
     );
+    if enable_admin_chaos {
+        assert!(
+            admin_ok > 0 || admin_timeout > 0,
+            "admin chaos path did not execute (ok={}, timeout={})",
+            admin_ok,
+            admin_timeout
+        );
+    }
+
+    let samples = verification_samples.lock().clone();
+    let verify_count = if writes > 0 {
+        samples.len().min(200)
+    } else {
+        0
+    };
+    if writes > 0 {
+        assert!(
+            verify_count > 0,
+            "no verification samples were captured from batch writes"
+        );
+        for (idx, (expected_id, vector)) in samples.iter().take(verify_count).enumerate() {
+            let body = serde_json::json!({
+                "vector": vector,
+                "k": 20,
+                "ef": 256,
+                "include_metadata": false
+            });
+            let resp = client
+                .post(format!("{}/v2/query", base_url))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+                .expect("verification query request");
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "verification query status failed for sample={} expected_id={}",
+                idx,
+                expected_id
+            );
+            let parsed: QueryResponseEnvelope =
+                resp.json().await.expect("verification query payload");
+            let found = parsed.data.results.iter().any(|r| r.id == *expected_id);
+            assert!(
+                found,
+                "verification query missing expected id: sample={} expected_id={} top_ids={:?}",
+                idx,
+                expected_id,
+                parsed
+                    .data
+                    .results
+                    .iter()
+                    .take(5)
+                    .map(|r| r.id)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    let elapsed = started.elapsed();
+    if !cfg!(debug_assertions) {
+        assert!(
+            elapsed <= Duration::from_secs(max_elapsed_secs),
+            "throughput target missed: elapsed={:?} max_elapsed_secs={} total_ops={} concurrency={}",
+            elapsed,
+            max_elapsed_secs,
+            total_ops,
+            concurrency
+        );
+    }
 
     eprintln!(
-        "stress summary seed={} total_ops={} concurrency={} elapsed={:?} reads={} writes={} delete_attempted={} delete_ok={} delete_unsupported={} admin_ok={} admin_timeout={} admin_skipped={}",
+        "stress summary seed={} total_ops={} concurrency={} elapsed={:?} reads={} writes={} write_batches={} verify_samples={} admin_enabled={} admin_ok={} admin_timeout={} admin_skipped={}",
         seed,
         total_ops,
         concurrency,
-        started.elapsed(),
+        elapsed,
         counters.read_ok.load(Ordering::Relaxed),
         writes,
-        counters.delete_attempted.load(Ordering::Relaxed),
-        deletes,
-        counters.delete_unsupported.load(Ordering::Relaxed),
+        write_batches,
+        verify_count,
+        enable_admin_chaos,
         admin_ok,
         admin_timeout,
         counters.admin_skipped.load(Ordering::Relaxed),

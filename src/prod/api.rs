@@ -125,7 +125,14 @@ async fn v2_ingest_batch(
                 .metrics
                 .auth_failures_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return auth_error_response(&state, &request_id, "/v2/vectors/batch", "ingest_batch", started, e);
+            return auth_error_response(
+                &state,
+                &request_id,
+                "/v2/vectors/batch",
+                "ingest_batch",
+                started,
+                e,
+            );
         }
     };
 
@@ -582,7 +589,9 @@ async fn v2_admin_stats(State(state): State<Arc<ProductionState>>, headers: Head
                 Err(e) => Err(anyhow::anyhow!("stats join error: {}", e)),
             };
             match result {
-                Ok(stats) => json_response(StatusCode::OK, &request_id, &ApiResponse { data: stats }),
+                Ok(stats) => {
+                    json_response(StatusCode::OK, &request_id, &ApiResponse { data: stats })
+                }
                 Err(e) => error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &request_id,
@@ -591,7 +600,7 @@ async fn v2_admin_stats(State(state): State<Arc<ProductionState>>, headers: Head
                     None,
                 ),
             }
-        },
+        }
         Err(_) => error_response(
             StatusCode::UNAUTHORIZED,
             &request_id,

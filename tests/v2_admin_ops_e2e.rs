@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 use tempfile::tempdir;
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
@@ -43,7 +44,7 @@ async fn start_server(
             "false"
         })
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     cmd.spawn()
 }
 
@@ -66,6 +67,37 @@ async fn wait_for_ready(base_url: &str, token: &str) -> Result<(), String> {
 async fn stop_server(child: &mut Child) {
     let _ = child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+}
+
+async fn wait_for_unauthorized_with_child(child: &mut Child, base_url: &str) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let live_url = format!("{}/v2/health/live", base_url);
+
+    for _ in 0..200 {
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut stderr_text = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut stderr_text).await;
+            }
+            return Err(format!(
+                "server exited before live auth check: status={} url={} stderr={}",
+                status,
+                live_url,
+                stderr_text.trim()
+            ));
+        }
+        if let Ok(resp) = client.get(&live_url).send().await {
+            if resp.status() == StatusCode::UNAUTHORIZED {
+                return Ok(());
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    Err(format!(
+        "server did not return unauthorized at {} within timeout",
+        live_url
+    ))
 }
 
 fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
@@ -118,19 +150,9 @@ async fn test_ops_health_auth_and_replay_to_lsn() {
         }
     };
 
-    let mut unauth_status = None;
-    for _ in 0..60 {
-        if let Ok(resp) = client
-            .get(format!("{}/v2/health/live", base_url))
-            .send()
-            .await
-        {
-            unauth_status = Some(resp.status());
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(unauth_status, Some(StatusCode::UNAUTHORIZED));
+    wait_for_unauthorized_with_child(&mut server, &base_url)
+        .await
+        .expect("live endpoint should enforce auth");
 
     wait_for_ready(&base_url, &token)
         .await
@@ -160,6 +182,7 @@ async fn test_ops_health_auth_and_replay_to_lsn() {
 
     stop_server(&mut server).await;
 
+    let target_lsn = 10u64;
     let replay_out = std::process::Command::new(env!("CARGO_BIN_EXE_vibrato-db"))
         .arg("replay-to-lsn")
         .arg("--data-dir")
@@ -167,7 +190,7 @@ async fn test_ops_health_auth_and_replay_to_lsn() {
         .arg("--collection")
         .arg("default")
         .arg("--target-lsn")
-        .arg("10")
+        .arg(target_lsn.to_string())
         .output()
         .expect("run replay-to-lsn");
     assert!(
@@ -194,7 +217,8 @@ async fn test_ops_health_auth_and_replay_to_lsn() {
     let total_vectors = stats["data"]["total_vectors"]
         .as_u64()
         .expect("total_vectors");
-    assert_eq!(total_vectors, 11);
+    // WAL LSN is AUTOINCREMENT starting at 1, so replaying to N keeps N rows.
+    assert_eq!(total_vectors, target_lsn);
 
     stop_server(&mut restarted).await;
 }
