@@ -33,6 +33,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Crash matrix full
         env:
@@ -46,6 +48,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Recall gate
         run: cargo test -p vibrato-core hnsw::index::tests::test_recall -- --exact
@@ -61,6 +65,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Mixed workload soak harness (manual)
         env:

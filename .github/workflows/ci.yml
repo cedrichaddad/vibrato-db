@@ -14,6 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Workspace tests
         run: cargo test --workspace --exclude vibrato-vst
@@ -24,6 +26,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Identify tests
         run: |
@@ -39,6 +43,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Crash matrix subset (PR)
         env:

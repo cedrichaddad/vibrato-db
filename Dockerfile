@@ -1,4 +1,4 @@
-FROM rust:1.84-bookworm AS builder
+FROM rust:1.93-bookworm AS builder
 
 WORKDIR /app
 
@@ -6,7 +6,7 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends pkg-config libsqlite3-dev ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY crates ./crates
 COPY benches ./benches
