@@ -12,12 +12,12 @@ Unlike wrapper libraries, Vibrato-DB is a standalone database server that handle
 
 Benchmarks run on a single-thread consumer CPU (Apple M2) against 128-dimensional normalized vectors.
 
-| Metric | Phase 0 Baseline | **Phase 4 (Current)** | Improvement |
-|--------|------------------|-----------------------|-------------|
-| Query Latency (P99, ef=20) | 147 µs | **65 µs** | **2.26x** |
-| Query Latency (P99, ef=50) | 271 µs | **124 µs** | **2.18x** |
-| Throughput | 1.8 Gelem/s | **4.4 Gelem/s** | **2.44x** |
-| Recall@10 | 99.0% | 99.0% | No regression |
+| Metric | Phase 0 Baseline | Phase 4 | **Current** | Improvement (vs Phase 0) |
+|--------|------------------|---------|-------------|--------------------------|
+| Query Latency (P99, ef=20) | 147 µs | 65 µs | **25 µs** | **5.8x** |
+| Query Latency (P99, ef=50) | 271 µs | 124 µs | **51 µs** | **5.3x** |
+| Throughput | 1.8 Gelem/s | 4.4 Gelem/s | **7.6 Gelem/s** | **4.2x** |
+| Recall@10 | 99.0% | 99.0% | **99.0%** | No regression |
 
 ### Detailed Benchmarks
 
@@ -25,22 +25,22 @@ Benchmarks run on a single-thread consumer CPU (Apple M2) against 128-dimensiona
 
 | Operation | Latency | Throughput |
 |-----------|---------|------------|
-| Dot Product | 29 ns | 4.4 Gelem/s |
-| L2 Distance | 62 ns | 2.1 Gelem/s |
+| Dot Product | 17 ns | 7.6 Gelem/s |
+| L2 Distance | 17 ns | 7.4 Gelem/s |
 
-**HNSW Search Latency (5000 vectors, k=10)**
+**HNSW Search Latency (P99, 5000 vectors, k=10)**
 
-| ef Parameter | Phase 0 | **Phase 4** |
-|--------------|---------|-------------|
-| ef=20 | 147 µs | **65 µs** |
-| ef=50 | 271 µs | **124 µs** |
-| ef=100 | 369 µs | **203 µs** |
+| ef Parameter | Phase 0 | Phase 4 | **Current** |
+|--------------|---------|---------|-------------|
+| ef=20 | 147 µs | 65 µs | **25 µs** |
+| ef=50 | 271 µs | 124 µs | **51 µs** |
+| ef=100 | 369 µs | 203 µs | **91 µs** |
 
 ---
 
 ## Technical Architecture
 
-Vibrato-DB is built on three core pillars of systems engineering:
+Vibrato-DB is built on core pillars of systems engineering, evolved into a robust `v2` distributed system:
 
 ### 1. Zero-Copy Storage Engine (mmap)
 
@@ -49,6 +49,7 @@ Vectors are not loaded into the heap. The `.vdb` binary format is designed to be
 - **Benefit**: Instant startup time regardless of dataset size.
 - **Safety**: Uses `bytemuck` for alignment-checked casting from raw bytes to `&[f32]` slices.
 - **OS Optimization**: Relies on the kernel's Page Cache to handle hot/cold data swapping.
+- **Madvise Tuning**: Implements memory access pattern hints (AB tested in `v2`) to ensure page cache efficiency under random read load.
 
 ### 2. Lock-Free HNSW Indexing
 
@@ -56,7 +57,6 @@ Implements a multi-layered graph traversal algorithm for Approximate Nearest Nei
 
 - **Diversity Heuristic**: Neighbor selection logic actively prunes redundant connections.
 - **BitSet Visited Pool**: Uses thread-local `FixedBitSet` pools to eliminate hashing overhead.
-- **Persistence**: Vectors, metadata, and graph are persisted in one `.vdb` container.
 
 ### 3. SIMD-Accelerated Math
 
@@ -64,6 +64,23 @@ Distance kernels are strictly optimized for AVX2 (x86_64) and NEON (aarch64).
 
 - **Aligned Loads**: Exploits 32-byte alignment for AVX2 `vmovaps` when data layout permits.
 - **Runtime Dispatch**: Automatically selects the fastest kernel supported by the CPU.
+
+### 4. V2 Control Plane & Storage Tiers
+
+The `v2` architecture introduces an immutable segment lifecycle and distributed-ready semantics.
+
+- **SQLite Catalog (`catalog.rs`)**: Centralizes metadata, segmented collections, API key authentication, and role-based access control (RBAC).
+- **WAL & Multi-Version Concurrency (`recovery.rs`)**: Write-Ahead Logs provide durability against crashes by replaying uncommitted ingestion events.
+- **Hierarchical Indexing**: Divides storage into a Hot/Active tier (mmap `.vdb`) and an Archive tier (`pq.rs`).
+- **Product Quantization (PQ)**: L2 segments are PQ-encoded for highly memory-efficient background archive searching.
+- **Roaring Bitmaps (`filter.rs`)**: Accelerates pre-filtering attributes before executing dense vector similarity scans.
+
+### 5. Multi-Modal Ingestion & Python FFI
+
+Vibrato-DB natively processes high-level audio and neural data.
+
+- **Onboard Neural Pipeline (`crates/vibrato-neural`)**: Embeds ONNX runtime to do on-the-fly audio feature extraction (Spectrograms, Windowing) within the DB.
+- **Native Python Bindings (`crates/vibrato-ffi`)**: High-performance bindings via PyO3 that bypass HTTP serialization overhead entirely, allowing vibrato clusters to be embedded in python workloads with zero network latency.
 
 ---
 
