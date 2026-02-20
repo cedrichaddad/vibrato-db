@@ -4,10 +4,13 @@ use std::fmt::Write as FmtWrite;
 use std::os::raw::{c_char, c_int, c_uchar, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use arc_swap::ArcSwap;
 use rand::RngCore;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -573,6 +576,16 @@ unsafe fn column_text_bytes<'a>(stmt: *mut Sqlite3Stmt, idx: c_int) -> &'a [u8] 
     }
 }
 
+unsafe fn column_blob_bytes<'a>(stmt: *mut Sqlite3Stmt, idx: c_int) -> &'a [u8] {
+    let ptr = sqlite3_column_blob(stmt, idx);
+    let len = sqlite3_column_bytes(stmt, idx).max(0) as usize;
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr as *const u8, len)
+    }
+}
+
 unsafe fn column_text_string(stmt: *mut Sqlite3Stmt, idx: c_int) -> String {
     String::from_utf8_lossy(column_text_bytes(stmt, idx)).to_string()
 }
@@ -739,6 +752,9 @@ pub struct SqliteCatalog {
     next_reader: AtomicUsize,
     read_timeout_total: AtomicU64,
     quarantine_evictions_total: AtomicU64,
+    tag_registry_forward: RwLock<HashMap<String, u32>>,
+    tag_registry_reverse: ArcSwap<Vec<Arc<str>>>,
+    next_tag_id: AtomicU32,
 }
 
 impl SqliteCatalog {
@@ -762,8 +778,12 @@ impl SqliteCatalog {
             next_reader: AtomicUsize::new(0),
             read_timeout_total: AtomicU64::new(0),
             quarantine_evictions_total: AtomicU64::new(0),
+            tag_registry_forward: RwLock::new(HashMap::new()),
+            tag_registry_reverse: ArcSwap::from_pointee(Vec::new()),
+            next_tag_id: AtomicU32::new(1),
         };
         catalog.apply_migrations()?;
+        catalog.load_tag_registry_cache()?;
         catalog.init_readers(3)?;
         Ok(catalog)
     }
@@ -856,6 +876,118 @@ impl SqliteCatalog {
         Ok(())
     }
 
+    fn tag_cache_key(collection_id: &str, tag: &str) -> String {
+        format!("{}\u{1f}{}", collection_id, tag)
+    }
+
+    fn load_tag_registry_cache(&self) -> Result<()> {
+        let rows = self.query_rows::<TagRegistryRow>(
+            "SELECT collection_id, tag_id, tag_text FROM tag_registry ORDER BY collection_id ASC, tag_id ASC;",
+        )?;
+
+        let mut forward = HashMap::with_capacity(rows.len());
+        let mut reverse = Vec::with_capacity(rows.len());
+        let mut max_tag_id = 0u32;
+        for row in rows {
+            max_tag_id = max_tag_id.max(row.tag_id);
+            let key = Self::tag_cache_key(&row.collection_id, &row.tag_text);
+            forward.insert(key, row.tag_id);
+            reverse.push(Arc::<str>::from(row.tag_text));
+        }
+        *self
+            .tag_registry_forward
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = forward;
+        self.tag_registry_reverse.store(Arc::new(reverse));
+        self.next_tag_id
+            .store(max_tag_id.saturating_add(1), AtomicOrdering::Relaxed);
+        Ok(())
+    }
+
+    fn resolve_tag_ids_for_batch(
+        &self,
+        collection_id: &str,
+        unique_tags: &[String],
+    ) -> (HashMap<String, u32>, Vec<(u32, String)>) {
+        let mut resolved = HashMap::with_capacity(unique_tags.len());
+        let mut new_rows = Vec::new();
+        let guard = self
+            .tag_registry_forward
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        for tag in unique_tags {
+            let key = Self::tag_cache_key(collection_id, tag);
+            if let Some(id) = guard.get(&key).copied() {
+                resolved.insert(tag.clone(), id);
+                continue;
+            }
+        }
+        drop(guard);
+
+        for tag in unique_tags {
+            if resolved.contains_key(tag) {
+                continue;
+            }
+            let allocated = self.next_tag_id.fetch_add(1, AtomicOrdering::Relaxed);
+            resolved.insert(tag.clone(), allocated);
+            new_rows.push((allocated, tag.clone()));
+        }
+
+        (resolved, new_rows)
+    }
+
+    fn commit_tag_rows_to_cache(&self, collection_id: &str, new_rows: &[(u32, String)]) {
+        if new_rows.is_empty() {
+            return;
+        }
+
+        let mut max_seen = 0u32;
+        let mut forward = self
+            .tag_registry_forward
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut reverse_delta: Vec<Arc<str>> = Vec::new();
+        for (tag_id, tag_text) in new_rows {
+            max_seen = max_seen.max(*tag_id);
+            let key = Self::tag_cache_key(collection_id, tag_text);
+            if forward.contains_key(&key) {
+                continue;
+            }
+            forward.insert(key, *tag_id);
+            reverse_delta.push(Arc::<str>::from(tag_text.as_str()));
+        }
+        drop(forward);
+
+        if !reverse_delta.is_empty() {
+            let mut current = self.tag_registry_reverse.load_full().as_ref().clone();
+            current.extend(reverse_delta);
+            self.tag_registry_reverse.store(Arc::new(current));
+        }
+
+        if max_seen > 0 {
+            let desired = max_seen.saturating_add(1);
+            loop {
+                let current = self.next_tag_id.load(AtomicOrdering::Relaxed);
+                if current >= desired {
+                    break;
+                }
+                if self
+                    .next_tag_id
+                    .compare_exchange(
+                        current,
+                        desired,
+                        AtomicOrdering::Relaxed,
+                        AtomicOrdering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn read_timeout_total(&self) -> u64 {
         self.read_timeout_total.load(AtomicOrdering::Relaxed)
     }
@@ -875,7 +1007,7 @@ impl SqliteCatalog {
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, checksum TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS collections (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, dim INTEGER NOT NULL, created_at INTEGER NOT NULL)",
             "CREATE TABLE IF NOT EXISTS segments (id TEXT PRIMARY KEY, collection_id TEXT NOT NULL, level INTEGER NOT NULL, path TEXT NOT NULL UNIQUE, row_count INTEGER NOT NULL, vector_id_start INTEGER NOT NULL, vector_id_end INTEGER NOT NULL, created_lsn INTEGER NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS wal_entries (lsn INTEGER PRIMARY KEY AUTOINCREMENT, collection_id TEXT NOT NULL, vector_id INTEGER NOT NULL, vector_json TEXT NOT NULL, metadata_json TEXT NOT NULL, idempotency_key TEXT, checkpointed_at INTEGER, created_at INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS wal_entries (lsn INTEGER PRIMARY KEY AUTOINCREMENT, collection_id TEXT NOT NULL, vector_id INTEGER NOT NULL, vector_json TEXT NOT NULL, metadata_json TEXT NOT NULL, schema_version INTEGER NOT NULL DEFAULT 2, vector_blob BLOB, metadata_blob BLOB, idempotency_key TEXT, checkpointed_at INTEGER, created_at INTEGER NOT NULL)",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_idempotency ON wal_entries(collection_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_vector_id ON wal_entries(collection_id, vector_id)",
             "CREATE INDEX IF NOT EXISTS idx_wal_pending_by_collection_lsn ON wal_entries(collection_id, checkpointed_at, lsn)",
@@ -884,6 +1016,8 @@ impl SqliteCatalog {
             "CREATE TABLE IF NOT EXISTS vector_id_counters (collection_id TEXT PRIMARY KEY, next_id INTEGER NOT NULL)",
             "CREATE TABLE IF NOT EXISTS tag_ids (collection_id TEXT NOT NULL, id INTEGER NOT NULL, tag TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(collection_id, id), UNIQUE(collection_id, tag))",
             "CREATE INDEX IF NOT EXISTS idx_tag_ids_collection_tag ON tag_ids(collection_id, tag)",
+            "CREATE TABLE IF NOT EXISTS tag_registry (collection_id TEXT NOT NULL, tag_id INTEGER NOT NULL, tag_text TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(collection_id, tag_id), UNIQUE(collection_id, tag_text))",
+            "CREATE INDEX IF NOT EXISTS idx_tag_registry_lookup ON tag_registry(collection_id, tag_text)",
             "CREATE TABLE IF NOT EXISTS vector_tags (collection_id TEXT NOT NULL, vector_id INTEGER NOT NULL, tag_id INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(collection_id, vector_id, tag_id))",
             "CREATE INDEX IF NOT EXISTS idx_vector_tags_collection_vector ON vector_tags(collection_id, vector_id)",
             "CREATE INDEX IF NOT EXISTS idx_vector_tags_collection_tag ON vector_tags(collection_id, tag_id)",
@@ -898,6 +1032,13 @@ impl SqliteCatalog {
             self.exec(sql)?;
         }
         self.migrate_vector_metadata_pk()?;
+        self.ensure_column(
+            "wal_entries",
+            "schema_version",
+            "INTEGER NOT NULL DEFAULT 2",
+        )?;
+        self.ensure_column("wal_entries", "vector_blob", "BLOB")?;
+        self.ensure_column("wal_entries", "metadata_blob", "BLOB")?;
         self.ensure_column("orphan_files", "size_bytes", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("orphan_files", "deleted_reason", "TEXT")?;
         self.ensure_column("api_keys", "hash_version", "INTEGER NOT NULL DEFAULT 1")?;
@@ -906,6 +1047,11 @@ impl SqliteCatalog {
              SELECT collection_id, COALESCE(MAX(vector_id) + 1, 0)
              FROM vector_metadata
              GROUP BY collection_id;",
+        )?;
+        self.exec(
+            "INSERT OR IGNORE INTO tag_registry(collection_id, tag_id, tag_text, created_at)
+             SELECT collection_id, id, tag, COALESCE(created_at, 0)
+             FROM tag_ids;",
         )?;
         self.backfill_vector_tags_if_needed()?;
         self.exec(&format!(
@@ -1157,12 +1303,25 @@ impl CatalogStore for SqliteCatalog {
         metadata: &VectorMetadata,
         idempotency_key: Option<&str>,
     ) -> Result<WalIngestResult> {
-        self.ingest_wal_internal(collection_id, None, vector, metadata, idempotency_key)
+        let rows = self.ingest_wal_batch(
+            collection_id,
+            &[(
+                vector.to_vec(),
+                metadata.clone(),
+                idempotency_key.map(|v| v.to_string()),
+            )],
+        )?;
+        rows.into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("ingest transaction produced no result row"))
     }
 
     fn pending_wal(&self, collection_id: &str, limit: usize) -> Result<Vec<WalEntry>> {
         self.query_wal(&format!(
-            "SELECT lsn, vector_id, vector_json, metadata_json FROM wal_entries WHERE collection_id='{}' AND checkpointed_at IS NULL ORDER BY lsn ASC LIMIT {};",
+            "SELECT lsn, vector_id, schema_version, vector_blob, metadata_blob, vector_json, metadata_json
+             FROM wal_entries
+             WHERE collection_id='{}' AND checkpointed_at IS NULL
+             ORDER BY lsn ASC LIMIT {};",
             sql_quote(collection_id),
             limit
         ))
@@ -1174,7 +1333,10 @@ impl CatalogStore for SqliteCatalog {
         lsn_exclusive: u64,
     ) -> Result<Vec<WalEntry>> {
         self.query_wal(&format!(
-            "SELECT lsn, vector_id, vector_json, metadata_json FROM wal_entries WHERE collection_id='{}' AND checkpointed_at IS NULL AND lsn > {} ORDER BY lsn ASC;",
+            "SELECT lsn, vector_id, schema_version, vector_blob, metadata_blob, vector_json, metadata_json
+             FROM wal_entries
+             WHERE collection_id='{}' AND checkpointed_at IS NULL AND lsn > {}
+             ORDER BY lsn ASC;",
             sql_quote(collection_id),
             lsn_exclusive
         ))
@@ -1532,6 +1694,11 @@ impl CatalogStore for SqliteCatalog {
                  WHERE NOT EXISTS (
                     SELECT 1 FROM tag_ids WHERE collection_id='{collection}' AND tag='{tag_q}'
                  );
+                 INSERT OR IGNORE INTO tag_registry(collection_id, tag_id, tag_text, created_at)
+                 SELECT '{collection}', id, '{tag_q}', {now}
+                 FROM tag_ids
+                 WHERE collection_id='{collection}' AND tag='{tag_q}'
+                 LIMIT 1;
                  INSERT OR IGNORE INTO vector_tags(collection_id, vector_id, tag_id, created_at)
                  SELECT '{collection}', {vector_id}, id, {now}
                  FROM tag_ids
@@ -1619,10 +1786,10 @@ impl CatalogStore for SqliteCatalog {
 
     fn fetch_tag_dictionary(&self, collection_id: &str) -> Result<HashMap<String, u32>> {
         let rows = self.query_rows::<TagDictionaryRow>(&format!(
-            "SELECT id, tag
-             FROM tag_ids
+            "SELECT tag_id AS id, tag_text AS tag
+             FROM tag_registry
              WHERE collection_id='{}'
-             ORDER BY id ASC;",
+             ORDER BY tag_id ASC;",
             sql_quote(collection_id)
         ))?;
         let mut out = HashMap::with_capacity(rows.len());
@@ -1900,12 +2067,34 @@ struct TagDictionaryRow {
     tag: String,
 }
 
+#[derive(Debug)]
+struct TagRegistryRow {
+    collection_id: String,
+    tag_id: u32,
+    tag_text: String,
+}
+
 impl FromSqlRow for WalEntry {
     unsafe fn from_row(stmt: *mut Sqlite3Stmt) -> Result<Self> {
         let lsn = column_i64(stmt, 0).max(0) as u64;
         let vector_id = column_i64(stmt, 1).max(0) as usize;
-        let vector: Vec<f32> = serde_json::from_slice(column_text_bytes(stmt, 2))?;
-        let metadata: VectorMetadata = serde_json::from_slice(column_text_bytes(stmt, 3))?;
+        let schema_version = column_i64(stmt, 2).max(0) as u32;
+        let vector_blob = column_blob_bytes(stmt, 3);
+        let metadata_blob = column_blob_bytes(stmt, 4);
+        let vector_json = column_text_bytes(stmt, 5);
+        let metadata_json = column_text_bytes(stmt, 6);
+
+        let (vector, metadata) = if schema_version >= 3 && !vector_blob.is_empty() {
+            (
+                decode_vector_blob(vector_blob)?,
+                decode_metadata_blob(metadata_blob)?,
+            )
+        } else {
+            (
+                serde_json::from_slice(vector_json)?,
+                serde_json::from_slice(metadata_json)?,
+            )
+        };
         Ok(Self {
             lsn,
             vector_id,
@@ -1973,6 +2162,16 @@ impl FromSqlRow for TagDictionaryRow {
         Ok(Self {
             id: column_i64(stmt, 0).max(0) as u32,
             tag: column_text_string(stmt, 1),
+        })
+    }
+}
+
+impl FromSqlRow for TagRegistryRow {
+    unsafe fn from_row(stmt: *mut Sqlite3Stmt) -> Result<Self> {
+        Ok(Self {
+            collection_id: column_text_string(stmt, 0),
+            tag_id: column_i64(stmt, 1).max(0) as u32,
+            tag_text: column_text_string(stmt, 2),
         })
     }
 }
@@ -2237,9 +2436,9 @@ impl SqliteCatalog {
         }
         #[derive(Debug)]
         struct PreparedBatchEntry {
-            vector_json: String,
+            vector_blob_hex: String,
             metadata: VectorMetadata,
-            metadata_json: String,
+            metadata_blob_hex: String,
             tags_json: String,
             idempotency_key: Option<String>,
         }
@@ -2273,8 +2472,8 @@ impl SqliteCatalog {
                     normalized_metadata.tags = tags;
 
                     Ok(PreparedBatchEntry {
-                        vector_json: serde_json::to_string(vector)?,
-                        metadata_json: serde_json::to_string(&normalized_metadata)?,
+                        vector_blob_hex: hex_string(&encode_vector_blob(vector)),
+                        metadata_blob_hex: hex_string(&encode_metadata_blob(&normalized_metadata)?),
                         tags_json: serde_json::to_string(&normalized_metadata.tags)?,
                         metadata: normalized_metadata,
                         idempotency_key: normalize_idempotency_key(idempotency_key.as_deref()),
@@ -2439,22 +2638,60 @@ impl SqliteCatalog {
                 }
 
                 let mut unique_tags = HashSet::new();
-                let mut vector_tag_pairs = Vec::new();
                 for row in &pending {
                     for tag in &row.entry.metadata.tags {
                         unique_tags.insert(tag.clone());
-                        vector_tag_pairs.push((row.vector_id, tag.clone()));
+                    }
+                }
+                let mut ordered_tags = unique_tags.into_iter().collect::<Vec<_>>();
+                ordered_tags.sort();
+                if !ordered_tags.is_empty() {
+                    let in_clause = ordered_tags
+                        .iter()
+                        .map(|tag| format!("'{}'", sql_quote(tag)))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let existing_rows = guard.query_json(
+                        &format!(
+                            "SELECT tag_id, tag_text
+                             FROM tag_registry
+                             WHERE collection_id='{}'
+                               AND tag_text IN ({});",
+                            collection, in_clause
+                        ),
+                        None,
+                    )?;
+                    let mut cache_rows = Vec::with_capacity(existing_rows.len());
+                    for row in existing_rows {
+                        let tag_id = row["tag_id"].as_i64().unwrap_or(0).max(0) as u32;
+                        let tag_text = row["tag_text"].as_str().unwrap_or_default().to_string();
+                        if tag_id == 0 || tag_text.is_empty() {
+                            continue;
+                        }
+                        cache_rows.push((tag_id, tag_text));
+                    }
+                    self.commit_tag_rows_to_cache(collection_id, &cache_rows);
+                }
+                let (tag_ids, new_tag_rows) =
+                    self.resolve_tag_ids_for_batch(collection_id, &ordered_tags);
+
+                let mut vector_tag_pairs: Vec<(usize, u32)> = Vec::new();
+                for row in &pending {
+                    for tag in &row.entry.metadata.tags {
+                        if let Some(tag_id) = tag_ids.get(tag) {
+                            vector_tag_pairs.push((row.vector_id, *tag_id));
+                        }
                     }
                 }
 
                 let estimated_capacity = pending.len() * 2048
-                    + unique_tags.len() * 128
+                    + ordered_tags.len() * 128
                     + vector_tag_pairs.len() * 96
                     + 2048;
                 let mut sql = String::with_capacity(estimated_capacity);
 
                 sql.push_str(
-                    "INSERT INTO wal_entries(collection_id, vector_id, vector_json, metadata_json, idempotency_key, checkpointed_at, created_at) VALUES ",
+                    "INSERT INTO wal_entries(collection_id, vector_id, schema_version, vector_blob, metadata_blob, vector_json, metadata_json, idempotency_key, checkpointed_at, created_at) VALUES ",
                 );
                 for (idx, row) in pending.iter().enumerate() {
                     if idx > 0 {
@@ -2462,11 +2699,11 @@ impl SqliteCatalog {
                     }
                     write!(
                         sql,
-                        "('{}', {}, '{}', '{}', {}, NULL, {})",
+                        "('{}', {}, 3, x'{}', x'{}', '[]', '{{}}', {}, NULL, {})",
                         collection,
                         row.vector_id,
-                        sql_quote(&row.entry.vector_json),
-                        sql_quote(&row.entry.metadata_json),
+                        row.entry.vector_blob_hex,
+                        row.entry.metadata_blob_hex,
                         row.entry
                             .idempotency_key
                             .as_ref()
@@ -2499,40 +2736,55 @@ impl SqliteCatalog {
                 }
                 sql.push(';');
 
-                let mut ordered_tags = unique_tags.into_iter().collect::<Vec<_>>();
-                ordered_tags.sort();
-                for tag in ordered_tags {
-                    write!(
-                        sql,
-                        "INSERT INTO tag_ids(collection_id, id, tag, created_at)
-                         SELECT '{collection}',
-                                COALESCE((SELECT MAX(id) + 1 FROM tag_ids WHERE collection_id='{collection}'), 1),
-                                '{}',
-                                {}
-                         WHERE NOT EXISTS (
-                             SELECT 1 FROM tag_ids WHERE collection_id='{collection}' AND tag='{}'
-                         );",
-                        sql_quote(&tag),
-                        now,
-                        sql_quote(&tag),
-                    )
-                    .unwrap();
-                }
-
-                if !vector_tag_pairs.is_empty() {
-                    sql.push_str("INSERT OR IGNORE INTO vector_tags(collection_id, vector_id, tag_id, created_at) VALUES ");
-                    for (idx, (vector_id, tag)) in vector_tag_pairs.iter().enumerate() {
+                if !new_tag_rows.is_empty() {
+                    sql.push_str("INSERT OR IGNORE INTO tag_registry(collection_id, tag_id, tag_text, created_at) VALUES ");
+                    for (idx, (tag_id, tag)) in new_tag_rows.iter().enumerate() {
                         if idx > 0 {
                             sql.push(',');
                         }
                         write!(
                             sql,
-                            "('{}', {}, (SELECT id FROM tag_ids WHERE collection_id='{}' AND tag='{}' LIMIT 1), {})",
+                            "('{}', {}, '{}', {})",
                             collection,
-                            vector_id,
-                            collection,
+                            tag_id,
                             sql_quote(tag),
-                            now,
+                            now
+                        )
+                        .unwrap();
+                    }
+                    sql.push(';');
+
+                    // Backward-compatible mirror while v2 readers still exist.
+                    sql.push_str(
+                        "INSERT OR IGNORE INTO tag_ids(collection_id, id, tag, created_at) VALUES ",
+                    );
+                    for (idx, (tag_id, tag)) in new_tag_rows.iter().enumerate() {
+                        if idx > 0 {
+                            sql.push(',');
+                        }
+                        write!(
+                            sql,
+                            "('{}', {}, '{}', {})",
+                            collection,
+                            tag_id,
+                            sql_quote(tag),
+                            now
+                        )
+                        .unwrap();
+                    }
+                    sql.push(';');
+                }
+
+                if !vector_tag_pairs.is_empty() {
+                    sql.push_str("INSERT OR IGNORE INTO vector_tags(collection_id, vector_id, tag_id, created_at) VALUES ");
+                    for (idx, (vector_id, tag_id)) in vector_tag_pairs.iter().enumerate() {
+                        if idx > 0 {
+                            sql.push(',');
+                        }
+                        write!(
+                            sql,
+                            "('{}', {}, {}, {})",
+                            collection, vector_id, tag_id, now,
                         )
                         .unwrap();
                     }
@@ -2540,6 +2792,7 @@ impl SqliteCatalog {
                 }
 
                 guard.exec(&sql)?;
+                self.commit_tag_rows_to_cache(collection_id, &new_tag_rows);
             }
 
             Ok(results)
@@ -2581,6 +2834,39 @@ fn hex_string(bytes: &[u8]) -> String {
         out.push_str(&format!("{:02x}", b));
     }
     out
+}
+
+fn encode_vector_blob(vector: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vector.len() * 4);
+    for value in vector {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+fn decode_vector_blob(bytes: &[u8]) -> Result<Vec<f32>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if bytes.len() % 4 != 0 {
+        return Err(anyhow!(
+            "invalid vector blob length: expected multiple of 4, got {}",
+            bytes.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(out)
+}
+
+fn encode_metadata_blob(metadata: &VectorMetadata) -> Result<Vec<u8>> {
+    Ok(rmp_serde::to_vec(metadata)?)
+}
+
+fn decode_metadata_blob(bytes: &[u8]) -> Result<VectorMetadata> {
+    Ok(rmp_serde::from_slice(bytes)?)
 }
 
 fn hash_secret(pepper: &str, secret: &str) -> String {

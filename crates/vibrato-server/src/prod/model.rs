@@ -207,6 +207,9 @@ pub struct StatsResponseV2 {
     pub quarantine_files: usize,
     pub quarantine_bytes: u64,
     pub quarantine_evictions_total: u64,
+    pub ingest_queue_bytes: u64,
+    pub memory_proxy_bytes: u64,
+    pub memory_budget_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

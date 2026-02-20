@@ -222,6 +222,14 @@ enum Commands {
         #[arg(long, default_value = "8")]
         hot_index_shards: usize,
 
+        /// Bounded queue capacity for dedicated SQLite ingest writer jobs
+        #[arg(long, default_value = "1024")]
+        ingest_queue_capacity: usize,
+
+        /// Deterministic in-process memory budget for backpressure decisions
+        #[arg(long, default_value = "8589934592")]
+        memory_budget_bytes: u64,
+
         /// Vector mmap advise mode for active segment vectors: normal|random
         #[arg(long, default_value = "normal")]
         vector_madvise_mode: String,
@@ -573,6 +581,8 @@ async fn main() -> anyhow::Result<()> {
             quarantine_max_bytes,
             background_io_mb_per_sec,
             hot_index_shards,
+            ingest_queue_capacity,
+            memory_budget_bytes,
             vector_madvise_mode,
             bootstrap_admin_key,
         } => {
@@ -588,6 +598,8 @@ async fn main() -> anyhow::Result<()> {
             config.quarantine_max_bytes = quarantine_max_bytes;
             config.background_io_mb_per_sec = background_io_mb_per_sec;
             config.hot_index_shards = hot_index_shards;
+            config.ingest_queue_capacity = ingest_queue_capacity.max(1);
+            config.memory_budget_bytes = memory_budget_bytes;
             config.vector_madvise_mode = parse_vector_madvise_mode(&vector_madvise_mode)?;
 
             bootstrap_data_dirs(&config)?;

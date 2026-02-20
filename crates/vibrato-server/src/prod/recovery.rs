@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use vibrato_core::format_v2::VdbHeaderV2;
+use vibrato_core::metadata::{MetadataReader, VectorMetadata};
 use vibrato_core::pq::ProductQuantizer;
 use vibrato_core::store::VectorStore;
 
@@ -180,7 +181,7 @@ pub fn migrate_existing_vdb_to_segment(
         .with_context(|| format!("copying {:?} to {:?}", input_vdb, out_path))?;
 
     let store = vibrato_core::store::VectorStore::open(&out_path)?;
-    let metadata = crate::server::load_store_metadata(&store);
+    let metadata = load_store_metadata(&store);
 
     for (idx, item) in metadata.iter().enumerate() {
         state
@@ -448,4 +449,36 @@ fn validate_archive_pq_segment(path: &Path, header: VdbHeaderV2) -> Result<()> {
         &bytes[codebook_start..codebook_end],
     )?;
     Ok(())
+}
+
+fn load_store_metadata(store: &VectorStore) -> Vec<VectorMetadata> {
+    let mut metadata = vec![VectorMetadata::default(); store.count];
+    let Some(bytes) = store.metadata_bytes() else {
+        return metadata;
+    };
+
+    let reader = match MetadataReader::new(bytes) {
+        Ok(reader) => reader,
+        Err(err) => {
+            tracing::warn!("failed to parse metadata section: {}", err);
+            return metadata;
+        }
+    };
+
+    if reader.count() != store.count {
+        tracing::warn!(
+            "metadata count mismatch: metadata={} vectors={}",
+            reader.count(),
+            store.count
+        );
+        return metadata;
+    }
+
+    for (idx, slot) in metadata.iter_mut().enumerate() {
+        if let Ok(item) = reader.get(idx) {
+            *slot = item;
+        }
+    }
+
+    metadata
 }

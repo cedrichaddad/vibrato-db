@@ -6,10 +6,11 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use tokio::time::sleep;
 
 use super::auth::{authorize, AuthError};
 use super::catalog::Role;
-use super::engine::ProductionState;
+use super::engine::{IngestBackpressureDecision, ProductionState};
 use super::model::{
     ApiResponse, ErrorBody, HealthResponseV2, IdentifyRequestV2, IngestBatchRequestV2,
     IngestBatchResponseV2, IngestRequestV2, IngestResponseV2, JobResponseV2, QueryRequestV2,
@@ -59,7 +60,66 @@ async fn v2_ingest(
     let metadata = body.metadata.into();
     let idempotency_key = body.idempotency_key.clone();
     let vector = body.vector.clone();
+    let incoming_bytes = ProductionState::estimate_ingest_entry_bytes(
+        &vector,
+        &metadata,
+        idempotency_key.as_deref(),
+    );
+    match state.ingest_backpressure_decision(incoming_bytes) {
+        IngestBackpressureDecision::Allow => {}
+        IngestBackpressureDecision::Throttle {
+            delay,
+            projected_bytes,
+            soft_limit_bytes,
+            hard_limit_bytes,
+        } => {
+            state.record_ingest_soft_throttle(delay);
+            tracing::debug!(
+                "semantic_throttle endpoint=/v2/vectors delay_ms={} projected={} soft={} hard={}",
+                delay.as_millis(),
+                projected_bytes,
+                soft_limit_bytes,
+                hard_limit_bytes
+            );
+            sleep(delay).await;
+        }
+        IngestBackpressureDecision::Reject {
+            projected_bytes,
+            hard_limit_bytes,
+        } => {
+            state.record_ingest_hard_reject();
+            let msg = format!(
+                "resource exhausted: projected memory proxy {} exceeds hard limit {}",
+                projected_bytes, hard_limit_bytes
+            );
+            let resp = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &request_id,
+                "resource_exhausted",
+                msg.clone(),
+                Some(serde_json::json!({
+                    "projected_bytes": projected_bytes,
+                    "hard_limit_bytes": hard_limit_bytes
+                })),
+            );
+            audit_best_effort(
+                &state,
+                &request_id,
+                auth.as_deref(),
+                "/v2/vectors",
+                "ingest",
+                StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                started.elapsed().as_secs_f64() * 1000.0,
+                serde_json::json!({"error": msg, "code": "resource_exhausted"}),
+            );
+            return resp;
+        }
+    }
+
     let state_bg = state.clone();
+    state
+        .inflight_decode_bytes
+        .fetch_add(incoming_bytes, std::sync::atomic::Ordering::Relaxed);
     let result = tokio::task::spawn_blocking(move || {
         state_bg.ingest_vector(&vector, &metadata, idempotency_key.as_deref())
     })
@@ -68,6 +128,9 @@ async fn v2_ingest(
         Ok(inner) => inner,
         Err(e) => Err(anyhow::anyhow!("ingest join error: {}", e)),
     };
+    state
+        .inflight_decode_bytes
+        .fetch_sub(incoming_bytes, std::sync::atomic::Ordering::Relaxed);
 
     match result {
         Ok((id, created)) => {
@@ -154,12 +217,70 @@ async fn v2_ingest_batch(
         })
         .collect();
 
+    let incoming_bytes = ProductionState::estimate_ingest_batch_bytes(&entries);
+    match state.ingest_backpressure_decision(incoming_bytes) {
+        IngestBackpressureDecision::Allow => {}
+        IngestBackpressureDecision::Throttle {
+            delay,
+            projected_bytes,
+            soft_limit_bytes,
+            hard_limit_bytes,
+        } => {
+            state.record_ingest_soft_throttle(delay);
+            tracing::debug!(
+                "semantic_throttle endpoint=/v2/vectors/batch delay_ms={} projected={} soft={} hard={}",
+                delay.as_millis(),
+                projected_bytes,
+                soft_limit_bytes,
+                hard_limit_bytes
+            );
+            sleep(delay).await;
+        }
+        IngestBackpressureDecision::Reject {
+            projected_bytes,
+            hard_limit_bytes,
+        } => {
+            state.record_ingest_hard_reject();
+            let msg = format!(
+                "resource exhausted: projected memory proxy {} exceeds hard limit {}",
+                projected_bytes, hard_limit_bytes
+            );
+            let resp = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &request_id,
+                "resource_exhausted",
+                msg.clone(),
+                Some(serde_json::json!({
+                    "projected_bytes": projected_bytes,
+                    "hard_limit_bytes": hard_limit_bytes
+                })),
+            );
+            audit_best_effort(
+                &state,
+                &request_id,
+                auth.as_deref(),
+                "/v2/vectors/batch",
+                "ingest_batch",
+                StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                started.elapsed().as_secs_f64() * 1000.0,
+                serde_json::json!({"error": msg, "code": "resource_exhausted"}),
+            );
+            return resp;
+        }
+    }
+
     let state_bg = state.clone();
+    state
+        .inflight_decode_bytes
+        .fetch_add(incoming_bytes, std::sync::atomic::Ordering::Relaxed);
     let result = tokio::task::spawn_blocking(move || state_bg.ingest_batch(&entries)).await;
     let result = match result {
         Ok(inner) => inner,
         Err(e) => Err(anyhow::anyhow!("batch ingest join error: {}", e)),
     };
+    state
+        .inflight_decode_bytes
+        .fetch_sub(incoming_bytes, std::sync::atomic::Ordering::Relaxed);
 
     match result {
         Ok(results) => {
@@ -839,6 +960,9 @@ fn classify_ingest_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
     }
     if lower.contains("dimension mismatch") {
         return (StatusCode::BAD_REQUEST, "bad_request");
+    }
+    if lower.contains("resource exhausted") || lower.contains("resource_exhausted") {
+        return (StatusCode::TOO_MANY_REQUESTS, "resource_exhausted");
     }
     if lower.contains("unique constraint failed") || lower.contains("constraint failed") {
         return (StatusCode::CONFLICT, "conflict");

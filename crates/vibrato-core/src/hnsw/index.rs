@@ -14,11 +14,12 @@
 //! on layer 0 with ef candidates.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::node::Node;
 use super::visited::VisitedGuard;
@@ -93,7 +94,7 @@ pub struct HNSW {
     pub nodes: Vec<Node>,
 
     /// Map from node ID to index in nodes vector (O(1) lookup)
-    id_to_index: HashMap<usize, usize>,
+    id_to_index: FxHashMap<usize, usize>,
 
     /// Entry point node ID (node on the highest layer)
     pub entry_point: Option<usize>,
@@ -175,7 +176,7 @@ impl HNSW {
     {
         Self {
             nodes: Vec::new(),
-            id_to_index: HashMap::new(),
+            id_to_index: FxHashMap::default(),
             entry_point: None,
             max_layer: 0,
             m,
@@ -202,7 +203,7 @@ impl HNSW {
         F: Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static,
     {
         // Build id_to_index map from existing nodes
-        let id_to_index: HashMap<usize, usize> = nodes
+        let id_to_index: FxHashMap<usize, usize> = nodes
             .iter()
             .enumerate()
             .map(|(idx, node)| (node.id, idx))
@@ -325,7 +326,8 @@ impl HNSW {
 
             // Add forward edges to new node
             for &(neighbor_id, _) in &neighbors {
-                node.add_neighbor(layer, neighbor_id);
+                // `select_neighbors` returns unique IDs, so this is duplicate-safe.
+                node.add_neighbor_unchecked(layer, neighbor_id);
 
                 // Find the node index for this neighbor using O(1) HashMap
                 if let Some(node_idx) = self.get_node_index(neighbor_id) {
@@ -365,14 +367,15 @@ impl HNSW {
         }
 
         // Apply reverse edges (avoiding those that will be overwritten by pruning)
-        let prune_targets: std::collections::HashSet<(usize, usize)> = prune_ops
+        let prune_targets: FxHashSet<(usize, usize)> = prune_ops
             .iter()
             .map(|(idx, layer, _)| (*idx, *layer))
             .collect();
 
         for (node_idx, layer, neighbor_id) in reverse_edges {
             if !prune_targets.contains(&(node_idx, layer)) {
-                self.nodes[node_idx].add_neighbor(layer, neighbor_id);
+                // New node ID was not present before this insert, so edge is unique.
+                self.nodes[node_idx].add_neighbor_unchecked(layer, neighbor_id);
             }
         }
 
@@ -735,7 +738,7 @@ impl HNSW {
             anchor_offsets.push(salience.first().map(|(i, _)| *i).unwrap_or(0));
         }
 
-        let mut best_by_start: HashMap<usize, f32> = HashMap::new();
+        let mut best_by_start: FxHashMap<usize, f32> = FxHashMap::default();
         let anchor_overfetch = (k.saturating_mul(6)).max(32);
 
         for salient_offset in anchor_offsets {

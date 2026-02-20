@@ -24,7 +24,7 @@ use vibrato_core::training::{train_pq, TrainingConfig};
 
 use super::catalog::{
     CatalogStore, CheckpointJobRecord, CollectionRecord, CompactionJobRecord, SegmentRecord,
-    SqliteCatalog, WalEntry,
+    SqliteCatalog, WalEntry, WalIngestResult,
 };
 use super::filter::{BitmapSet, FilterIndex};
 use super::model::{
@@ -36,6 +36,28 @@ use super::model::{
 pub enum VectorMadviseMode {
     Normal,
     Random,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum IngestBackpressureDecision {
+    Allow,
+    Throttle {
+        delay: Duration,
+        projected_bytes: u64,
+        soft_limit_bytes: u64,
+        hard_limit_bytes: u64,
+    },
+    Reject {
+        projected_bytes: u64,
+        hard_limit_bytes: u64,
+    },
+}
+
+#[derive(Debug)]
+struct IngestWriteJob {
+    entries: Vec<(Vec<f32>, VectorMetadata, Option<String>)>,
+    estimated_bytes: u64,
+    result_tx: SyncSender<Result<Vec<WalIngestResult>>>,
 }
 
 #[derive(Debug)]
@@ -96,6 +118,8 @@ pub struct ProductionConfig {
     pub quarantine_max_bytes: u64,
     pub background_io_mb_per_sec: u64,
     pub hot_index_shards: usize,
+    pub ingest_queue_capacity: usize,
+    pub memory_budget_bytes: u64,
     pub vector_madvise_mode: VectorMadviseMode,
     pub api_pepper: String,
 }
@@ -110,6 +134,9 @@ pub struct Metrics {
     pub checkpoint_total: AtomicU64,
     pub compaction_total: AtomicU64,
     pub obsolete_files_deleted_total: AtomicU64,
+    pub ingest_backpressure_soft_total: AtomicU64,
+    pub ingest_backpressure_hard_total: AtomicU64,
+    pub ingest_semantic_throttle_ms_total: AtomicU64,
     pub query_latency_count: AtomicU64,
     pub query_latency_us_sum: AtomicU64,
     pub query_latency_us_le_10: AtomicU64,
@@ -155,6 +182,12 @@ pub struct ProductionState {
     pub retired_segments: std::sync::Mutex<HashMap<String, Weak<SegmentHandle>>>,
 
     pub metrics: Metrics,
+    ingest_writer_tx: SyncSender<IngestWriteJob>,
+    pub ingest_queue_bytes: AtomicU64,
+    pub hot_vectors_bytes: AtomicU64,
+    pub hnsw_graph_bytes: AtomicU64,
+    pub metadata_cache_bytes: AtomicU64,
+    pub inflight_decode_bytes: AtomicU64,
     pub admin_ops_lock: std::sync::Mutex<()>,
     pub checkpoint_lock: std::sync::Mutex<()>,
     pub compaction_lock: std::sync::Mutex<()>,
@@ -195,6 +228,8 @@ impl ProductionConfig {
             quarantine_max_bytes: 5 * 1024 * 1024 * 1024,
             background_io_mb_per_sec: 40,
             hot_index_shards: 8,
+            ingest_queue_capacity: 1024,
+            memory_budget_bytes: 8 * 1024 * 1024 * 1024,
             vector_madvise_mode: VectorMadviseMode::Normal,
             api_pepper: std::env::var("VIBRATO_API_PEPPER")
                 .unwrap_or_else(|_| "dev-pepper".to_string()),
@@ -228,6 +263,8 @@ impl ProductionState {
             .collect::<Vec<_>>();
         let metadata_cache = Arc::new(RwLock::new(HashMap::new()));
         let (audit_tx, audit_rx) = sync_channel(4096);
+        let (ingest_writer_tx, ingest_writer_rx) =
+            sync_channel(config.ingest_queue_capacity.max(1));
         let available = std::thread::available_parallelism()
             .map(|v| v.get())
             .unwrap_or(2);
@@ -264,6 +301,12 @@ impl ProductionState {
             filter_index: Arc::new(RwLock::new(FilterIndex::default())),
             retired_segments: std::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
+            ingest_writer_tx,
+            ingest_queue_bytes: AtomicU64::new(0),
+            hot_vectors_bytes: AtomicU64::new(0),
+            hnsw_graph_bytes: AtomicU64::new(0),
+            metadata_cache_bytes: AtomicU64::new(0),
+            inflight_decode_bytes: AtomicU64::new(0),
             admin_ops_lock: std::sync::Mutex::new(()),
             checkpoint_lock: std::sync::Mutex::new(()),
             compaction_lock: std::sync::Mutex::new(()),
@@ -274,7 +317,147 @@ impl ProductionState {
             audit_rx: std::sync::Mutex::new(Some(audit_rx)),
         });
 
+        state.start_ingest_writer(ingest_writer_rx);
+
         Ok(state)
+    }
+
+    fn start_ingest_writer(self: &Arc<Self>, ingest_writer_rx: Receiver<IngestWriteJob>) {
+        let state = Arc::clone(self);
+        let writer_name = format!("vibrato-sqlite-writer-{}", state.collection.id);
+        let _ = std::thread::Builder::new()
+            .name(writer_name)
+            .spawn(move || {
+                if state.config.audio_colocated {
+                    set_background_worker_priority();
+                }
+                while let Ok(job) = ingest_writer_rx.recv() {
+                    let result = state
+                        .catalog
+                        .ingest_wal_batch(&state.collection.id, &job.entries);
+                    atomic_saturating_sub(&state.ingest_queue_bytes, job.estimated_bytes);
+                    let _ = job.result_tx.send(result);
+                }
+            });
+    }
+
+    fn estimate_metadata_bytes(metadata: &VectorMetadata) -> u64 {
+        let mut bytes = metadata.source_file.len() as u64;
+        bytes = bytes
+            .saturating_add(std::mem::size_of::<u32>() as u64)
+            .saturating_add(std::mem::size_of::<u16>() as u64)
+            .saturating_add(std::mem::size_of::<f32>() as u64);
+        for tag in &metadata.tags {
+            bytes = bytes.saturating_add(tag.len() as u64);
+        }
+        bytes
+    }
+
+    fn estimate_hnsw_bytes_per_vector(&self) -> u64 {
+        // Approximate graph edge memory: M 32-bit neighbor IDs plus small node overhead.
+        let edges = self.config.hnsw_m as u64 * std::mem::size_of::<u32>() as u64;
+        edges.saturating_add(32)
+    }
+
+    fn enqueue_ingest_batch(
+        &self,
+        entries: Vec<(Vec<f32>, VectorMetadata, Option<String>)>,
+        estimated_bytes: u64,
+    ) -> Result<Vec<WalIngestResult>> {
+        let (result_tx, result_rx) = sync_channel(1);
+        self.ingest_queue_bytes
+            .fetch_add(estimated_bytes, AtomicOrdering::Relaxed);
+        let send_result = self.ingest_writer_tx.send(IngestWriteJob {
+            entries,
+            estimated_bytes,
+            result_tx,
+        });
+        if send_result.is_err() {
+            atomic_saturating_sub(&self.ingest_queue_bytes, estimated_bytes);
+            return Err(anyhow!("ingest writer queue is unavailable"));
+        }
+        match result_rx.recv() {
+            Ok(inner) => inner,
+            Err(_) => Err(anyhow!("ingest writer disconnected before sending result")),
+        }
+    }
+
+    pub fn estimate_ingest_entry_bytes(
+        vector: &[f32],
+        metadata: &VectorMetadata,
+        idempotency_key: Option<&str>,
+    ) -> u64 {
+        let vector_bytes = (vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
+        let metadata_bytes = Self::estimate_metadata_bytes(metadata);
+        let idempotency_bytes = idempotency_key.map(|v| v.len() as u64).unwrap_or(0);
+        vector_bytes
+            .saturating_add(metadata_bytes)
+            .saturating_add(idempotency_bytes)
+    }
+
+    pub fn estimate_ingest_batch_bytes(
+        entries: &[(Vec<f32>, VectorMetadata, Option<String>)],
+    ) -> u64 {
+        entries.iter().fold(0u64, |acc, (vector, metadata, key)| {
+            acc.saturating_add(Self::estimate_ingest_entry_bytes(
+                vector,
+                metadata,
+                key.as_deref(),
+            ))
+        })
+    }
+
+    pub fn memory_proxy_bytes(&self) -> u64 {
+        self.ingest_queue_bytes
+            .load(AtomicOrdering::Relaxed)
+            .saturating_add(self.hot_vectors_bytes.load(AtomicOrdering::Relaxed))
+            .saturating_add(self.hnsw_graph_bytes.load(AtomicOrdering::Relaxed))
+            .saturating_add(self.metadata_cache_bytes.load(AtomicOrdering::Relaxed))
+            .saturating_add(self.inflight_decode_bytes.load(AtomicOrdering::Relaxed))
+    }
+
+    pub fn ingest_backpressure_decision(&self, incoming_bytes: u64) -> IngestBackpressureDecision {
+        let budget = self.config.memory_budget_bytes;
+        if budget == 0 {
+            return IngestBackpressureDecision::Allow;
+        }
+        let soft_limit = (budget as u128 * 70 / 100).min(u64::MAX as u128) as u64;
+        let hard_limit = (budget as u128 * 85 / 100).min(u64::MAX as u128) as u64;
+        let projected = self.memory_proxy_bytes().saturating_add(incoming_bytes);
+        if projected > hard_limit {
+            return IngestBackpressureDecision::Reject {
+                projected_bytes: projected,
+                hard_limit_bytes: hard_limit,
+            };
+        }
+        if projected > soft_limit {
+            let range = hard_limit.saturating_sub(soft_limit).max(1);
+            let pressure = projected.saturating_sub(soft_limit);
+            let delay_ms = (1 + pressure.saturating_mul(19) / range).clamp(1, 20);
+            return IngestBackpressureDecision::Throttle {
+                delay: Duration::from_millis(delay_ms),
+                projected_bytes: projected,
+                soft_limit_bytes: soft_limit,
+                hard_limit_bytes: hard_limit,
+            };
+        }
+        IngestBackpressureDecision::Allow
+    }
+
+    pub fn record_ingest_soft_throttle(&self, delay: Duration) {
+        self.metrics
+            .ingest_backpressure_soft_total
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.metrics.ingest_semantic_throttle_ms_total.fetch_add(
+            delay.as_millis().min(u64::MAX as u128) as u64,
+            AtomicOrdering::Relaxed,
+        );
+    }
+
+    pub fn record_ingest_hard_reject(&self) {
+        self.metrics
+            .ingest_backpressure_hard_total
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     pub fn set_ready(&self, ready: bool, report: impl Into<String>) {
@@ -360,6 +543,8 @@ impl ProductionState {
     }
 
     pub fn insert_hot_vector(&self, vector_id: usize, vector: Vec<f32>, metadata: VectorMetadata) {
+        let vector_bytes = (vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
+        let metadata_bytes = Self::estimate_metadata_bytes(&metadata);
         let shard = vector_id & self.shard_mask;
         if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
             shard_vectors
@@ -374,6 +559,14 @@ impl ProductionState {
             .write()
             .insert(vector_id, metadata.clone());
         self.filter_index.write().add(vector_id, &metadata);
+        self.hot_vectors_bytes
+            .fetch_add(vector_bytes, AtomicOrdering::Relaxed);
+        self.metadata_cache_bytes
+            .fetch_add(metadata_bytes, AtomicOrdering::Relaxed);
+        self.hnsw_graph_bytes.fetch_add(
+            self.estimate_hnsw_bytes_per_vector(),
+            AtomicOrdering::Relaxed,
+        );
     }
 
     pub fn ingest_vector(
@@ -390,19 +583,17 @@ impl ProductionState {
             ));
         }
 
-        let ingest = self.catalog.ingest_wal_atomic(
-            &self.collection.id,
-            vector,
-            metadata,
-            idempotency_key,
-        )?;
-        if ingest.created {
-            self.insert_hot_vector(ingest.vector_id, vector.to_vec(), metadata.clone());
-            self.metrics
-                .ingest_total
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        Ok((ingest.vector_id, ingest.created))
+        let mut entries = Vec::with_capacity(1);
+        entries.push((
+            vector.to_vec(),
+            metadata.clone(),
+            idempotency_key.map(|v| v.to_string()),
+        ));
+        let result = self.ingest_batch(&entries)?;
+        result
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("ingest writer returned an empty batch result"))
     }
 
     /// Batch ingest: single SQLite transaction for N vectors, shard-grouped
@@ -411,6 +602,9 @@ impl ProductionState {
         &self,
         entries: &[(Vec<f32>, VectorMetadata, Option<String>)],
     ) -> Result<Vec<(usize, bool)>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
         // Validate dimensions up front
         for (i, (vector, _, _)) in entries.iter().enumerate() {
             if vector.len() != self.collection.dim {
@@ -423,10 +617,25 @@ impl ProductionState {
             }
         }
 
-        // 1. Bulk catalog write — single BEGIN...COMMIT
-        let wal_results = self
-            .catalog
-            .ingest_wal_batch(&self.collection.id, entries)?;
+        let estimated_bytes = Self::estimate_ingest_batch_bytes(entries);
+        match self.ingest_backpressure_decision(estimated_bytes) {
+            IngestBackpressureDecision::Reject {
+                projected_bytes,
+                hard_limit_bytes,
+            } => {
+                self.record_ingest_hard_reject();
+                return Err(anyhow!(
+                    "resource exhausted: memory proxy={} projected={} hard_limit={}",
+                    self.memory_proxy_bytes(),
+                    projected_bytes,
+                    hard_limit_bytes
+                ));
+            }
+            IngestBackpressureDecision::Throttle { .. } | IngestBackpressureDecision::Allow => {}
+        }
+
+        // 1. Bulk catalog write on dedicated SQLite writer lane.
+        let wal_results = self.enqueue_ingest_batch(entries.to_vec(), estimated_bytes)?;
 
         // 2. Group by shard for efficient lock acquisition
         let mut by_shard: HashMap<usize, Vec<(usize, &[f32], &VectorMetadata)>> = HashMap::new();
@@ -467,8 +676,21 @@ impl ProductionState {
                 for &(vid, _, meta) in items {
                     meta_cache.insert(vid, meta.clone());
                     filter_idx.add(vid, meta);
+                    self.metadata_cache_bytes
+                        .fetch_add(Self::estimate_metadata_bytes(meta), AtomicOrdering::Relaxed);
+                    self.hnsw_graph_bytes.fetch_add(
+                        self.estimate_hnsw_bytes_per_vector(),
+                        AtomicOrdering::Relaxed,
+                    );
                 }
             }
+            let vector_bytes = by_shard.values().flatten().fold(0u64, |acc, (_, vec, _)| {
+                acc.saturating_add(
+                    (vec.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
+                )
+            });
+            self.hot_vectors_bytes
+                .fetch_add(vector_bytes, AtomicOrdering::Relaxed);
             self.metrics
                 .ingest_total
                 .fetch_add(created_count as u64, AtomicOrdering::Relaxed);
@@ -923,6 +1145,9 @@ impl ProductionState {
             quarantine_files: quarantine_usage.files,
             quarantine_bytes: quarantine_usage.bytes,
             quarantine_evictions_total: self.catalog.quarantine_evictions_total(),
+            ingest_queue_bytes: self.ingest_queue_bytes.load(AtomicOrdering::Relaxed),
+            memory_proxy_bytes: self.memory_proxy_bytes(),
+            memory_budget_bytes: self.config.memory_budget_bytes,
         })
     }
 
@@ -943,6 +1168,27 @@ impl ProductionState {
         out.push_str(&format!(
             "vibrato_ingest_requests_total {}\n",
             self.metrics.ingest_total.load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_ingest_backpressure_soft_total counter\n");
+        out.push_str(&format!(
+            "vibrato_ingest_backpressure_soft_total {}\n",
+            self.metrics
+                .ingest_backpressure_soft_total
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_ingest_backpressure_hard_total counter\n");
+        out.push_str(&format!(
+            "vibrato_ingest_backpressure_hard_total {}\n",
+            self.metrics
+                .ingest_backpressure_hard_total
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_ingest_semantic_throttle_ms_total counter\n");
+        out.push_str(&format!(
+            "vibrato_ingest_semantic_throttle_ms_total {}\n",
+            self.metrics
+                .ingest_semantic_throttle_ms_total
+                .load(AtomicOrdering::Relaxed)
         ));
         out.push_str("# TYPE vibrato_auth_failures_total counter\n");
         out.push_str(&format!(
@@ -1128,6 +1374,21 @@ impl ProductionState {
         out.push_str(&format!(
             "vibrato_quarantine_evictions_total {}\n",
             stats.quarantine_evictions_total
+        ));
+        out.push_str("# TYPE vibrato_ingest_queue_bytes gauge\n");
+        out.push_str(&format!(
+            "vibrato_ingest_queue_bytes {}\n",
+            stats.ingest_queue_bytes
+        ));
+        out.push_str("# TYPE vibrato_memory_proxy_bytes gauge\n");
+        out.push_str(&format!(
+            "vibrato_memory_proxy_bytes {}\n",
+            stats.memory_proxy_bytes
+        ));
+        out.push_str("# TYPE vibrato_memory_budget_bytes gauge\n");
+        out.push_str(&format!(
+            "vibrato_memory_budget_bytes {}\n",
+            stats.memory_budget_bytes
         ));
 
         Ok(out)
@@ -1701,6 +1962,18 @@ impl ProductionState {
             *self.hot_indices[i].write() = hnsw;
         }
 
+        let vector_bytes = pending.iter().fold(0u64, |acc, e| {
+            acc.saturating_add(
+                (e.vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
+            )
+        });
+        self.hot_vectors_bytes
+            .store(vector_bytes, AtomicOrdering::Relaxed);
+        self.hnsw_graph_bytes.store(
+            (pending.len() as u64).saturating_mul(self.estimate_hnsw_bytes_per_vector()),
+            AtomicOrdering::Relaxed,
+        );
+
         Ok(())
     }
 
@@ -1714,11 +1987,15 @@ impl ProductionState {
             index.add_with_tag_ids(row.vector_id, row.bpm, &row.tag_ids);
         }
         let mut metadata_cache = HashMap::with_capacity(entries.len());
+        let mut metadata_bytes = 0u64;
         for (id, meta) in entries {
+            metadata_bytes = metadata_bytes.saturating_add(Self::estimate_metadata_bytes(&meta));
             metadata_cache.insert(id, meta);
         }
         *self.filter_index.write() = index;
         *self.metadata_cache.write() = metadata_cache;
+        self.metadata_cache_bytes
+            .store(metadata_bytes, AtomicOrdering::Relaxed);
         Ok(())
     }
 
@@ -2824,6 +3101,24 @@ fn advise_memory(bytes: &[u8], advice: i32) {
             return;
         }
         let _ = libc::madvise(bytes.as_ptr() as *mut libc::c_void, bytes.len(), advice);
+    }
+}
+
+fn atomic_saturating_sub(counter: &AtomicU64, amount: u64) {
+    loop {
+        let current = counter.load(AtomicOrdering::Relaxed);
+        let next = current.saturating_sub(amount);
+        if counter
+            .compare_exchange(
+                current,
+                next,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            )
+            .is_ok()
+        {
+            break;
+        }
     }
 }
 

@@ -1,9 +1,10 @@
-//! Thread-local visited set pool for HNSW search
+//! Thread-local visited set pool for HNSW search.
 //!
-//! Using a BitSet instead of HashSet avoids hashing overhead in the hot path.
-//! The pool reuses buffers across queries to reduce allocation pressure.
+//! Uses an epoch array to avoid O(n) clear cost per query:
+//! - `is_visited(id)` is a single array read/compare
+//! - `visit(id)` is a single array write
+//! - `clear()` increments epoch instead of zeroing memory
 
-use fixedbitset::FixedBitSet;
 use std::cell::RefCell;
 
 thread_local! {
@@ -11,10 +12,63 @@ thread_local! {
     static VISITED_POOL: RefCell<VisitedPoolInner> = RefCell::new(VisitedPoolInner::new());
 }
 
+/// Epoch-backed visited state.
+struct EpochVisited {
+    epochs: Vec<u32>,
+    current_epoch: u32,
+}
+
+impl EpochVisited {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            epochs: vec![0; capacity.max(1024)],
+            current_epoch: 1,
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.epochs.len()
+    }
+
+    #[inline(always)]
+    fn ensure_capacity_for(&mut self, id: usize) {
+        if id < self.epochs.len() {
+            return;
+        }
+        let required = id.saturating_add(1);
+        let new_len = required
+            .checked_next_power_of_two()
+            .unwrap_or(required)
+            .max(1024);
+        self.epochs.resize(new_len, 0);
+    }
+
+    #[inline(always)]
+    fn is_visited(&self, id: usize) -> bool {
+        id < self.epochs.len() && self.epochs[id] == self.current_epoch
+    }
+
+    #[inline(always)]
+    fn visit(&mut self, id: usize) {
+        self.ensure_capacity_for(id);
+        self.epochs[id] = self.current_epoch;
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.current_epoch = self.current_epoch.wrapping_add(1);
+        if self.current_epoch == 0 {
+            // Extremely rare overflow path: reset epochs and restart epoch numbering.
+            self.epochs.fill(0);
+            self.current_epoch = 1;
+        }
+    }
+}
+
 /// Inner pool state
 struct VisitedPoolInner {
-    /// Reusable bitsets (different sizes for different graph sizes)
-    sets: Vec<FixedBitSet>,
+    sets: Vec<EpochVisited>,
 }
 
 impl VisitedPoolInner {
@@ -25,105 +79,83 @@ impl VisitedPoolInner {
     }
 }
 
-/// Handle to a borrowed visited set from the pool
+/// Handle to a borrowed visited set from the pool.
 pub struct VisitedSet {
-    set: FixedBitSet,
+    set: EpochVisited,
 }
 
 impl VisitedSet {
-    /// Check if a node has been visited
+    /// Check if a node has been visited.
     #[inline(always)]
     pub fn is_visited(&self, id: usize) -> bool {
-        if id >= self.set.len() {
-            return false;
-        }
-        self.set.contains(id)
+        self.set.is_visited(id)
     }
 
-    /// Mark a node as visited
+    /// Mark a node as visited.
     #[inline(always)]
     pub fn visit(&mut self, id: usize) {
-        if id >= self.set.len() {
-            // HNSW can be traversed with sparse/global IDs (e.g. sharded indexes),
-            // so grow on demand when IDs exceed the initial node-count estimate.
-            let current = self.set.len().max(1);
-            let target = id.saturating_add(1);
-            let required = current.max(target);
-            let new_len = required.checked_next_power_of_two().unwrap_or(required);
-            self.set.grow(new_len);
-        }
-        self.set.insert(id);
+        self.set.visit(id);
     }
 
-    /// Clear all visited marks
+    /// Clear visited marks by advancing epoch.
+    #[inline(always)]
     pub fn clear(&mut self) {
         self.set.clear();
     }
 }
 
-/// Pool for managing visited sets
-///
-/// Provides thread-local allocation-free visited set access.
+/// Pool for managing visited sets.
 pub struct VisitedPool;
 
 impl VisitedPool {
-    /// Get a visited set with at least the specified capacity
-    ///
-    /// The returned set is cleared and ready for use.
+    /// Get a visited set with at least the specified capacity.
     pub fn get(capacity: usize) -> VisitedSet {
         VISITED_POOL.with(|pool| {
             let mut pool = pool.borrow_mut();
-
-            // Try to find a reusable set of sufficient size
-            let set = if let Some(idx) = pool.sets.iter().position(|s| s.len() >= capacity) {
-                let mut set = pool.sets.swap_remove(idx);
-                set.clear();
-                set
+            let mut set = if let Some(idx) = pool.sets.iter().position(|s| s.len() >= capacity) {
+                pool.sets.swap_remove(idx)
             } else {
-                // Create new set with some headroom
-                FixedBitSet::with_capacity(capacity.max(1024))
+                EpochVisited::with_capacity(capacity)
             };
-
+            set.clear();
             VisitedSet { set }
         })
     }
 
-    /// Return a visited set to the pool for reuse
+    /// Return a visited set to the pool for reuse.
     pub fn put(visited: VisitedSet) {
         VISITED_POOL.with(|pool| {
             let mut pool = pool.borrow_mut();
-            // Only keep a few sets in the pool
             if pool.sets.len() < 4 {
                 pool.sets.push(visited.set);
             }
-            // Otherwise let it drop
         });
     }
 }
 
-/// RAII guard for automatic pool return
+/// RAII guard for automatic pool return.
 pub struct VisitedGuard {
     set: Option<VisitedSet>,
 }
 
 impl VisitedGuard {
-    /// Borrow a visited set from the pool
+    /// Borrow a visited set from the pool.
     pub fn new(capacity: usize) -> Self {
         Self {
             set: Some(VisitedPool::get(capacity)),
         }
     }
 
-    /// Access the visited set
+    /// Access the visited set.
     #[inline(always)]
     pub fn set(&self) -> &VisitedSet {
-        self.set.as_ref().unwrap()
+        self.set.as_ref().expect("visited set missing")
     }
 
-    /// Access the visited set mutably
+    /// Access the visited set mutably.
     #[inline(always)]
     pub fn set_mut(&mut self) -> &mut VisitedSet {
-        self.set.as_mut().unwrap()
+        self.set.as_mut().expect("visited set missing")
     }
 }
 

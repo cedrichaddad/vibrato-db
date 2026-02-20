@@ -3114,6 +3114,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
+dependencies = [
+ "rmp",
+ "serde",
+]
+
+[[package]]
+name = "roaring"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ba9ce64a8f45d7fc86358410bb1a82e8c987504c0d4900e9141d69a9f26c885"
+dependencies = [
+ "bytemuck",
+ "byteorder",
+]
+
+[[package]]
 name = "rtrb"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3136,6 +3165,12 @@ name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357703d41365b4b27c590e3ed91eabb1b663f07c4c084095e60cbed4362dff0d"
 
 [[package]]
 name = "rustfft"
@@ -4247,6 +4282,8 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "rand",
+ "roaring",
+ "rustc-hash",
  "serde",
  "tempfile",
  "thiserror 1.0.69",
@@ -4262,12 +4299,13 @@ dependencies = [
  "axum",
  "clap",
  "criterion",
- "fixedbitset",
  "libc",
  "parking_lot",
  "rand",
  "rayon",
  "reqwest",
+ "rmp-serde",
+ "roaring",
  "serde",
  "serde_json",
  "sha2",
@@ -4280,6 +4318,8 @@ dependencies = [
  "tracing-subscriber",
  "vibrato-core",
  "vibrato-neural",
+ "vibrato-server",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -4312,6 +4352,27 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokenizers",
+ "tokio",
+ "tracing",
+ "vibrato-core",
+]
+
+[[package]]
+name = "vibrato-server"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "axum",
+ "libc",
+ "parking_lot",
+ "rand",
+ "rayon",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "tracing",
  "vibrato-core",
@@ -5003,6 +5064,12 @@ name = "xkeysym"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "yoke"
