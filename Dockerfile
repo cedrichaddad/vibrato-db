@@ -6,7 +6,7 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends pkg-config libsqlite3-dev ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY src ./src
 COPY crates ./crates
 COPY benches ./benches
