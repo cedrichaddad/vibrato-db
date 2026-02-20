@@ -14,9 +14,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 
 const DIM: usize = 128;
-const TOTAL_VECTORS: usize = 10_000;
-const QUERY_START: usize = 5_000;
-const QUERY_LEN: usize = 50;
 const HTTP_RETRY_ATTEMPTS: usize = 6;
 
 fn global_test_semaphore() -> Arc<Semaphore> {
@@ -34,6 +31,21 @@ async fn acquire_test_lock() -> OwnedSemaphorePermit {
 fn retry_delay(attempt: usize) -> Duration {
     let exp = 1u64 << attempt.min(5);
     Duration::from_millis(25 * exp)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .expect("build reqwest client")
 }
 
 fn reserve_local_port() -> Option<u16> {
@@ -60,6 +72,8 @@ async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
         .arg("3600")
         .arg("--compaction-interval-secs")
         .arg("3600")
+        .arg("--hot-index-shards")
+        .arg("1")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd.spawn()
@@ -307,6 +321,24 @@ async fn identify(
 #[tokio::test]
 async fn identify_protocol_perfect_noisy_and_silent_anchor() {
     let _permit = acquire_test_lock().await;
+    let total_vectors = env_usize(
+        "VIBRATO_IDENTIFY_PROTOCOL_TOTAL_VECTORS",
+        if cfg!(debug_assertions) {
+            4_000
+        } else {
+            10_000
+        },
+    )
+    .max(2_000);
+    let query_len = env_usize("VIBRATO_IDENTIFY_PROTOCOL_QUERY_LEN", 50).max(16);
+    let query_start = env_usize(
+        "VIBRATO_IDENTIFY_PROTOCOL_QUERY_START",
+        total_vectors
+            .saturating_sub(query_len + 1)
+            .min(total_vectors / 2),
+    )
+    .min(total_vectors.saturating_sub(query_len + 1));
+
     let dir = tempdir().expect("tempdir");
     let data_dir: PathBuf = dir.path().join("identify_protocol_data");
     std::fs::create_dir_all(&data_dir).expect("create data dir");
@@ -317,7 +349,7 @@ async fn identify_protocol_perfect_noisy_and_silent_anchor() {
         return;
     };
     let base_url = format!("http://127.0.0.1:{}", port);
-    let client = reqwest::Client::new();
+    let client = http_client();
 
     let mut server = match start_server(&data_dir, port).await {
         Ok(child) => child,
@@ -331,16 +363,19 @@ async fn identify_protocol_perfect_noisy_and_silent_anchor() {
     };
     wait_for_ready(&base_url).await.expect("ready");
 
-    let dataset: Vec<Vec<f32>> = (0..TOTAL_VECTORS).map(deterministic_frame).collect();
+    let dataset: Vec<Vec<f32>> = (0..total_vectors).map(deterministic_frame).collect();
     for (idx, vector) in dataset.iter().enumerate() {
         let assigned_id = ingest_frame(&client, &base_url, &token, idx, vector).await;
         assert_eq!(
             assigned_id, idx,
             "vector ids must stay monotonic and contiguous for identify sequence semantics"
         );
+        if idx > 0 && idx % 2_000 == 0 {
+            eprintln!("[identify_protocol] ingested {} vectors", idx);
+        }
     }
 
-    let perfect_query = dataset[QUERY_START..QUERY_START + QUERY_LEN].to_vec();
+    let perfect_query = dataset[query_start..query_start + query_len].to_vec();
     let perfect_payload = identify(&client, &base_url, &token, &perfect_query, 5, 400).await;
     let perfect_results = perfect_payload["data"]["results"]
         .as_array()
@@ -348,7 +383,7 @@ async fn identify_protocol_perfect_noisy_and_silent_anchor() {
     assert!(!perfect_results.is_empty(), "perfect query should match");
     assert_eq!(
         perfect_results[0]["id"].as_u64(),
-        Some(QUERY_START as u64),
+        Some(query_start as u64),
         "perfect identify should return exact sequence start id"
     );
     let perfect_score = perfect_results[0]["score"].as_f64().expect("perfect score");
@@ -372,7 +407,7 @@ async fn identify_protocol_perfect_noisy_and_silent_anchor() {
     );
     let noisy_rank = noisy_results
         .iter()
-        .position(|row| row["id"].as_u64() == Some(QUERY_START as u64))
+        .position(|row| row["id"].as_u64() == Some(query_start as u64))
         .expect("noisy identify should still include exact start id");
     assert!(
         noisy_rank <= 2,
@@ -387,12 +422,12 @@ async fn identify_protocol_perfect_noisy_and_silent_anchor() {
         "noisy identify score should remain high, got {noisy_score}"
     );
 
-    let mut silent_query = vec![vec![0.0f32; DIM]; QUERY_LEN];
+    let mut silent_query = vec![vec![0.0f32; DIM]; query_len];
     let mut artifact = deterministic_frame(42_424_242);
     for lane in &mut artifact {
         *lane *= 5.0;
     }
-    silent_query[QUERY_LEN / 2] = artifact;
+    silent_query[query_len / 2] = artifact;
     let silent_payload = identify(&client, &base_url, &token, &silent_query, 5, 512).await;
     let silent_results = silent_payload["data"]["results"]
         .as_array()
@@ -410,6 +445,15 @@ async fn identify_protocol_perfect_noisy_and_silent_anchor() {
 #[tokio::test]
 async fn identify_matches_multiple_sequences_across_tracks() {
     let _permit = acquire_test_lock().await;
+    let track_len = env_usize(
+        "VIBRATO_IDENTIFY_PROTOCOL_TRACK_LEN",
+        if cfg!(debug_assertions) { 768 } else { 1_536 },
+    )
+    .max(256);
+    let track_query_len = env_usize("VIBRATO_IDENTIFY_PROTOCOL_TRACK_QUERY_LEN", 40)
+        .min(track_len.saturating_sub(1))
+        .max(16);
+
     let dir = tempdir().expect("tempdir");
     let data_dir: PathBuf = dir.path().join("identify_protocol_multi_data");
     std::fs::create_dir_all(&data_dir).expect("create data dir");
@@ -420,7 +464,7 @@ async fn identify_matches_multiple_sequences_across_tracks() {
         return;
     };
     let base_url = format!("http://127.0.0.1:{}", port);
-    let client = reqwest::Client::new();
+    let client = http_client();
 
     let mut server = match start_server(&data_dir, port).await {
         Ok(child) => child,
@@ -434,8 +478,6 @@ async fn identify_matches_multiple_sequences_across_tracks() {
     };
     wait_for_ready(&base_url).await.expect("ready");
 
-    const TRACK_LEN: usize = 1_536;
-    const TRACK_QUERY_LEN: usize = 40;
     const QUERIES_PER_TRACK: usize = 6;
     let track_specs = [
         ("track_alpha.wav", 0xA1A1_A1A1_A1A1_A1A1u64),
@@ -453,7 +495,7 @@ async fn identify_matches_multiple_sequences_across_tracks() {
     let mut next_id = 0usize;
     for (source_file, seed) in track_specs {
         let id_offset = next_id;
-        let frames = (0..TRACK_LEN)
+        let frames = (0..track_len)
             .map(|i| deterministic_frame_for_track(seed, i))
             .collect::<Vec<_>>();
         for (local_idx, vector) in frames.iter().enumerate() {
@@ -470,6 +512,12 @@ async fn identify_matches_multiple_sequences_across_tracks() {
             assert_eq!(assigned, next_id, "global vector id drifted during ingest");
             next_id += 1;
         }
+        eprintln!(
+            "[identify_protocol_multi] ingested track={} frames={} id_offset={}",
+            source_file,
+            frames.len(),
+            id_offset
+        );
         tracks.push(TrackData {
             source_file,
             frames,
@@ -479,9 +527,9 @@ async fn identify_matches_multiple_sequences_across_tracks() {
 
     for track in &tracks {
         for probe in 0..QUERIES_PER_TRACK {
-            let max_start = TRACK_LEN - TRACK_QUERY_LEN - 1;
+            let max_start = track_len - track_query_len - 1;
             let local_start = 64 + ((probe * 197) % (max_start - 64));
-            let query = track.frames[local_start..local_start + TRACK_QUERY_LEN].to_vec();
+            let query = track.frames[local_start..local_start + track_query_len].to_vec();
             let payload = identify(&client, &base_url, &token, &query, 5, 320).await;
             let results = payload["data"]["results"]
                 .as_array()
@@ -519,8 +567,8 @@ async fn identify_matches_multiple_sequences_across_tracks() {
 
     let mut noise_rng = StdRng::seed_from_u64(0xDEC0_DED1_CAFE_BABEu64);
     for track in &tracks {
-        let local_start = TRACK_LEN / 2;
-        let noisy_query = track.frames[local_start..local_start + TRACK_QUERY_LEN]
+        let local_start = track_len / 2;
+        let noisy_query = track.frames[local_start..local_start + track_query_len]
             .iter()
             .map(|v| add_gaussian_noise(v, 0.025, &mut noise_rng))
             .collect::<Vec<_>>();

@@ -130,6 +130,7 @@ pub fn restore_snapshot(config: &ProductionConfig, snapshot_dir: &Path) -> Resul
     std::fs::create_dir_all(backup_root.join("segments"))?;
 
     let catalog_dst = config.catalog_path();
+    let (catalog_wal_dst, catalog_shm_dst) = sqlite_sidecar_paths(&catalog_dst);
     if catalog_dst.exists() {
         let backup_catalog = backup_root.join("catalog.sqlite3");
         std::fs::rename(&catalog_dst, &backup_catalog).with_context(|| {
@@ -138,6 +139,21 @@ pub fn restore_snapshot(config: &ProductionConfig, snapshot_dir: &Path) -> Resul
                 catalog_dst, backup_catalog
             )
         })?;
+    }
+    for sidecar in [&catalog_wal_dst, &catalog_shm_dst] {
+        if sidecar.exists() {
+            let file_name = sidecar
+                .file_name()
+                .map(|v| v.to_os_string())
+                .unwrap_or_else(|| std::ffi::OsString::from("catalog.sidecar"));
+            let backup_sidecar = backup_root.join(file_name);
+            std::fs::rename(sidecar, &backup_sidecar).with_context(|| {
+                format!(
+                    "backing up catalog sidecar {:?} -> {:?}",
+                    sidecar, backup_sidecar
+                )
+            })?;
+        }
     }
 
     for entry in std::fs::read_dir(&config.segments_dir)? {
@@ -161,6 +177,7 @@ pub fn restore_snapshot(config: &ProductionConfig, snapshot_dir: &Path) -> Resul
         )
     })?;
     sync_file(&catalog_dst)?;
+    sync_dir(&config.data_dir)?;
 
     for seg in &manifest.segments {
         let src = snapshot_dir.join("segments").join(&seg.snapshot_file);
@@ -269,6 +286,14 @@ fn make_snapshot_id() -> String {
         suffix.push_str(&format!("{:02x}", b));
     }
     format!("snap_{}_{}", now_unix_ts(), suffix)
+}
+
+fn sqlite_sidecar_paths(db_path: &Path) -> (PathBuf, PathBuf) {
+    let mut wal = db_path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = db_path.as_os_str().to_os_string();
+    shm.push("-shm");
+    (PathBuf::from(wal), PathBuf::from(shm))
 }
 
 fn sql_quote(value: &str) -> String {

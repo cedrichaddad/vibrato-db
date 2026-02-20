@@ -1,5 +1,6 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,59 @@ use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
 const DIM: usize = 16;
+
+fn process_rss_kb(pid: u32) -> Option<u64> {
+    let output = StdCommand::new("ps")
+        .arg("-o")
+        .arg("rss=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim().parse::<u64>().ok()
+}
+
+fn process_fd_count(pid: u32) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let fd_dir = format!("/proc/{}/fd", pid);
+        if let Ok(entries) = std::fs::read_dir(fd_dir) {
+            return Some(entries.count());
+        }
+    }
+
+    let output = StdCommand::new("lsof")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let lines = String::from_utf8_lossy(&output.stdout);
+    Some(lines.lines().skip(1).count())
+}
+
+fn count_tmp_vdb_files(tmp_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(tmp_dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .file_name()
+                .and_then(|v| v.to_str())
+                .map(|name| name.ends_with(".vdb.tmp"))
+                .unwrap_or(false)
+        })
+        .count()
+}
 
 fn reserve_local_port() -> Option<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
@@ -101,16 +155,38 @@ fn normalized_vector(seed: u64, idx: usize) -> Vec<f32> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "24h soak harness; run on dedicated runner with VIBRATO_SOAK_SECS=86400"]
+#[ignore = "72h soak harness; run on dedicated runner with VIBRATO_SOAK_SECS=259200"]
 async fn mixed_workload_soak() {
     let soak_secs = std::env::var("VIBRATO_SOAK_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(86_400);
+        .unwrap_or(259_200);
     let soak_seed = std::env::var("VIBRATO_SOAK_SEED")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(42);
+    let sample_interval_secs = std::env::var("VIBRATO_SOAK_SAMPLE_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60)
+        .max(5);
+    let target_ops_per_sec = std::env::var("VIBRATO_SOAK_TARGET_OPS_PER_SEC")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(500)
+        .max(1);
+    let max_rss_growth_pct = std::env::var("VIBRATO_SOAK_MAX_RSS_GROWTH_PCT")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(35.0);
+    let max_fd_growth = std::env::var("VIBRATO_SOAK_MAX_FD_GROWTH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(256);
+    let max_tmp_vdb_files = std::env::var("VIBRATO_SOAK_MAX_TMP_VDB_FILES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(8);
 
     let dir = tempdir().expect("tempdir");
     let data_dir: PathBuf = dir.path().join("soak_data");
@@ -132,11 +208,15 @@ async fn mixed_workload_soak() {
         .await
         .expect("start soak server");
     wait_for_ready(&base_url).await.expect("ready");
+    let server_pid = server.id().unwrap_or(0);
 
     let start = Instant::now();
+    let mut next_sample_at = Instant::now() + Duration::from_secs(sample_interval_secs);
     let mut op_idx = 0usize;
     let mut ingested = 0usize;
     let mut known_vectors: Vec<Vec<f32>> = Vec::new();
+    let mut rss_samples_kb = Vec::<u64>::new();
+    let mut fd_samples = Vec::<usize>::new();
 
     while start.elapsed().as_secs() < soak_secs {
         let roll = rng.gen::<u8>() % 100;
@@ -210,7 +290,21 @@ async fn mixed_workload_soak() {
                 "server became unready during soak"
             );
         }
+        if server_pid > 0 && Instant::now() >= next_sample_at {
+            if let Some(rss) = process_rss_kb(server_pid) {
+                rss_samples_kb.push(rss);
+            }
+            if let Some(fd_count) = process_fd_count(server_pid) {
+                fd_samples.push(fd_count);
+            }
+            next_sample_at += Duration::from_secs(sample_interval_secs);
+        }
+
         op_idx += 1;
+        let expected_elapsed = Duration::from_secs_f64(op_idx as f64 / target_ops_per_sec as f64);
+        if expected_elapsed > start.elapsed() {
+            sleep(expected_elapsed - start.elapsed()).await;
+        }
     }
 
     let stats = client
@@ -222,11 +316,50 @@ async fn mixed_workload_soak() {
     assert_eq!(stats.status(), StatusCode::OK);
     let payload: serde_json::Value = stats.json().await.expect("stats json");
     let total_vectors = payload["data"]["total_vectors"].as_u64().unwrap_or(0);
-    assert!(
-        total_vectors >= ingested as u64,
-        "stats total_vectors should cover ingested writes (stats={}, ingested={})",
+    assert_eq!(
+        total_vectors,
+        ingested as u64,
+        "stats total_vectors should equal ingested writes in append-only soak (stats={}, ingested={})",
         total_vectors,
         ingested
+    );
+
+    if rss_samples_kb.len() >= 4 {
+        let first = rss_samples_kb[0] as f64;
+        let max_seen = *rss_samples_kb.iter().max().unwrap_or(&rss_samples_kb[0]) as f64;
+        let growth_pct = if first <= 0.0 {
+            0.0
+        } else {
+            ((max_seen - first) / first) * 100.0
+        };
+        assert!(
+            growth_pct <= max_rss_growth_pct,
+            "rss growth exceeded threshold: first_kb={} max_kb={} growth_pct={:.2} limit_pct={:.2}",
+            first,
+            max_seen,
+            growth_pct,
+            max_rss_growth_pct
+        );
+    }
+
+    if fd_samples.len() >= 4 {
+        let first = fd_samples[0];
+        let max_seen = *fd_samples.iter().max().unwrap_or(&first);
+        assert!(
+            max_seen <= first.saturating_add(max_fd_growth),
+            "fd growth exceeded threshold: first={} max={} limit={}",
+            first,
+            max_seen,
+            first.saturating_add(max_fd_growth)
+        );
+    }
+
+    let tmp_vdb_files = count_tmp_vdb_files(&data_dir.join("tmp"));
+    assert!(
+        tmp_vdb_files <= max_tmp_vdb_files,
+        "tmp segment leak suspected: tmp_vdb_files={} limit={}",
+        tmp_vdb_files,
+        max_tmp_vdb_files
     );
 
     stop_server(&mut server).await;

@@ -9,6 +9,10 @@ on:
         description: "Crash matrix seed count"
         required: false
         default: "100"
+      jepsen_crash_seeds:
+        description: "Jepsen-style kill-while-writing seed count"
+        required: false
+        default: "24"
       enforce_madvise_gate:
         description: "Set to 1 to fail on madvise random regression threshold"
         required: false
@@ -29,10 +33,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Crash matrix full
         env:
           VIBRATO_CRASH_SEEDS: ${{ github.event.inputs.crash_seeds || '100' }}
+          VIBRATO_JEPSEN_CRASH_SEEDS: ${{ github.event.inputs.jepsen_crash_seeds || '24' }}
         run: bash scripts/ci/run_crash_matrix.sh
 
   perf-and-recall:
@@ -41,6 +48,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Recall gate
         run: cargo test -p vibrato-core hnsw::index::tests::test_recall -- --exact
@@ -56,6 +65,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Mixed workload soak harness (manual)
         env:

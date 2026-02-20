@@ -1,11 +1,16 @@
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tempfile::tempdir;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
@@ -23,6 +28,45 @@ struct AckRecord {
     duration_ms: u16,
     bpm: f32,
     tags: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ReplayRecord {
+    idempotency_key: String,
+    vector: Vec<f32>,
+    source_file: String,
+    start_time_ms: u32,
+    duration_ms: u16,
+    bpm: f32,
+    tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct IngestRequest {
+    vector: Vec<f32>,
+    metadata: serde_json::Value,
+    idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct IngestBatchRequest {
+    vectors: Vec<IngestRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct IngestBatchResponseEnvelope {
+    data: IngestBatchResponseData,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct IngestBatchResponseData {
+    results: Vec<IngestBatchResult>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct IngestBatchResult {
+    id: usize,
+    created: bool,
 }
 
 fn reserve_local_port() -> Option<u16> {
@@ -187,6 +231,97 @@ async fn ingest_one(
     })
 }
 
+async fn ingest_batch(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    seed: u64,
+    worker_id: usize,
+    start_idx: usize,
+    count: usize,
+) -> (Vec<AckRecord>, Vec<ReplayRecord>) {
+    let mut requests = Vec::with_capacity(count);
+    let mut template = Vec::with_capacity(count);
+    for i in 0..count {
+        let idx = start_idx + i;
+        let vector = normalized_vector(seed ^ ((worker_id as u64) << 32), idx);
+        let source_file = format!("jepsen_seed{seed}_w{worker_id}_{idx}.wav");
+        let start_time_ms = idx as u32;
+        let duration_ms = 48u16;
+        let bpm = 95.0 + ((idx % 100) as f32) * 0.25;
+        let tags = vec![
+            "drums".to_string(),
+            "crash".to_string(),
+            format!("worker-{worker_id}"),
+        ];
+        let idempotency_key = format!("jepsen-{seed}-{worker_id}-{idx}");
+        requests.push(IngestRequest {
+            vector: vector.clone(),
+            metadata: serde_json::json!({
+                "source_file": source_file,
+                "start_time_ms": start_time_ms,
+                "duration_ms": duration_ms,
+                "bpm": bpm,
+                "tags": tags
+            }),
+            idempotency_key: Some(idempotency_key.clone()),
+        });
+        template.push(ReplayRecord {
+            idempotency_key,
+            vector,
+            source_file: format!("jepsen_seed{seed}_w{worker_id}_{idx}.wav"),
+            start_time_ms,
+            duration_ms,
+            bpm,
+            tags: vec![
+                "drums".to_string(),
+                "crash".to_string(),
+                format!("worker-{worker_id}"),
+            ],
+        });
+    }
+
+    let payload = IngestBatchRequest { vectors: requests };
+    let response = match client
+        .post(format!("{}/v2/vectors/batch", base_url))
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return (Vec::new(), template),
+    };
+    if response.status() != StatusCode::CREATED {
+        return (Vec::new(), template);
+    }
+    let parsed: IngestBatchResponseEnvelope = match response.json().await {
+        Ok(v) => v,
+        Err(_) => return (Vec::new(), template),
+    };
+    if parsed.data.results.len() != template.len() {
+        return (Vec::new(), template);
+    }
+
+    let mut out = Vec::with_capacity(template.len());
+    for (rec, result) in template.iter().zip(parsed.data.results.into_iter()) {
+        if !result.created {
+            continue;
+        }
+        out.push(AckRecord {
+            vector_id: result.id,
+            idempotency_key: rec.idempotency_key.clone(),
+            vector: rec.vector.clone(),
+            source_file: rec.source_file.clone(),
+            start_time_ms: rec.start_time_ms,
+            duration_ms: rec.duration_ms,
+            bpm: rec.bpm,
+            tags: rec.tags.clone(),
+        });
+    }
+    (out, template)
+}
+
 async fn admin_post(client: &reqwest::Client, base_url: &str, token: &str, path: &str) {
     let _ = client
         .post(format!("{}/{}", base_url, path))
@@ -240,6 +375,49 @@ async fn verify_ack_records(
             rec.idempotency_key
         );
     }
+}
+
+async fn replay_attempted_records(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    records: &[ReplayRecord],
+) -> anyhow::Result<(usize, usize)> {
+    let mut existing = 0usize;
+    let mut inserted = 0usize;
+    for rec in records {
+        let body = serde_json::json!({
+            "vector": rec.vector,
+            "metadata": {
+                "source_file": rec.source_file,
+                "start_time_ms": rec.start_time_ms,
+                "duration_ms": rec.duration_ms,
+                "bpm": rec.bpm,
+                "tags": rec.tags
+            },
+            "idempotency_key": rec.idempotency_key
+        });
+
+        let resp = client
+            .post(format!("{}/v2/vectors", base_url))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            resp.status() == StatusCode::CREATED,
+            "replay ingest failed for {}: status={}",
+            rec.idempotency_key,
+            resp.status()
+        );
+        let payload: serde_json::Value = resp.json().await?;
+        if payload["data"]["created"].as_bool() == Some(false) {
+            existing += 1;
+        } else {
+            inserted += 1;
+        }
+    }
+    Ok((existing, inserted))
 }
 
 fn verify_metadata_integrity(data_dir: &Path, records: &[AckRecord]) -> anyhow::Result<()> {
@@ -373,6 +551,203 @@ async fn run_seed(seed: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_jepsen_seed(seed: u64) -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let data_dir = dir.path().join(format!("jepsen_seed_{seed}"));
+    std::fs::create_dir_all(&data_dir)?;
+    let token = create_api_key(&data_dir)?;
+
+    let Some(port) = reserve_local_port() else {
+        return Ok(());
+    };
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    let mut server = start_server(&data_dir, port).await?;
+    wait_for_ready(&base_url)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let writer_concurrency = std::env::var("VIBRATO_JEPSEN_WRITERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+        .max(1);
+    let batch_size = std::env::var("VIBRATO_JEPSEN_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64)
+        .max(1);
+    let kill_min_ms = std::env::var("VIBRATO_JEPSEN_KILL_MIN_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(80);
+    let kill_max_ms = std::env::var("VIBRATO_JEPSEN_KILL_MAX_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1200)
+        .max(kill_min_ms);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let next_idx = Arc::new(AtomicUsize::new(0));
+    let acked = Arc::new(Mutex::new(Vec::<AckRecord>::new()));
+    let attempted = Arc::new(Mutex::new(Vec::<ReplayRecord>::new()));
+
+    let mut writers = Vec::with_capacity(writer_concurrency);
+    for worker_id in 0..writer_concurrency {
+        let client = client.clone();
+        let token = token.clone();
+        let base_url = base_url.clone();
+        let stop = stop.clone();
+        let next_idx = next_idx.clone();
+        let acked = acked.clone();
+        let attempted = attempted.clone();
+        writers.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                let start = next_idx.fetch_add(batch_size, Ordering::Relaxed);
+                let (batch, attempted_batch) = ingest_batch(
+                    &client, &base_url, &token, seed, worker_id, start, batch_size,
+                )
+                .await;
+                if !attempted_batch.is_empty() {
+                    attempted.lock().extend(attempted_batch);
+                }
+                if !batch.is_empty() {
+                    acked.lock().extend(batch);
+                } else if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x6EAF_D11D_55AA_9021);
+    let kill_delay_ms = if kill_max_ms == kill_min_ms {
+        kill_min_ms
+    } else {
+        rng.gen_range(kill_min_ms..=kill_max_ms)
+    };
+    sleep(Duration::from_millis(kill_delay_ms)).await;
+    kill_server(&mut server).await;
+    stop.store(true, Ordering::Relaxed);
+
+    for task in writers {
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+    let acked_records = acked.lock().clone();
+    let acked_count = acked_records.len();
+    let attempted_records = attempted.lock().clone();
+    let attempted_unique = {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for rec in attempted_records {
+            if seen.insert(rec.idempotency_key.clone()) {
+                out.push(rec);
+            }
+        }
+        out
+    };
+    let attempted_unique_count = attempted_unique.len();
+
+    let Some(restart_port) = reserve_local_port() else {
+        return Ok(());
+    };
+    let restart_url = format!("http://127.0.0.1:{}", restart_port);
+    let mut restarted = start_server(&data_dir, restart_port).await?;
+    wait_for_ready(&restart_url)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let verify_cap = std::env::var("VIBRATO_JEPSEN_VERIFY_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(500);
+    let verify_records = if acked_records.len() > verify_cap {
+        let stride = (acked_records.len() / verify_cap).max(1);
+        acked_records
+            .iter()
+            .step_by(stride)
+            .take(verify_cap)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        acked_records.clone()
+    };
+
+    verify_ack_records(&client, &restart_url, &token, &verify_records).await;
+    verify_metadata_integrity(&data_dir, &verify_records)?;
+
+    let stats_before_replay_resp = client
+        .get(format!("{}/v2/admin/stats", restart_url))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        stats_before_replay_resp.status() == StatusCode::OK,
+        "stats endpoint failed after restart: status={}",
+        stats_before_replay_resp.status()
+    );
+    let stats_before_replay: serde_json::Value = stats_before_replay_resp.json().await?;
+    let total_vectors_before_replay = stats_before_replay["data"]["total_vectors"]
+        .as_u64()
+        .unwrap_or(0) as usize;
+
+    let (replay_existing, replay_inserted) =
+        replay_attempted_records(&client, &restart_url, &token, &attempted_unique).await?;
+
+    anyhow::ensure!(
+        replay_existing == total_vectors_before_replay,
+        "jepsen mismatch before replay: seed={} kill_delay_ms={} total_vectors_before_replay={} replay_existing={}",
+        seed,
+        kill_delay_ms,
+        total_vectors_before_replay,
+        replay_existing
+    );
+    anyhow::ensure!(
+        replay_existing >= acked_count,
+        "acked durability violated: seed={} kill_delay_ms={} acked_count={} replay_existing={}",
+        seed,
+        kill_delay_ms,
+        acked_count,
+        replay_existing
+    );
+    anyhow::ensure!(
+        replay_existing + replay_inserted == attempted_unique_count,
+        "attempt ledger mismatch: seed={} attempted_unique={} replay_existing={} replay_inserted={}",
+        seed,
+        attempted_unique_count,
+        replay_existing,
+        replay_inserted
+    );
+
+    let stats_after_replay_resp = client
+        .get(format!("{}/v2/admin/stats", restart_url))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        stats_after_replay_resp.status() == StatusCode::OK,
+        "stats endpoint failed after replay: status={}",
+        stats_after_replay_resp.status()
+    );
+    let stats_after_replay: serde_json::Value = stats_after_replay_resp.json().await?;
+    let total_vectors_after_replay = stats_after_replay["data"]["total_vectors"]
+        .as_u64()
+        .unwrap_or(0) as usize;
+    anyhow::ensure!(
+        total_vectors_after_replay == attempted_unique_count,
+        "replay final count mismatch: seed={} expected={} actual={}",
+        seed,
+        attempted_unique_count,
+        total_vectors_after_replay
+    );
+
+    stop_server(&mut restarted).await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "long-running crash-matrix suite; run in CI nightly or explicitly"]
 async fn crash_matrix_kill9_100_seed_integrity() {
@@ -385,5 +760,19 @@ async fn crash_matrix_kill9_100_seed_integrity() {
         run_seed(seed)
             .await
             .unwrap_or_else(|e| panic!("seed {} failed: {}", seed, e));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "jepsen-style kill-9 during active batch ingest; run in CI/nightly or explicitly"]
+async fn crash_matrix_kill9_random_ms_exact_ack_recovery() {
+    let seeds = std::env::var("VIBRATO_JEPSEN_CRASH_SEEDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(24);
+    for seed in 0..seeds {
+        run_jepsen_seed(seed)
+            .await
+            .unwrap_or_else(|e| panic!("jepsen seed {} failed: {}", seed, e));
     }
 }

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 use tempfile::tempdir;
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
@@ -33,22 +34,54 @@ async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
         .arg("--compaction-interval-secs")
         .arg("3600")
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     cmd.spawn()
 }
 
-async fn wait_for_ready(base_url: &str) -> Result<(), String> {
+async fn wait_for_ready(
+    child: &mut Child,
+    base_url: &str,
+    token: Option<&str>,
+) -> Result<(), String> {
     let client = reqwest::Client::new();
     let ready_url = format!("{}/v2/health/ready", base_url);
-    for _ in 0..80 {
-        if let Ok(resp) = client.get(&ready_url).send().await {
-            if resp.status() == StatusCode::OK {
+    let mut last_status = String::new();
+    let mut last_body = String::new();
+    for _ in 0..180 {
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut stderr_text = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut stderr_text).await;
+            }
+            return Err(format!(
+                "server exited before ready: status={} url={} stderr={}",
+                status,
+                ready_url,
+                stderr_text.trim()
+            ));
+        }
+
+        let mut req = client.get(&ready_url);
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        if let Ok(resp) = req.send().await {
+            let status = resp.status();
+            if status == StatusCode::OK {
                 return Ok(());
+            }
+            last_status = status.to_string();
+            last_body = resp.text().await.unwrap_or_default();
+            if last_body.len() > 300 {
+                last_body.truncate(300);
             }
         }
         sleep(Duration::from_millis(100)).await;
     }
-    Err(format!("server did not become ready at {}", ready_url))
+    Err(format!(
+        "server did not become ready at {} (last_status={} last_body={})",
+        ready_url, last_status, last_body
+    ))
 }
 
 async fn stop_server(child: &mut Child) {
@@ -178,7 +211,9 @@ async fn snapshot_restore_reverts_catalog_and_segments_to_snapshot_point() {
             return;
         }
     };
-    wait_for_ready(&base_url).await.expect("ready");
+    wait_for_ready(&mut server, &base_url, Some(&token))
+        .await
+        .expect("ready");
 
     ingest_count(&client, &base_url, &token, "pre", 0, 30).await;
     let checkpoint = client
@@ -193,7 +228,7 @@ async fn snapshot_restore_reverts_catalog_and_segments_to_snapshot_point() {
     let snapshot_dir = run_snapshot_create(&data_dir).expect("create snapshot");
 
     let mut server2 = start_server(&data_dir, port).await.expect("restart server");
-    wait_for_ready(&base_url)
+    wait_for_ready(&mut server2, &base_url, Some(&token))
         .await
         .expect("ready after restart");
     ingest_count(&client, &base_url, &token, "post", 30, 10).await;
@@ -211,7 +246,7 @@ async fn snapshot_restore_reverts_catalog_and_segments_to_snapshot_point() {
     let mut server3 = start_server(&data_dir, port)
         .await
         .expect("restart after restore");
-    wait_for_ready(&base_url)
+    wait_for_ready(&mut server3, &base_url, Some(&token))
         .await
         .expect("ready after snapshot restore");
     let stats_resp = client

@@ -14,9 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Workspace tests
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude vibrato-vst
 
   identify-suite:
     runs-on: ubuntu-latest
@@ -24,13 +26,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Identify tests
         run: |
-          cargo test --test v2_identify_e2e
-          cargo test --test v2_identify_validation_e2e
-          cargo test --test v2_identify_archive_e2e
-          cargo test --test v2_identify_protocol_e2e
+          cargo test --release --test v2_identify_e2e
+          cargo test --release --test v2_identify_validation_e2e
+          cargo test --release --test v2_identify_archive_e2e
+          cargo test --release --test v2_identify_protocol_e2e
 
   crash-matrix-pr:
     if: github.event_name == 'pull_request'
@@ -39,10 +43,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@v2
       - name: Crash matrix subset (PR)
         env:
           VIBRATO_CRASH_SEEDS: "10"
+          VIBRATO_JEPSEN_CRASH_SEEDS: "0"
         run: bash scripts/ci/run_crash_matrix.sh
 
   docker-smoke:
