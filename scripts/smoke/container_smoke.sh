@@ -4,9 +4,27 @@ set -euo pipefail
 IMAGE_TAG="${IMAGE_TAG:-vibrato-db:smoke}"
 PORT="${PORT:-18080}"
 CONTAINER_NAME="${CONTAINER_NAME:-vibrato-smoke}"
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
 
 tmp_root="$(mktemp -d)"
-trap 'docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true; rm -rf "${tmp_root}"' EXIT
+mkdir -p "${tmp_root}/data"
+
+cleanup() {
+  set +e
+  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  rm -rf "${tmp_root}" >/dev/null 2>&1 && return 0
+
+  # If container wrote root-owned files to the bind mount, retake ownership
+  # via a short-lived container and retry deletion.
+  docker run --rm \
+    --entrypoint sh \
+    -v "${tmp_root}:/cleanup" \
+    "${IMAGE_TAG}" \
+    -c "chown -R ${HOST_UID}:${HOST_GID} /cleanup || true" >/dev/null 2>&1 || true
+  rm -rf "${tmp_root}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 echo "[smoke] building ${IMAGE_TAG}"
 docker build -t "${IMAGE_TAG}" .
@@ -14,6 +32,7 @@ docker build -t "${IMAGE_TAG}" .
 echo "[smoke] starting container ${CONTAINER_NAME}"
 docker run -d \
   --name "${CONTAINER_NAME}" \
+  --user "${HOST_UID}:${HOST_GID}" \
   -p "${PORT}:8080" \
   -v "${tmp_root}/data:/var/lib/vibrato" \
   "${IMAGE_TAG}" \
