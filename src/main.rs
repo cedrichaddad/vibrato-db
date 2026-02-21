@@ -28,8 +28,8 @@ use vibrato_db::format_v2::{VdbHeaderV2, VdbWriterV2};
 use vibrato_db::hnsw::HNSW;
 use vibrato_db::prod::{
     bootstrap_data_dirs, create_snapshot, create_v2_router, migrate_existing_vdb_to_segment,
-    recover_state, replay_to_lsn, restore_snapshot, CatalogOptions, CatalogStore, ProductionConfig,
-    ProductionState, Role, SqliteCatalog, VectorMadviseMode,
+    recover_state, replay_to_lsn, restore_snapshot, start_flight_server, CatalogOptions,
+    CatalogStore, ProductionConfig, ProductionState, Role, SqliteCatalog, VectorMadviseMode,
 };
 use vibrato_db::server::{
     load_store_metadata, serve, AppState, SearchRequest, SearchResponse, SharedStore,
@@ -233,6 +233,14 @@ enum Commands {
         /// Vector mmap advise mode for active segment vectors: normal|random
         #[arg(long, default_value = "normal")]
         vector_madvise_mode: String,
+
+        /// Arrow Flight gRPC host (used when --flight-port is provided)
+        #[arg(long, default_value = "0.0.0.0")]
+        flight_host: String,
+
+        /// Optional Arrow Flight gRPC port for high-throughput ingest data plane
+        #[arg(long)]
+        flight_port: Option<u16>,
 
         /// Bootstrap first admin API key if no keys exist in catalog
         #[arg(long, default_value_t = false)]
@@ -584,6 +592,8 @@ async fn main() -> anyhow::Result<()> {
             ingest_queue_capacity,
             memory_budget_bytes,
             vector_madvise_mode,
+            flight_host,
+            flight_port,
             bootstrap_admin_key,
         } => {
             let mut config = ProductionConfig::from_data_dir(data_dir, collection, dim);
@@ -625,12 +635,28 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("{}", report.report);
 
             state.start_background_workers();
+            let router = create_v2_router(state.clone());
+            let http_addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+            tracing::info!("Starting Vibrato v2 HTTP control plane on {}", http_addr);
+            let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
 
-            let router = create_v2_router(state);
-            let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-            tracing::info!("Starting Vibrato v2 server on {}", addr);
-            let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, router).await?;
+            if let Some(flight_port) = flight_port {
+                let flight_addr: SocketAddr = format!("{}:{}", flight_host, flight_port).parse()?;
+                tracing::info!(
+                    "Starting Vibrato Arrow Flight ingest data plane on {}",
+                    flight_addr
+                );
+                tokio::select! {
+                    http_res = axum::serve(http_listener, router) => {
+                        http_res?;
+                    }
+                    flight_res = start_flight_server(state, flight_addr) => {
+                        flight_res?;
+                    }
+                }
+            } else {
+                axum::serve(http_listener, router).await?;
+            }
         }
 
         Commands::KeyCreate {

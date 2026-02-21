@@ -13,6 +13,7 @@
 //! **Search**: Start at entry point, greedy descent to layer 0, then beam search
 //! on layer 0 with ef candidates.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -84,6 +85,56 @@ impl PartialOrd for SearchResult {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// Reusable heap buffers for `search_layer` to avoid per-call allocations.
+struct SearchScratch {
+    candidates: BinaryHeap<Candidate>,
+    results: BinaryHeap<SearchResult>,
+}
+
+impl SearchScratch {
+    #[inline]
+    fn new(initial_ef: usize) -> Self {
+        let ef = initial_ef.max(1);
+        Self {
+            candidates: BinaryHeap::with_capacity(ef),
+            results: BinaryHeap::with_capacity(ef + 1),
+        }
+    }
+
+    #[inline]
+    fn prepare(&mut self, ef: usize) {
+        let ef = ef.max(1);
+        self.candidates.clear();
+        self.results.clear();
+
+        if self.candidates.capacity() < ef {
+            self.candidates.reserve(ef - self.candidates.capacity());
+        }
+        if self.results.capacity() < ef + 1 {
+            self.results.reserve((ef + 1) - self.results.capacity());
+        }
+    }
+}
+
+struct QueryScratch {
+    search: SearchScratch,
+    layer_candidates: Vec<(usize, f32)>,
+}
+
+impl QueryScratch {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            search: SearchScratch::new(32),
+            layer_candidates: Vec::with_capacity(128),
+        }
+    }
+}
+
+thread_local! {
+    static QUERY_SCRATCH: RefCell<QueryScratch> = RefCell::new(QueryScratch::new());
 }
 
 /// HNSW Index
@@ -254,15 +305,13 @@ impl HNSW {
         out
     }
 
-    /// Compute distance between query and node (dot product for normalized vectors)
-    /// Returns negative dot product so smaller = more similar
+    /// Compute distance between query and node (dot product for normalized vectors).
+    /// Returns negative similarity so smaller = more similar, without extra subtraction.
     #[inline]
     fn distance(&self, query: &[f32], node_id: usize) -> f32 {
         let mut dist = 0.0f32;
         self.with_vector(node_id, &mut |node_vec| {
-            // For normalized vectors, higher dot product = more similar.
-            // We return 1 - dot_product to convert to a distance metric.
-            dist = 1.0 - dot_product(query, node_vec);
+            dist = -dot_product(query, node_vec);
         });
         dist
     }
@@ -295,12 +344,23 @@ impl HNSW {
 
         let entry_point = self.entry_point.unwrap();
         let mut current_node = entry_point;
+        let mut visited = VisitedGuard::new(self.nodes.len().max(1024));
+        let mut scratch = SearchScratch::new(self.ef_construction.max(1));
+        let mut layer_candidates: Vec<(usize, f32)> = Vec::new();
 
         // Phase 1: Zoom in from top layer to node_layer + 1
         // Greedy search, single best neighbor per layer
         for layer in (node_layer + 1..=self.max_layer).rev() {
-            let nearest = self.search_layer(&query, &[current_node], 1, layer);
-            if let Some((nearest_id, _)) = nearest.first() {
+            self.search_layer_into(
+                &query,
+                &[current_node],
+                1,
+                layer,
+                &mut visited,
+                &mut scratch,
+                &mut layer_candidates,
+            );
+            if let Some((nearest_id, _)) = layer_candidates.first() {
                 current_node = *nearest_id;
             }
         }
@@ -318,11 +378,18 @@ impl HNSW {
             let m_layer = if layer == 0 { self.m0 } else { self.m };
 
             // Find candidates for this layer
-            let candidates =
-                self.search_layer(&query, &[current_node], self.ef_construction, layer);
+            self.search_layer_into(
+                &query,
+                &[current_node],
+                self.ef_construction,
+                layer,
+                &mut visited,
+                &mut scratch,
+                &mut layer_candidates,
+            );
 
             // Select neighbors using the heuristic
-            let neighbors = self.select_neighbors(&query, &candidates, m_layer);
+            let neighbors = self.select_neighbors(&query, &layer_candidates, m_layer);
 
             // Add forward edges to new node
             for &(neighbor_id, _) in &neighbors {
@@ -347,7 +414,7 @@ impl HNSW {
                             for &n in &all_neighbors {
                                 let mut dist = 0.0f32;
                                 self.with_vector(n, &mut |v| {
-                                    dist = 1.0 - dot_product(neighbor_vec, v);
+                                    dist = -dot_product(neighbor_vec, v);
                                 });
                                 neighbor_candidates.push((n, dist));
                             }
@@ -361,7 +428,7 @@ impl HNSW {
             }
 
             // Use first candidate as entry for next layer
-            if let Some((first_id, _)) = candidates.first() {
+            if let Some((first_id, _)) = layer_candidates.first() {
                 current_node = *first_id;
             }
         }
@@ -402,21 +469,21 @@ impl HNSW {
     /// Search for nearest neighbors on a single layer
     ///
     /// Greedy beam search with `ef` candidates.
-    fn search_layer(
+    fn search_layer_into(
         &self,
         query: &[f32],
         entry_points: &[usize],
         ef: usize,
         layer: usize,
-    ) -> Vec<(usize, f32)> {
-        let mut visited = VisitedGuard::new(self.nodes.len().max(1024));
-
-        // Candidates to explore (min-heap by distance)
-        // Pre-allocate for performance
-        let mut candidates: BinaryHeap<Candidate> = BinaryHeap::with_capacity(ef);
-
-        // Found neighbors (max-heap to track worst)
-        let mut results: BinaryHeap<SearchResult> = BinaryHeap::with_capacity(ef + 1);
+        visited: &mut VisitedGuard,
+        scratch: &mut SearchScratch,
+        out: &mut Vec<(usize, f32)>,
+    ) {
+        let ef = ef.max(1);
+        visited.clear();
+        scratch.prepare(ef);
+        let candidates = &mut scratch.candidates;
+        let results = &mut scratch.results;
         let mut worst_distance = f32::INFINITY;
 
         // Initialize with entry points
@@ -480,10 +547,10 @@ impl HNSW {
             }
         }
 
-        // Convert to sorted vec
-        let mut result_vec: Vec<_> = results.into_iter().map(|r| (r.id, r.distance)).collect();
-        result_vec.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        result_vec
+        // Convert to sorted vec while keeping heap allocations for reuse.
+        out.clear();
+        out.extend(results.iter().map(|r| (r.id, r.distance)));
+        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     }
 
     /// Select neighbors using diversity-preserving heuristic
@@ -517,7 +584,7 @@ impl HNSW {
                 for &(existing_id, _) in &result {
                     let mut dist_to_existing = 0.0f32;
                     self.with_vector(existing_id, &mut |existing_vec| {
-                        dist_to_existing = 1.0 - dot_product(candidate_vec, existing_vec);
+                        dist_to_existing = -dot_product(candidate_vec, existing_vec);
                     });
 
                     if dist_to_existing < candidate_dist {
@@ -563,26 +630,50 @@ impl HNSW {
             return Vec::new();
         }
 
-        let entry_point = self.entry_point.unwrap();
-        let mut current_node = entry_point;
+        QUERY_SCRATCH.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let QueryScratch {
+                search,
+                layer_candidates,
+            } = &mut *slot;
+            let entry_point = self.entry_point.unwrap();
+            let mut current_node = entry_point;
+            let mut visited = VisitedGuard::new(self.nodes.len().max(1024));
 
-        // Phase 1: Greedy descent from top layer to layer 1
-        for layer in (1..=self.max_layer).rev() {
-            let nearest = self.search_layer(query, &[current_node], 1, layer);
-            if let Some((nearest_id, _)) = nearest.first() {
-                current_node = *nearest_id;
+            // Phase 1: Greedy descent from top layer to layer 1
+            for layer in (1..=self.max_layer).rev() {
+                self.search_layer_into(
+                    query,
+                    &[current_node],
+                    1,
+                    layer,
+                    &mut visited,
+                    search,
+                    layer_candidates,
+                );
+                if let Some((nearest_id, _)) = layer_candidates.first() {
+                    current_node = *nearest_id;
+                }
             }
-        }
 
-        // Phase 2: Beam search on layer 0
-        let candidates = self.search_layer(query, &[current_node], ef.max(k), 0);
+            // Phase 2: Beam search on layer 0
+            self.search_layer_into(
+                query,
+                &[current_node],
+                ef.max(k),
+                0,
+                &mut visited,
+                search,
+                layer_candidates,
+            );
 
-        // Return top k, convert distance to similarity score
-        candidates
-            .into_iter()
-            .take(k)
-            .map(|(id, dist)| (id, 1.0 - dist)) // Convert back to similarity
-            .collect()
+            // Return top k, convert distance to similarity score
+            layer_candidates
+                .iter()
+                .take(k)
+                .map(|(id, dist)| (*id, -*dist))
+                .collect()
+        })
     }
 
     /// Search with metadata predicate filter (hybrid search)
@@ -617,28 +708,55 @@ impl HNSW {
             return Vec::new();
         }
 
-        let entry_point = self.entry_point.unwrap();
-        let mut current_node = entry_point;
+        let candidates = QUERY_SCRATCH.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let QueryScratch {
+                search,
+                layer_candidates,
+            } = &mut *slot;
+            let entry_point = self.entry_point.unwrap();
+            let mut current_node = entry_point;
+            let mut visited = VisitedGuard::new(self.nodes.len().max(1024));
 
-        // Phase 1: Greedy descent (unfiltered — we don't filter hub nodes)
-        for layer in (1..=self.max_layer).rev() {
-            let nearest = self.search_layer(query, &[current_node], 1, layer);
-            if let Some((nearest_id, _)) = nearest.first() {
-                current_node = *nearest_id;
+            // Phase 1: Greedy descent (unfiltered — we don't filter hub nodes)
+            for layer in (1..=self.max_layer).rev() {
+                self.search_layer_into(
+                    query,
+                    &[current_node],
+                    1,
+                    layer,
+                    &mut visited,
+                    search,
+                    layer_candidates,
+                );
+                if let Some((nearest_id, _)) = layer_candidates.first() {
+                    current_node = *nearest_id;
+                }
             }
-        }
 
-        // Phase 2: Over-fetch beam search on layer 0
-        // We fetch ef*2 candidates because many will be filtered out
-        let over_fetch = (ef * 2).max(k * 4);
-        let candidates = self.search_layer(query, &[current_node], over_fetch, 0);
+            // Phase 2: Over-fetch beam search on layer 0
+            // We fetch ef*2 candidates because many will be filtered out
+            let over_fetch = (ef * 2).max(k * 4);
+            self.search_layer_into(
+                query,
+                &[current_node],
+                over_fetch,
+                0,
+                &mut visited,
+                search,
+                layer_candidates,
+            );
 
-        // Apply predicate filter and return top k
+            layer_candidates.clone()
+        });
+
+        // Apply predicate filter outside the scratch borrow scope so predicate
+        // closures may safely perform re-entrant searches.
         candidates
             .into_iter()
             .filter(|(id, _)| predicate(*id))
             .take(k)
-            .map(|(id, dist)| (id, 1.0 - dist))
+            .map(|(id, dist)| (id, -dist))
             .collect()
     }
 

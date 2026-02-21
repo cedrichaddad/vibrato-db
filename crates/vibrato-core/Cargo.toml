@@ -28,3 +28,15 @@ rustc-hash = "2.1.1"
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "simd"
+harness = false
+
+[[bench]]
+name = "hnsw"
+harness = false
+
+[[bench]]
+name = "hnsw_p99"
+harness = false

@@ -11,12 +11,13 @@ Unlike wrapper libraries, Vibrato-DB is a standalone database server that handle
 ## Performance Metrics
 
 Benchmarks run on a single-thread consumer CPU (Apple M2) against 128-dimensional normalized vectors.
+`Current` latency values below are true p99 numbers from `benches/hnsw_p99.rs` (median of 5 runs).
 
 | Metric | Phase 0 Baseline | Phase 4 | **Current** | Improvement (vs Phase 0) |
 |--------|------------------|---------|-------------|--------------------------|
-| Query Latency (P99, ef=20) | 147 µs | 65 µs | **25 µs** | **5.8x** |
-| Query Latency (P99, ef=50) | 271 µs | 124 µs | **51 µs** | **5.3x** |
-| Throughput | 1.8 Gelem/s | 4.4 Gelem/s | **7.6 Gelem/s** | **4.2x** |
+| Query Latency (P99, ef=20) | 147 µs | 65 µs | **16 µs** | **9.2x** |
+| Query Latency (P99, ef=50) | 271 µs | 124 µs | **42 µs** | **6.5x** |
+| Throughput | 1.8 Gelem/s | 4.4 Gelem/s | **13.9 Gelem/s** | **7.7x** |
 | Recall@10 | 99.0% | 99.0% | **99.0%** | No regression |
 
 ### Detailed Benchmarks
@@ -25,16 +26,29 @@ Benchmarks run on a single-thread consumer CPU (Apple M2) against 128-dimensiona
 
 | Operation | Latency | Throughput |
 |-----------|---------|------------|
-| Dot Product | 17 ns | 7.6 Gelem/s |
-| L2 Distance | 17 ns | 7.4 Gelem/s |
+| Dot Product | 9.18 ns | 13.9 Gelem/s |
+| L2 Distance | 9.73 ns | 13.2 Gelem/s |
 
 **HNSW Search Latency (P99, 5000 vectors, k=10)**
 
 | ef Parameter | Phase 0 | Phase 4 | **Current** |
 |--------------|---------|---------|-------------|
-| ef=20 | 147 µs | 65 µs | **25 µs** |
-| ef=50 | 271 µs | 124 µs | **51 µs** |
-| ef=100 | 369 µs | 203 µs | **91 µs** |
+| ef=20 | 147 µs | 65 µs | **16 µs** |
+| ef=50 | 271 µs | 124 µs | **42 µs** |
+| ef=100 | 369 µs | 203 µs | **68 µs** |
+
+**P99 Methodology**
+
+```bash
+# true p99 harness (not criterion mean)
+cargo bench -p vibrato-core --bench hnsw_p99
+
+# robust median p99 across repeated runs
+./scripts/bench_hnsw_p99.sh 5
+```
+
+- HNSW p99 values above are the median of 5 fixed-query harness runs (`20,000` queries/run).
+- SIMD throughput values come from `cargo bench -p vibrato-core --bench simd` at 128D.
 
 ---
 
@@ -56,7 +70,7 @@ Vectors are not loaded into the heap. The `.vdb` binary format is designed to be
 Implements a multi-layered graph traversal algorithm for Approximate Nearest Neighbor (ANN) search.
 
 - **Diversity Heuristic**: Neighbor selection logic actively prunes redundant connections.
-- **BitSet Visited Pool**: Uses thread-local `FixedBitSet` pools to eliminate hashing overhead.
+- **Epoch Visited Pool**: Uses thread-local epoch-array visited sets to eliminate per-query clear cost.
 
 ### 3. SIMD-Accelerated Math
 
@@ -137,6 +151,14 @@ cargo run --release -- serve-v2 \
   --dim 128 \
   --bootstrap-admin-key true
 
+# Optional: enable Arrow Flight ingest data plane on a second port
+cargo run --release -- serve-v2 \
+  --data-dir ./vibrato_data \
+  --collection default \
+  --dim 128 \
+  --port 8080 \
+  --flight-port 50051
+
 # Create/revoke API keys
 cargo run --release -- key-create --data-dir ./vibrato_data --name ops --roles admin,query,ingest
 cargo run --release -- key-revoke --data-dir ./vibrato_data --key-id <vbk_id>
@@ -148,6 +170,14 @@ cargo run --release -- replay-to-lsn --data-dir ./vibrato_data --collection defa
 ```
 
 See `/Users/cedrichaddad/vibrato-db/docs/PRODUCTION_RUNBOOK_V21.md` for full operations guidance.
+
+Arrow Flight ingest notes:
+- Flight service is enabled only when `--flight-port` is set.
+- Auth uses gRPC metadata header `authorization: Bearer vbk_<id>.<secret>`.
+- `do_put` expects a `RecordBatch` with:
+  - required: `vector` (`FixedSizeList<Float32>`; fixed length must equal collection `dim`)
+  - optional: `metadata_json` (`Utf8`), `idempotency_key` (`Utf8`)
+  - optional metadata columns: `source_file` (`Utf8`), `start_time_ms` (`UInt32`), `duration_ms` (`UInt16`), `bpm` (`Float32`), `tags` (`List<Utf8>`)
 
 ### 4. Python Bindings
 
@@ -215,6 +245,9 @@ src/
 
 crates/
   vibrato-core    # Core engine (HNSW, SIMD, V2 Format)
+  vibrato-server  # V2 control/data plane services
+  vibrato-edge    # C-ABI edge embedding surface
+  vibrato-midas   # Time-series constrained DTW search primitives
   vibrato-neural  # Audio pipeline (features, ONNX)
   vibrato-ffi     # Python/C bindings
 ```
@@ -233,10 +266,10 @@ cargo test --workspace
 
 ```bash
 # Measure SIMD throughput
-cargo bench --bench simd
+cargo bench -p vibrato-core --bench simd
 
 # Measure Index Latency
-cargo bench --bench hnsw
+cargo bench -p vibrato-core --bench hnsw
 ```
 
 ---

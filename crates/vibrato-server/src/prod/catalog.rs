@@ -196,6 +196,25 @@ unsafe extern "C" {
     ) -> c_int;
     fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int;
     fn sqlite3_finalize(stmt: *mut Sqlite3Stmt) -> c_int;
+    fn sqlite3_reset(stmt: *mut Sqlite3Stmt) -> c_int;
+    fn sqlite3_clear_bindings(stmt: *mut Sqlite3Stmt) -> c_int;
+    fn sqlite3_bind_null(stmt: *mut Sqlite3Stmt, idx: c_int) -> c_int;
+    fn sqlite3_bind_int64(stmt: *mut Sqlite3Stmt, idx: c_int, value: i64) -> c_int;
+    fn sqlite3_bind_double(stmt: *mut Sqlite3Stmt, idx: c_int, value: f64) -> c_int;
+    fn sqlite3_bind_text(
+        stmt: *mut Sqlite3Stmt,
+        idx: c_int,
+        value: *const c_char,
+        nbytes: c_int,
+        destroy: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> c_int;
+    fn sqlite3_bind_blob(
+        stmt: *mut Sqlite3Stmt,
+        idx: c_int,
+        value: *const c_void,
+        nbytes: c_int,
+        destroy: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> c_int;
     fn sqlite3_column_count(stmt: *mut Sqlite3Stmt) -> c_int;
     fn sqlite3_column_name(stmt: *mut Sqlite3Stmt, i_col: c_int) -> *const c_char;
     fn sqlite3_column_type(stmt: *mut Sqlite3Stmt, i_col: c_int) -> c_int;
@@ -248,6 +267,163 @@ struct TimeoutCtx {
     start: Instant,
     timeout: Duration,
     timed_out: bool,
+}
+
+#[inline]
+fn sqlite_transient_destructor() -> unsafe extern "C" fn(*mut c_void) {
+    unsafe { std::mem::transmute::<isize, unsafe extern "C" fn(*mut c_void)>(-1) }
+}
+
+struct PreparedStmt {
+    db: *mut Sqlite3,
+    stmt: *mut Sqlite3Stmt,
+}
+
+impl PreparedStmt {
+    fn new(conn: &RawSqliteConnection, sql: &str) -> Result<Self> {
+        let c_sql = CString::new(sql)?;
+        let mut stmt: *mut Sqlite3Stmt = std::ptr::null_mut();
+        let mut tail: *const c_char = std::ptr::null();
+        let rc = unsafe {
+            sqlite3_prepare_v2(conn.db, c_sql.as_ptr(), -1, &mut stmt, &mut tail as *mut _)
+        };
+        if rc != SQLITE_OK || stmt.is_null() {
+            return Err(anyhow!("sqlite prepare failed: {}", unsafe {
+                c_ptr_to_string(sqlite3_errmsg(conn.db))
+            }));
+        }
+        Ok(Self { db: conn.db, stmt })
+    }
+
+    #[inline]
+    fn reset(&mut self) -> Result<()> {
+        let rc_reset = unsafe { sqlite3_reset(self.stmt) };
+        if rc_reset != SQLITE_OK {
+            return Err(anyhow!("sqlite reset failed: {}", unsafe {
+                c_ptr_to_string(sqlite3_errmsg(self.db))
+            }));
+        }
+        let rc_clear = unsafe { sqlite3_clear_bindings(self.stmt) };
+        if rc_clear != SQLITE_OK {
+            return Err(anyhow!("sqlite clear_bindings failed: {}", unsafe {
+                c_ptr_to_string(sqlite3_errmsg(self.db))
+            }));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn bind_null(&mut self, idx: c_int) -> Result<()> {
+        let rc = unsafe { sqlite3_bind_null(self.stmt, idx) };
+        if rc != SQLITE_OK {
+            return Err(anyhow!("sqlite bind_null failed: {}", unsafe {
+                c_ptr_to_string(sqlite3_errmsg(self.db))
+            }));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn bind_i64(&mut self, idx: c_int, value: i64) -> Result<()> {
+        let rc = unsafe { sqlite3_bind_int64(self.stmt, idx, value) };
+        if rc != SQLITE_OK {
+            return Err(anyhow!("sqlite bind_int64 failed: {}", unsafe {
+                c_ptr_to_string(sqlite3_errmsg(self.db))
+            }));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn bind_f64(&mut self, idx: c_int, value: f64) -> Result<()> {
+        let rc = unsafe { sqlite3_bind_double(self.stmt, idx, value) };
+        if rc != SQLITE_OK {
+            return Err(anyhow!("sqlite bind_double failed: {}", unsafe {
+                c_ptr_to_string(sqlite3_errmsg(self.db))
+            }));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn bind_text(&mut self, idx: c_int, value: &str) -> Result<()> {
+        let bytes = value.as_bytes();
+        let ptr = if bytes.is_empty() {
+            std::ptr::null()
+        } else {
+            bytes.as_ptr() as *const c_char
+        };
+        let rc = unsafe {
+            sqlite3_bind_text(
+                self.stmt,
+                idx,
+                ptr,
+                bytes.len() as c_int,
+                Some(sqlite_transient_destructor()),
+            )
+        };
+        if rc != SQLITE_OK {
+            return Err(anyhow!("sqlite bind_text failed: {}", unsafe {
+                c_ptr_to_string(sqlite3_errmsg(self.db))
+            }));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn bind_blob(&mut self, idx: c_int, value: &[u8]) -> Result<()> {
+        let ptr = if value.is_empty() {
+            std::ptr::null()
+        } else {
+            value.as_ptr() as *const c_void
+        };
+        let rc = unsafe {
+            sqlite3_bind_blob(
+                self.stmt,
+                idx,
+                ptr,
+                value.len() as c_int,
+                Some(sqlite_transient_destructor()),
+            )
+        };
+        if rc != SQLITE_OK {
+            return Err(anyhow!("sqlite bind_blob failed: {}", unsafe {
+                c_ptr_to_string(sqlite3_errmsg(self.db))
+            }));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn bind_optional_text(&mut self, idx: c_int, value: Option<&str>) -> Result<()> {
+        if let Some(v) = value {
+            self.bind_text(idx, v)
+        } else {
+            self.bind_null(idx)
+        }
+    }
+
+    #[inline]
+    fn step_done(&mut self) -> Result<()> {
+        let rc = unsafe { sqlite3_step(self.stmt) };
+        if rc == SQLITE_DONE {
+            return Ok(());
+        }
+        Err(anyhow!("sqlite step failed: {}", unsafe {
+            c_ptr_to_string(sqlite3_errmsg(self.db))
+        }))
+    }
+}
+
+impl Drop for PreparedStmt {
+    fn drop(&mut self) {
+        if !self.stmt.is_null() {
+            unsafe {
+                let _ = sqlite3_finalize(self.stmt);
+            }
+            self.stmt = std::ptr::null_mut();
+        }
+    }
 }
 
 impl RawSqliteConnection {
@@ -1007,7 +1183,7 @@ impl SqliteCatalog {
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, checksum TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS collections (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, dim INTEGER NOT NULL, created_at INTEGER NOT NULL)",
             "CREATE TABLE IF NOT EXISTS segments (id TEXT PRIMARY KEY, collection_id TEXT NOT NULL, level INTEGER NOT NULL, path TEXT NOT NULL UNIQUE, row_count INTEGER NOT NULL, vector_id_start INTEGER NOT NULL, vector_id_end INTEGER NOT NULL, created_lsn INTEGER NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS wal_entries (lsn INTEGER PRIMARY KEY AUTOINCREMENT, collection_id TEXT NOT NULL, vector_id INTEGER NOT NULL, vector_json TEXT NOT NULL, metadata_json TEXT NOT NULL, schema_version INTEGER NOT NULL DEFAULT 2, vector_blob BLOB, metadata_blob BLOB, idempotency_key TEXT, checkpointed_at INTEGER, created_at INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS wal_entries (lsn INTEGER PRIMARY KEY AUTOINCREMENT, collection_id TEXT NOT NULL, vector_id INTEGER NOT NULL, vector_json TEXT, metadata_json TEXT, schema_version INTEGER NOT NULL DEFAULT 2, vector_blob BLOB, metadata_blob BLOB, idempotency_key TEXT, checkpointed_at INTEGER, created_at INTEGER NOT NULL)",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_idempotency ON wal_entries(collection_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_vector_id ON wal_entries(collection_id, vector_id)",
             "CREATE INDEX IF NOT EXISTS idx_wal_pending_by_collection_lsn ON wal_entries(collection_id, checkpointed_at, lsn)",
@@ -1039,6 +1215,7 @@ impl SqliteCatalog {
         )?;
         self.ensure_column("wal_entries", "vector_blob", "BLOB")?;
         self.ensure_column("wal_entries", "metadata_blob", "BLOB")?;
+        self.migrate_wal_entries_v3_layout()?;
         self.ensure_column("orphan_files", "size_bytes", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("orphan_files", "deleted_reason", "TEXT")?;
         self.ensure_column("api_keys", "hash_version", "INTEGER NOT NULL DEFAULT 1")?;
@@ -1125,6 +1302,67 @@ impl SqliteCatalog {
              FROM vector_metadata;
              DROP TABLE vector_metadata;
              ALTER TABLE vector_metadata_v2 RENAME TO vector_metadata;
+             COMMIT;",
+        )
+    }
+
+    fn migrate_wal_entries_v3_layout(&self) -> Result<()> {
+        let rows = self.query_json("PRAGMA table_info(wal_entries);")?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut vector_json_notnull = false;
+        let mut metadata_json_notnull = false;
+        for row in &rows {
+            let name = row.get("name").and_then(Value::as_str).unwrap_or_default();
+            let notnull = row
+                .get("notnull")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+                != 0;
+            if name == "vector_json" {
+                vector_json_notnull = notnull;
+            } else if name == "metadata_json" {
+                metadata_json_notnull = notnull;
+            }
+        }
+        if !vector_json_notnull && !metadata_json_notnull {
+            return Ok(());
+        }
+
+        self.exec(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS wal_entries_v3 (
+               lsn INTEGER PRIMARY KEY AUTOINCREMENT,
+               collection_id TEXT NOT NULL,
+               vector_id INTEGER NOT NULL,
+               vector_json TEXT,
+               metadata_json TEXT,
+               schema_version INTEGER NOT NULL DEFAULT 2,
+               vector_blob BLOB,
+               metadata_blob BLOB,
+               idempotency_key TEXT,
+               checkpointed_at INTEGER,
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO wal_entries_v3(
+               lsn, collection_id, vector_id, vector_json, metadata_json,
+               schema_version, vector_blob, metadata_blob, idempotency_key, checkpointed_at, created_at
+             )
+             SELECT
+               lsn, collection_id, vector_id, vector_json, metadata_json,
+               COALESCE(schema_version, 2), vector_blob, metadata_blob, idempotency_key, checkpointed_at, created_at
+             FROM wal_entries;
+             DROP TABLE wal_entries;
+             ALTER TABLE wal_entries_v3 RENAME TO wal_entries;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_idempotency
+               ON wal_entries(collection_id, idempotency_key)
+               WHERE idempotency_key IS NOT NULL;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_vector_id
+               ON wal_entries(collection_id, vector_id);
+             CREATE INDEX IF NOT EXISTS idx_wal_pending_by_collection_lsn
+               ON wal_entries(collection_id, checkpointed_at, lsn);
              COMMIT;",
         )
     }
@@ -2436,9 +2674,9 @@ impl SqliteCatalog {
         }
         #[derive(Debug)]
         struct PreparedBatchEntry {
-            vector_blob_hex: String,
+            vector_blob: Vec<u8>,
             metadata: VectorMetadata,
-            metadata_blob_hex: String,
+            metadata_blob: Vec<u8>,
             tags_json: String,
             idempotency_key: Option<String>,
         }
@@ -2472,8 +2710,8 @@ impl SqliteCatalog {
                     normalized_metadata.tags = tags;
 
                     Ok(PreparedBatchEntry {
-                        vector_blob_hex: hex_string(&encode_vector_blob(vector)),
-                        metadata_blob_hex: hex_string(&encode_metadata_blob(&normalized_metadata)?),
+                        vector_blob: encode_vector_blob(vector),
+                        metadata_blob: encode_metadata_blob(&normalized_metadata)?,
                         tags_json: serde_json::to_string(&normalized_metadata.tags)?,
                         metadata: normalized_metadata,
                         idempotency_key: normalize_idempotency_key(idempotency_key.as_deref()),
@@ -2507,6 +2745,50 @@ impl SqliteCatalog {
                  FROM vector_metadata
                  WHERE collection_id='{collection}';"
             ))?;
+
+            let mut wal_insert_stmt = PreparedStmt::new(
+                &guard,
+                "INSERT INTO wal_entries(
+                   collection_id,
+                   vector_id,
+                   schema_version,
+                   vector_blob,
+                   metadata_blob,
+                   vector_json,
+                   metadata_json,
+                   idempotency_key,
+                   checkpointed_at,
+                   created_at
+                 ) VALUES (?1, ?2, 3, ?3, ?4, NULL, NULL, ?5, NULL, ?6);",
+            )?;
+            let mut metadata_insert_stmt = PreparedStmt::new(
+                &guard,
+                "INSERT OR REPLACE INTO vector_metadata(
+                   collection_id,
+                   vector_id,
+                   source_file,
+                   start_time_ms,
+                   duration_ms,
+                   bpm,
+                   tags_json,
+                   created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
+            )?;
+            let mut tag_registry_insert_stmt = PreparedStmt::new(
+                &guard,
+                "INSERT OR IGNORE INTO tag_registry(collection_id, tag_id, tag_text, created_at)
+                 VALUES (?1, ?2, ?3, ?4);",
+            )?;
+            let mut tag_ids_insert_stmt = PreparedStmt::new(
+                &guard,
+                "INSERT OR IGNORE INTO tag_ids(collection_id, id, tag, created_at)
+                 VALUES (?1, ?2, ?3, ?4);",
+            )?;
+            let mut vector_tags_insert_stmt = PreparedStmt::new(
+                &guard,
+                "INSERT OR IGNORE INTO vector_tags(collection_id, vector_id, tag_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4);",
+            )?;
 
             for chunk in prepared_entries.chunks(BATCH_CHUNK_ROWS) {
                 let now = now_unix_ts();
@@ -2645,33 +2927,6 @@ impl SqliteCatalog {
                 }
                 let mut ordered_tags = unique_tags.into_iter().collect::<Vec<_>>();
                 ordered_tags.sort();
-                if !ordered_tags.is_empty() {
-                    let in_clause = ordered_tags
-                        .iter()
-                        .map(|tag| format!("'{}'", sql_quote(tag)))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let existing_rows = guard.query_json(
-                        &format!(
-                            "SELECT tag_id, tag_text
-                             FROM tag_registry
-                             WHERE collection_id='{}'
-                               AND tag_text IN ({});",
-                            collection, in_clause
-                        ),
-                        None,
-                    )?;
-                    let mut cache_rows = Vec::with_capacity(existing_rows.len());
-                    for row in existing_rows {
-                        let tag_id = row["tag_id"].as_i64().unwrap_or(0).max(0) as u32;
-                        let tag_text = row["tag_text"].as_str().unwrap_or_default().to_string();
-                        if tag_id == 0 || tag_text.is_empty() {
-                            continue;
-                        }
-                        cache_rows.push((tag_id, tag_text));
-                    }
-                    self.commit_tag_rows_to_cache(collection_id, &cache_rows);
-                }
                 let (tag_ids, new_tag_rows) =
                     self.resolve_tag_ids_for_batch(collection_id, &ordered_tags);
 
@@ -2684,114 +2939,53 @@ impl SqliteCatalog {
                     }
                 }
 
-                let estimated_capacity = pending.len() * 2048
-                    + ordered_tags.len() * 128
-                    + vector_tag_pairs.len() * 96
-                    + 2048;
-                let mut sql = String::with_capacity(estimated_capacity);
+                for row in &pending {
+                    wal_insert_stmt.reset()?;
+                    wal_insert_stmt.bind_text(1, collection_id)?;
+                    wal_insert_stmt.bind_i64(2, row.vector_id as i64)?;
+                    wal_insert_stmt.bind_blob(3, &row.entry.vector_blob)?;
+                    wal_insert_stmt.bind_blob(4, &row.entry.metadata_blob)?;
+                    wal_insert_stmt.bind_optional_text(5, row.entry.idempotency_key.as_deref())?;
+                    wal_insert_stmt.bind_i64(6, now)?;
+                    wal_insert_stmt.step_done()?;
 
-                sql.push_str(
-                    "INSERT INTO wal_entries(collection_id, vector_id, schema_version, vector_blob, metadata_blob, vector_json, metadata_json, idempotency_key, checkpointed_at, created_at) VALUES ",
-                );
-                for (idx, row) in pending.iter().enumerate() {
-                    if idx > 0 {
-                        sql.push(',');
-                    }
-                    write!(
-                        sql,
-                        "('{}', {}, 3, x'{}', x'{}', '[]', '{{}}', {}, NULL, {})",
-                        collection,
-                        row.vector_id,
-                        row.entry.vector_blob_hex,
-                        row.entry.metadata_blob_hex,
-                        row.entry
-                            .idempotency_key
-                            .as_ref()
-                            .map(|k| format!("'{}'", sql_quote(k)))
-                            .unwrap_or_else(|| "NULL".to_string()),
-                        now,
-                    )
-                    .unwrap();
+                    metadata_insert_stmt.reset()?;
+                    metadata_insert_stmt.bind_text(1, collection_id)?;
+                    metadata_insert_stmt.bind_i64(2, row.vector_id as i64)?;
+                    metadata_insert_stmt.bind_text(3, &row.entry.metadata.source_file)?;
+                    metadata_insert_stmt.bind_i64(4, row.entry.metadata.start_time_ms as i64)?;
+                    metadata_insert_stmt.bind_i64(5, row.entry.metadata.duration_ms as i64)?;
+                    metadata_insert_stmt.bind_f64(6, row.entry.metadata.bpm as f64)?;
+                    metadata_insert_stmt.bind_text(7, &row.entry.tags_json)?;
+                    metadata_insert_stmt.bind_i64(8, now)?;
+                    metadata_insert_stmt.step_done()?;
                 }
-                sql.push(';');
 
-                sql.push_str("INSERT OR REPLACE INTO vector_metadata(collection_id, vector_id, source_file, start_time_ms, duration_ms, bpm, tags_json, created_at) VALUES ");
-                for (idx, row) in pending.iter().enumerate() {
-                    if idx > 0 {
-                        sql.push(',');
-                    }
-                    write!(
-                        sql,
-                        "('{}', {}, '{}', {}, {}, {}, '{}', {})",
-                        collection,
-                        row.vector_id,
-                        sql_quote(&row.entry.metadata.source_file),
-                        row.entry.metadata.start_time_ms,
-                        row.entry.metadata.duration_ms,
-                        row.entry.metadata.bpm,
-                        sql_quote(&row.entry.tags_json),
-                        now,
-                    )
-                    .unwrap();
-                }
-                sql.push(';');
-
-                if !new_tag_rows.is_empty() {
-                    sql.push_str("INSERT OR IGNORE INTO tag_registry(collection_id, tag_id, tag_text, created_at) VALUES ");
-                    for (idx, (tag_id, tag)) in new_tag_rows.iter().enumerate() {
-                        if idx > 0 {
-                            sql.push(',');
-                        }
-                        write!(
-                            sql,
-                            "('{}', {}, '{}', {})",
-                            collection,
-                            tag_id,
-                            sql_quote(tag),
-                            now
-                        )
-                        .unwrap();
-                    }
-                    sql.push(';');
+                for (tag_id, tag_text) in &new_tag_rows {
+                    tag_registry_insert_stmt.reset()?;
+                    tag_registry_insert_stmt.bind_text(1, collection_id)?;
+                    tag_registry_insert_stmt.bind_i64(2, *tag_id as i64)?;
+                    tag_registry_insert_stmt.bind_text(3, tag_text)?;
+                    tag_registry_insert_stmt.bind_i64(4, now)?;
+                    tag_registry_insert_stmt.step_done()?;
 
                     // Backward-compatible mirror while v2 readers still exist.
-                    sql.push_str(
-                        "INSERT OR IGNORE INTO tag_ids(collection_id, id, tag, created_at) VALUES ",
-                    );
-                    for (idx, (tag_id, tag)) in new_tag_rows.iter().enumerate() {
-                        if idx > 0 {
-                            sql.push(',');
-                        }
-                        write!(
-                            sql,
-                            "('{}', {}, '{}', {})",
-                            collection,
-                            tag_id,
-                            sql_quote(tag),
-                            now
-                        )
-                        .unwrap();
-                    }
-                    sql.push(';');
+                    tag_ids_insert_stmt.reset()?;
+                    tag_ids_insert_stmt.bind_text(1, collection_id)?;
+                    tag_ids_insert_stmt.bind_i64(2, *tag_id as i64)?;
+                    tag_ids_insert_stmt.bind_text(3, tag_text)?;
+                    tag_ids_insert_stmt.bind_i64(4, now)?;
+                    tag_ids_insert_stmt.step_done()?;
                 }
 
-                if !vector_tag_pairs.is_empty() {
-                    sql.push_str("INSERT OR IGNORE INTO vector_tags(collection_id, vector_id, tag_id, created_at) VALUES ");
-                    for (idx, (vector_id, tag_id)) in vector_tag_pairs.iter().enumerate() {
-                        if idx > 0 {
-                            sql.push(',');
-                        }
-                        write!(
-                            sql,
-                            "('{}', {}, {}, {})",
-                            collection, vector_id, tag_id, now,
-                        )
-                        .unwrap();
-                    }
-                    sql.push(';');
+                for (vector_id, tag_id) in &vector_tag_pairs {
+                    vector_tags_insert_stmt.reset()?;
+                    vector_tags_insert_stmt.bind_text(1, collection_id)?;
+                    vector_tags_insert_stmt.bind_i64(2, *vector_id as i64)?;
+                    vector_tags_insert_stmt.bind_i64(3, *tag_id as i64)?;
+                    vector_tags_insert_stmt.bind_i64(4, now)?;
+                    vector_tags_insert_stmt.step_done()?;
                 }
-
-                guard.exec(&sql)?;
                 self.commit_tag_rows_to_cache(collection_id, &new_tag_rows);
             }
 

@@ -177,24 +177,125 @@ cargo test --release --test v2_catalog_timeout_e2e -- --nocapture
 Commands:
 
 ```bash
-cargo bench --bench simd
-cargo bench --bench hnsw
+cargo bench -p vibrato-core --bench simd
+cargo bench -p vibrato-core --bench hnsw
 ```
 
 Representative post-fix results:
 
 ```text
-dot_product/dim_128          9.35 ns   (13.69 Gelem/s)
-l2_distance_squared/dim_128  9.68 ns   (13.23 Gelem/s)
+dot_product/dim_128          9.18 ns   (13.94 Gelem/s)
+l2_distance_squared/dim_128  9.73 ns   (13.16 Gelem/s)
 
-hnsw_search/20               22.28 us
-hnsw_search/50               42.85 us
-hnsw_search/100              70.34 us
+hnsw_search/20               17.91 us
+hnsw_search/50               40.11 us
+hnsw_search/100              67.98 us
 ```
 
-These exceed README "Current" reference numbers for both SIMD throughput and HNSW latency.
+These exceed the previous README "Current" reference numbers for SIMD throughput and criterion mean latency.
 
 Root causes and fixes applied:
 - HNSW visited-set clear path was O(n) per query (`FixedBitSet::clear`); replaced with epoch-array visited sets (O(1) clear via epoch bump).
 - HNSW ID/index and prune-target maps used `std::HashMap`/`HashSet`; switched to `FxHashMap`/`FxHashSet` for lower hot-path hashing overhead.
 - aarch64 NEON kernels used a single accumulator chain; replaced with 4-lane unrolled accumulation to reduce dependency stalls and increase ILP.
+
+### True P99 Validation (hnsw_p99 Harness)
+
+Command:
+
+```bash
+for i in 1 2 3 4 5; do cargo bench -p vibrato-core --bench hnsw_p99 | rg '^ef='; done
+```
+
+Five-run samples (fixed query mode):
+
+```text
+run1: ef=20 p99=33.12us  ef=50 p99=42.17us  ef=100 p99=66.75us
+run2: ef=20 p99=16.17us  ef=50 p99=42.71us  ef=100 p99=67.88us
+run3: ef=20 p99=16.29us  ef=50 p99=42.62us  ef=100 p99=66.12us
+run4: ef=20 p99=16.75us  ef=50 p99=34.42us  ef=100 p99=67.96us
+run5: ef=20 p99=24.25us  ef=50 p99=35.58us  ef=100 p99=64.79us
+```
+
+Median p99 across these 5 runs:
+- `ef=20`: `16.75us`
+- `ef=50`: `42.17us`
+- `ef=100`: `66.75us`
+
+These median p99 values beat the README legacy reference (`25us / 51us / 91us`) while using an explicit per-query p99 harness instead of criterion mean latency.
+
+## Phase Review Notes (This Iteration)
+
+### Phase A: True p99 enforcement + HNSW tail stabilization
+
+Implemented:
+- Added `scripts/bench_hnsw_p99.sh` for repeated-run p99 median reporting.
+- Refactored HNSW search path to reuse per-query scratch heaps across layer traversals.
+- Added thread-local query scratch reuse.
+
+Code review findings fixed:
+- `search_filtered` originally evaluated user predicates while holding a mutable `RefCell` borrow, which could panic on re-entrant search calls.
+- Fixed by copying candidates out of scratch scope before predicate evaluation.
+
+Optimization headroom:
+- Replace `BinaryHeap` in search hot path with fixed-capacity bounded heaps for small `ef` values.
+- Add optional CPU affinity / scheduler controls in benchmark harness to reduce OS-tail jitter.
+
+### Phase B: Tag registry hot-path cleanup
+
+Implemented:
+- Removed per-chunk `SELECT ... FROM tag_registry WHERE tag_text IN (...)` from batch ingest loop.
+- Tag ID resolution now stays RAM-first (`tag_registry_forward`) and persists misses in the same transaction.
+
+Validation:
+- `cargo test --release --test v2_catalog_protocol_e2e -- --nocapture` (7/7 pass)
+- `cargo test --release --test v2_catalog_timeout_e2e -- --nocapture` (1/1 pass)
+
+Optimization headroom:
+- Replace idempotency `IN (...)` JSON query path with prepared-row lookup to cut remaining string/JSON overhead.
+
+### Phase C: Workspace extension (`vibrato-midas`, `vibrato-edge`)
+
+Implemented:
+- Added `crates/vibrato-midas` with Sakoe-Chiba constrained DTW, early abandonment, and top-k search API (`midas_fractal_search`).
+- Added unit tests for identity, out-of-band rejection, invalid band validation, and sorted top-k output.
+- Added `crates/vibrato-edge` (`cdylib`) with C ABI entrypoints:
+  - `vibrato_edge_build`
+  - `vibrato_search_batch`
+  - `vibrato_edge_free`
+  including pointer validation and panic containment (`catch_unwind`).
+
+Validation:
+- `cargo test -p vibrato-midas` (4/4 pass)
+- `cargo test -p vibrato-edge` (2/2 pass)
+- `cargo check --workspace --exclude vibrato-vst` pass.
+
+Optimization headroom:
+- Reuse DTW row buffers across candidate scans in `midas_fractal_search` to avoid per-candidate allocations.
+
+### Phase D: Arrow Flight data plane (`vibrato-server`)
+
+Implemented:
+- Added `crates/vibrato-server/src/prod/flight.rs` with `FlightService` implementation.
+- Added `start_flight_server(state, addr)` and wired `serve-v2` flags:
+  - `--flight-host`
+  - `--flight-port`
+- Implemented `do_put` ingest path with:
+  - API key auth via gRPC metadata (`authorization`)
+  - columnar `RecordBatch` decoding via `FlightRecordBatchStream`
+  - deterministic backpressure integration (soft throttle + hard reject)
+  - offloaded write path via `spawn_blocking -> ProductionState::ingest_batch`
+  - per-request ACK metadata (`accepted`, `created`, `collection_id`, `api_key_id`)
+
+Validation:
+- `cargo test -p vibrato-server flight:: -- --nocapture` (2/2 pass)
+- `cargo test --release --test v2_catalog_protocol_e2e -- --nocapture` (7/7 pass)
+- `VIBRATO_STRESS_TOTAL_OPS=100000 ... v2_stress_million_ops_direct -- --ignored --nocapture` pass
+
+Code review findings fixed:
+- Avoided async-runtime blocking in Flight ingest path by using `spawn_blocking`.
+- Enforced strict vector schema/type validation to prevent malformed column panics.
+
+Optimization headroom:
+- Current path still materializes per-batch `Vec<(Vec<f32>, VectorMetadata, Option<String>)>`; add an iterator-based ingest path in engine/catalog to eliminate row materialization and fully satisfy columnar streaming constraints.
+- Add dedicated Flight ingress metrics (batch size distribution, decode latency, per-batch throttle delay).
