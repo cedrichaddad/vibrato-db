@@ -299,3 +299,36 @@ Code review findings fixed:
 Optimization headroom:
 - Current path still materializes per-batch `Vec<(Vec<f32>, VectorMetadata, Option<String>)>`; add an iterator-based ingest path in engine/catalog to eliminate row materialization and fully satisfy columnar streaming constraints.
 - Add dedicated Flight ingress metrics (batch size distribution, decode latency, per-batch throttle delay).
+
+### Phase E: Flight validation + clone-elision ingest handoff
+
+Implemented:
+- Added owned-batch ingest handoff in engine:
+  - `ProductionState::ingest_batch_owned(...)`
+  - dedicated writer lane now returns `IngestWriteOutcome { wal_results, entries }`
+  - removed extra full-batch clone on `/v2/vectors/batch` and Flight `do_put` paths.
+- Optimized engine post-WAL ingest path to avoid cloning vector payloads when inserting into
+  hot shards (moves `Vec<f32>` buffers into `Arc<Vec<f32>>`).
+- Optimized Flight backpressure byte estimator to O(columns) using Arrow array memory accounting
+  (`get_array_memory_size`) instead of O(rows) string/tag scans on the async path.
+- Added Flight integration and guard suites:
+  - `tests/v2_flight_ingest_e2e.rs`
+  - `tests/v2_flight_row_materialization_guard.rs`
+  - `tests/v2_flight_stress_million_ops.rs` (ignored harness)
+
+Validation:
+- `cargo test --test v2_flight_row_materialization_guard -- --nocapture` pass
+- `cargo test --test v2_flight_ingest_e2e -- --nocapture` pass
+- `cargo test --release --test v2_flight_stress_million_ops -- --ignored --nocapture` pass
+- `cargo test --workspace --exclude vibrato-vst` pass
+
+Code review findings fixed:
+- Eliminated avoidable `entries.to_vec()` clone in API and Flight ingest path by switching to owned batch handoff.
+- Added CI guard to prevent regression to borrowed-slice ingest call in Flight handler.
+- Replaced fixed 90s million-op throughput gate in Flight stress harness with configurable
+  ops/sec + elapsed guard (`VIBRATO_STRESS_MIN_OPS_PER_SEC`, `VIBRATO_STRESS_MAX_ELAPSED_SECS`)
+  to avoid hardware-dependent false negatives.
+
+Optimization headroom:
+- Add explicit per-batch Flight ingest metrics (`decode_us`, `commit_us`, `ack_us`) for throughput attribution.
+- Eliminate remaining row materialization (`extract_batch_entries -> Vec<...>`) by introducing an iterator-based ingest path into engine/catalog.

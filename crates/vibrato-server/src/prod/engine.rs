@@ -57,7 +57,13 @@ pub enum IngestBackpressureDecision {
 struct IngestWriteJob {
     entries: Vec<(Vec<f32>, VectorMetadata, Option<String>)>,
     estimated_bytes: u64,
-    result_tx: SyncSender<Result<Vec<WalIngestResult>>>,
+    result_tx: SyncSender<Result<IngestWriteOutcome>>,
+}
+
+#[derive(Debug)]
+struct IngestWriteOutcome {
+    wal_results: Vec<WalIngestResult>,
+    entries: Vec<(Vec<f32>, VectorMetadata, Option<String>)>,
 }
 
 #[derive(Debug)]
@@ -332,9 +338,14 @@ impl ProductionState {
                     set_background_worker_priority();
                 }
                 while let Ok(job) = ingest_writer_rx.recv() {
+                    let entries = job.entries;
                     let result = state
                         .catalog
-                        .ingest_wal_batch(&state.collection.id, &job.entries);
+                        .ingest_wal_batch(&state.collection.id, &entries)
+                        .map(|wal_results| IngestWriteOutcome {
+                            wal_results,
+                            entries,
+                        });
                     atomic_saturating_sub(&state.ingest_queue_bytes, job.estimated_bytes);
                     let _ = job.result_tx.send(result);
                 }
@@ -363,7 +374,7 @@ impl ProductionState {
         &self,
         entries: Vec<(Vec<f32>, VectorMetadata, Option<String>)>,
         estimated_bytes: u64,
-    ) -> Result<Vec<WalIngestResult>> {
+    ) -> Result<IngestWriteOutcome> {
         let (result_tx, result_rx) = sync_channel(1);
         self.ingest_queue_bytes
             .fetch_add(estimated_bytes, AtomicOrdering::Relaxed);
@@ -589,7 +600,7 @@ impl ProductionState {
             metadata.clone(),
             idempotency_key.map(|v| v.to_string()),
         ));
-        let result = self.ingest_batch(&entries)?;
+        let result = self.ingest_batch_owned(entries)?;
         result
             .into_iter()
             .next()
@@ -601,6 +612,15 @@ impl ProductionState {
     pub fn ingest_batch(
         &self,
         entries: &[(Vec<f32>, VectorMetadata, Option<String>)],
+    ) -> Result<Vec<(usize, bool)>> {
+        self.ingest_batch_owned(entries.to_vec())
+    }
+
+    /// Batch ingest with owned entries to avoid an additional full-batch clone
+    /// before enqueueing to the dedicated SQLite writer lane.
+    pub fn ingest_batch_owned(
+        &self,
+        entries: Vec<(Vec<f32>, VectorMetadata, Option<String>)>,
     ) -> Result<Vec<(usize, bool)>> {
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -617,7 +637,7 @@ impl ProductionState {
             }
         }
 
-        let estimated_bytes = Self::estimate_ingest_batch_bytes(entries);
+        let estimated_bytes = Self::estimate_ingest_batch_bytes(&entries);
         match self.ingest_backpressure_decision(estimated_bytes) {
             IngestBackpressureDecision::Reject {
                 projected_bytes,
@@ -635,58 +655,78 @@ impl ProductionState {
         }
 
         // 1. Bulk catalog write on dedicated SQLite writer lane.
-        let wal_results = self.enqueue_ingest_batch(entries.to_vec(), estimated_bytes)?;
+        let IngestWriteOutcome {
+            wal_results,
+            entries,
+        } = self.enqueue_ingest_batch(entries, estimated_bytes)?;
 
-        // 2. Group by shard for efficient lock acquisition
-        let mut by_shard: HashMap<usize, Vec<(usize, &[f32], &VectorMetadata)>> = HashMap::new();
-        for (i, result) in wal_results.iter().enumerate() {
+        #[derive(Debug)]
+        struct CreatedShardItem {
+            vector_id: usize,
+            vector: Vec<f32>,
+            metadata: VectorMetadata,
+        }
+
+        // 2. Group by shard for efficient lock acquisition.
+        // Own vectors here so we can move them into Arc without another clone.
+        let mut by_shard: HashMap<usize, Vec<CreatedShardItem>> = HashMap::new();
+        for (result, (vector, metadata, _)) in wal_results.iter().zip(entries.into_iter()) {
             if result.created {
                 let shard = result.vector_id & self.shard_mask;
-                let (ref vec, ref meta, _) = entries[i];
-                by_shard
-                    .entry(shard)
-                    .or_default()
-                    .push((result.vector_id, vec.as_slice(), meta));
+                by_shard.entry(shard).or_default().push(CreatedShardItem {
+                    vector_id: result.vector_id,
+                    vector,
+                    metadata,
+                });
             }
         }
 
-        // 3. Insert into hot index shards in parallel — one lock acquisition per shard
-        by_shard.par_iter().for_each(|(shard, items)| {
-            if let Some(shard_vectors) = self.hot_vector_shards.get(*shard) {
+        let created_count = by_shard.values().map(|v| v.len()).sum::<usize>();
+        let mut metadata_updates = Vec::with_capacity(created_count);
+        for items in by_shard.values() {
+            for item in items {
+                metadata_updates.push((item.vector_id, item.metadata.clone(), item.vector.len()));
+            }
+        }
+
+        // 3. Insert into hot index shards in parallel — one lock acquisition per shard.
+        // Consumes shard buckets to move vector buffers directly into Arc.
+        by_shard.into_par_iter().for_each(|(shard, items)| {
+            let vector_ids = items.iter().map(|item| item.vector_id).collect::<Vec<_>>();
+            if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
                 let guard = shard_vectors.load();
                 let mut vec_guard = guard.write();
-                for &(vid, vec, _) in items {
-                    vec_guard.insert(vid, Arc::new(vec.to_vec()));
+                for item in items {
+                    vec_guard.insert(item.vector_id, Arc::new(item.vector));
                 }
             }
-            if let Some(index) = self.hot_indices.get(*shard) {
+            if let Some(index) = self.hot_indices.get(shard) {
                 let mut idx_guard = index.write();
-                for &(vid, _, _) in items {
-                    idx_guard.insert(vid);
+                for vector_id in vector_ids {
+                    idx_guard.insert(vector_id);
                 }
             }
         });
 
-        // 4. Update metadata cache + filter index in one pass
-        let created_count = by_shard.values().map(|v| v.len()).sum::<usize>();
+        // 4. Update metadata cache + filter index in one pass.
         if created_count > 0 {
             let mut meta_cache = self.metadata_cache.write();
             let mut filter_idx = self.filter_index.write();
-            for items in by_shard.values() {
-                for &(vid, _, meta) in items {
-                    meta_cache.insert(vid, meta.clone());
-                    filter_idx.add(vid, meta);
-                    self.metadata_cache_bytes
-                        .fetch_add(Self::estimate_metadata_bytes(meta), AtomicOrdering::Relaxed);
-                    self.hnsw_graph_bytes.fetch_add(
-                        self.estimate_hnsw_bytes_per_vector(),
-                        AtomicOrdering::Relaxed,
-                    );
-                }
+            for (vector_id, metadata, _) in &metadata_updates {
+                meta_cache.insert(*vector_id, metadata.clone());
+                filter_idx.add(*vector_id, metadata);
+                self.metadata_cache_bytes.fetch_add(
+                    Self::estimate_metadata_bytes(metadata),
+                    AtomicOrdering::Relaxed,
+                );
+                self.hnsw_graph_bytes.fetch_add(
+                    self.estimate_hnsw_bytes_per_vector(),
+                    AtomicOrdering::Relaxed,
+                );
             }
-            let vector_bytes = by_shard.values().flatten().fold(0u64, |acc, (_, vec, _)| {
+            let vector_bytes = metadata_updates.iter().fold(0u64, |acc, (_, _, vec_len)| {
                 acc.saturating_add(
-                    (vec.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
+                    (*vec_len as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
                 )
             });
             self.hot_vectors_bytes

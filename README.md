@@ -260,6 +260,21 @@ crates/
 
 ```bash
 cargo test --workspace
+
+# Flight ingest integration + guard
+cargo test --test v2_flight_ingest_e2e -- --nocapture
+cargo test --test v2_flight_row_materialization_guard -- --nocapture
+
+# Optional high-load Flight stress harness
+VIBRATO_STRESS_TOTAL_OPS=100000 \
+VIBRATO_STRESS_CONCURRENCY=16 \
+VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 \
+cargo test --release --test v2_flight_stress_million_ops -- --ignored --nocapture
+
+# Optional explicit performance gates (hardware dependent)
+VIBRATO_STRESS_MIN_OPS_PER_SEC=3500 \
+VIBRATO_STRESS_MAX_ELAPSED_SECS=300 \
+cargo test --release --test v2_flight_stress_million_ops -- --ignored --nocapture
 ```
 
 ### Running Benchmarks

@@ -61,6 +61,11 @@ roaring = "0.11.3"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+arrow-array = "56.2.0"
+arrow-flight = "56.2.0"
+arrow-schema = "56.2.0"
+futures = "0.3"
+tonic = { version = "0.13.1", features = ["transport"] }
 
 [[bench]]
 name = "simd"

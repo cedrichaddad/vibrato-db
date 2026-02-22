@@ -256,6 +256,37 @@ fn extract_batch_entries(
     Ok(entries)
 }
 
+fn estimate_batch_ingest_bytes(
+    batch: &RecordBatch,
+    dim: usize,
+) -> std::result::Result<u64, Status> {
+    let vector_idx = batch
+        .schema()
+        .index_of("vector")
+        .map_err(|_| Status::invalid_argument("missing required 'vector' column"))?;
+    let vectors = batch
+        .column(vector_idx)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| {
+            Status::invalid_argument("column 'vector' must be FixedSizeList<Float32>")
+        })?;
+    if vectors.value_length() as usize != dim {
+        return Err(Status::invalid_argument(format!(
+            "vector dimension mismatch: expected {dim}, got {}",
+            vectors.value_length()
+        )));
+    }
+
+    // O(columns) memory proxy using Arrow's own accounting for array buffer sizes.
+    // This avoids O(rows) scans on the async path while still reflecting payload scale.
+    let payload_bytes = batch.columns().iter().fold(0u64, |acc, col| {
+        acc.saturating_add(col.get_array_memory_size() as u64)
+    });
+    let decode_overhead = (batch.num_rows() as u64).saturating_mul(32);
+    Ok(payload_bytes.saturating_add(decode_overhead))
+}
+
 fn map_ingest_error(err: anyhow::Error) -> Status {
     let msg = err.to_string();
     if msg.contains("dimension mismatch") {
@@ -336,8 +367,7 @@ impl FlightService for VibratoFlightService {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let entries = extract_batch_entries(&batch, self.state.collection.dim)?;
-            let incoming_bytes = ProductionState::estimate_ingest_batch_bytes(&entries);
+            let incoming_bytes = estimate_batch_ingest_bytes(&batch, self.state.collection.dim)?;
             match self.state.ingest_backpressure_decision(incoming_bytes) {
                 IngestBackpressureDecision::Reject { .. } => {
                     self.state.record_ingest_hard_reject();
@@ -356,15 +386,22 @@ impl FlightService for VibratoFlightService {
                 .inflight_decode_bytes
                 .fetch_add(incoming_bytes, AtomicOrdering::Relaxed);
             let state_bg = self.state.clone();
-            let ingest_result =
-                tokio::task::spawn_blocking(move || state_bg.ingest_batch(&entries)).await;
+            let dim = self.state.collection.dim;
+            let ingest_result = tokio::task::spawn_blocking(
+                move || -> std::result::Result<Vec<(usize, bool)>, Status> {
+                    let entries = extract_batch_entries(&batch, dim)?;
+                    state_bg
+                        .ingest_batch_owned(entries)
+                        .map_err(map_ingest_error)
+                },
+            )
+            .await;
             self.state
                 .inflight_decode_bytes
                 .fetch_sub(incoming_bytes, AtomicOrdering::Relaxed);
 
             let ingest_result = ingest_result
-                .map_err(|e| Status::internal(format!("flight ingest task join error: {e}")))?
-                .map_err(map_ingest_error)?;
+                .map_err(|e| Status::internal(format!("flight ingest task join error: {e}")))??;
             accepted += ingest_result.len();
             created += ingest_result
                 .iter()
@@ -419,7 +456,7 @@ mod tests {
     use arrow_array::{FixedSizeListArray, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::extract_batch_entries;
+    use super::{estimate_batch_ingest_bytes, extract_batch_entries};
 
     fn make_batch() -> RecordBatch {
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
@@ -478,5 +515,16 @@ mod tests {
         let batch = make_batch();
         let err = extract_batch_entries(&batch, 8).expect_err("dim mismatch");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn estimate_batch_ingest_bytes_accounts_for_metadata_payload() {
+        let batch = make_batch();
+        let raw_vector_bytes = (batch.num_rows() as u64) * 4 * std::mem::size_of::<f32>() as u64;
+        let estimated = estimate_batch_ingest_bytes(&batch, 4).expect("estimate bytes");
+        assert!(
+            estimated > raw_vector_bytes,
+            "expected metadata-aware estimate to exceed raw vector payload"
+        );
     }
 }

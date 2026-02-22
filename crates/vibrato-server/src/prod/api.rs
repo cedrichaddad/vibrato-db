@@ -273,7 +273,7 @@ async fn v2_ingest_batch(
     state
         .inflight_decode_bytes
         .fetch_add(incoming_bytes, std::sync::atomic::Ordering::Relaxed);
-    let result = tokio::task::spawn_blocking(move || state_bg.ingest_batch(&entries)).await;
+    let result = tokio::task::spawn_blocking(move || state_bg.ingest_batch_owned(entries)).await;
     let result = match result {
         Ok(inner) => inner,
         Err(e) => Err(anyhow::anyhow!("batch ingest join error: {}", e)),
