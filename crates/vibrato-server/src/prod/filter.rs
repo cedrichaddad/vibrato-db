@@ -1,263 +1,15 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::RangeBounds;
+use std::ops::{Bound, RangeInclusive};
 
+use roaring::RoaringBitmap;
 use vibrato_core::metadata::VectorMetadata;
 
 use super::model::QueryFilter;
 
-const ARRAY_TO_BITMAP_THRESHOLD: usize = 4096;
-const CONTAINER_BITS: usize = 1 << 16;
-const BITMAP_WORDS: usize = CONTAINER_BITS / 64;
-
-#[derive(Debug, Clone)]
-enum Container {
-    Array(Vec<u16>),
-    Bitmap {
-        bits: Box<[u64; BITMAP_WORDS]>,
-        cardinality: usize,
-    },
-}
-
-impl Container {
-    fn empty() -> Self {
-        Self::Array(Vec::new())
-    }
-
-    fn cardinality(&self) -> usize {
-        match self {
-            Self::Array(values) => values.len(),
-            Self::Bitmap { cardinality, .. } => *cardinality,
-        }
-    }
-
-    fn contains(&self, value: u16) -> bool {
-        match self {
-            Self::Array(values) => values.binary_search(&value).is_ok(),
-            Self::Bitmap { bits, .. } => {
-                let word = value as usize / 64;
-                let mask = 1u64 << (value as usize % 64);
-                (bits[word] & mask) != 0
-            }
-        }
-    }
-
-    fn insert(&mut self, value: u16) {
-        match self {
-            Self::Array(values) => match values.binary_search(&value) {
-                Ok(_) => {}
-                Err(pos) => {
-                    values.insert(pos, value);
-                    if values.len() > ARRAY_TO_BITMAP_THRESHOLD {
-                        let mut bits = Box::new([0u64; BITMAP_WORDS]);
-                        for v in values.iter().copied() {
-                            let word = v as usize / 64;
-                            let bit = 1u64 << (v as usize % 64);
-                            bits[word] |= bit;
-                        }
-                        *self = Self::Bitmap {
-                            bits,
-                            cardinality: values.len(),
-                        };
-                    }
-                }
-            },
-            Self::Bitmap { bits, cardinality } => {
-                let word = value as usize / 64;
-                let mask = 1u64 << (value as usize % 64);
-                if (bits[word] & mask) == 0 {
-                    bits[word] |= mask;
-                    *cardinality += 1;
-                }
-            }
-        }
-    }
-
-    fn values(&self) -> Vec<u16> {
-        match self {
-            Self::Array(values) => values.clone(),
-            Self::Bitmap { bits, .. } => {
-                let mut out = Vec::new();
-                for (word_idx, word) in bits.iter().enumerate() {
-                    let mut w = *word;
-                    while w != 0 {
-                        let tz = w.trailing_zeros() as usize;
-                        out.push((word_idx * 64 + tz) as u16);
-                        w &= w - 1;
-                    }
-                }
-                out
-            }
-        }
-    }
-}
-
-fn union_container(a: &Container, b: &Container) -> Container {
-    match (a, b) {
-        (Container::Array(av), Container::Array(bv)) => {
-            let mut out = Vec::with_capacity(av.len() + bv.len());
-            let mut i = 0usize;
-            let mut j = 0usize;
-            while i < av.len() && j < bv.len() {
-                match av[i].cmp(&bv[j]) {
-                    std::cmp::Ordering::Less => {
-                        out.push(av[i]);
-                        i += 1;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        out.push(bv[j]);
-                        j += 1;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        out.push(av[i]);
-                        i += 1;
-                        j += 1;
-                    }
-                }
-            }
-            out.extend_from_slice(&av[i..]);
-            out.extend_from_slice(&bv[j..]);
-            dedup_sorted(&mut out);
-            if out.len() > ARRAY_TO_BITMAP_THRESHOLD {
-                let mut bits = Box::new([0u64; BITMAP_WORDS]);
-                for v in out.iter().copied() {
-                    let word = v as usize / 64;
-                    let bit = 1u64 << (v as usize % 64);
-                    bits[word] |= bit;
-                }
-                Container::Bitmap {
-                    bits,
-                    cardinality: out.len(),
-                }
-            } else {
-                Container::Array(out)
-            }
-        }
-        (Container::Bitmap { bits, cardinality }, Container::Array(values))
-        | (Container::Array(values), Container::Bitmap { bits, cardinality }) => {
-            let mut out_bits = bits.clone();
-            let mut out_cardinality = *cardinality;
-            for v in values.iter().copied() {
-                let word = v as usize / 64;
-                let mask = 1u64 << (v as usize % 64);
-                if (out_bits[word] & mask) == 0 {
-                    out_bits[word] |= mask;
-                    out_cardinality += 1;
-                }
-            }
-            Container::Bitmap {
-                bits: out_bits,
-                cardinality: out_cardinality,
-            }
-        }
-        (
-            Container::Bitmap {
-                bits: a_bits,
-                cardinality: _,
-            },
-            Container::Bitmap {
-                bits: b_bits,
-                cardinality: _,
-            },
-        ) => {
-            let mut out_bits = Box::new([0u64; BITMAP_WORDS]);
-            let mut out_cardinality = 0usize;
-            for i in 0..BITMAP_WORDS {
-                out_bits[i] = a_bits[i] | b_bits[i];
-                out_cardinality += out_bits[i].count_ones() as usize;
-            }
-            Container::Bitmap {
-                bits: out_bits,
-                cardinality: out_cardinality,
-            }
-        }
-    }
-}
-
-fn intersect_container(a: &Container, b: &Container) -> Container {
-    match (a, b) {
-        (Container::Array(av), Container::Array(bv)) => {
-            let mut out = Vec::with_capacity(av.len().min(bv.len()));
-            let mut i = 0usize;
-            let mut j = 0usize;
-            while i < av.len() && j < bv.len() {
-                match av[i].cmp(&bv[j]) {
-                    std::cmp::Ordering::Less => i += 1,
-                    std::cmp::Ordering::Greater => j += 1,
-                    std::cmp::Ordering::Equal => {
-                        out.push(av[i]);
-                        i += 1;
-                        j += 1;
-                    }
-                }
-            }
-            Container::Array(out)
-        }
-        (Container::Bitmap { bits, .. }, Container::Array(values))
-        | (Container::Array(values), Container::Bitmap { bits, .. }) => {
-            let mut out = Vec::new();
-            for v in values.iter().copied() {
-                let word = v as usize / 64;
-                let mask = 1u64 << (v as usize % 64);
-                if (bits[word] & mask) != 0 {
-                    out.push(v);
-                }
-            }
-            Container::Array(out)
-        }
-        (
-            Container::Bitmap {
-                bits: a_bits,
-                cardinality: _,
-            },
-            Container::Bitmap {
-                bits: b_bits,
-                cardinality: _,
-            },
-        ) => {
-            let mut out_bits = Box::new([0u64; BITMAP_WORDS]);
-            let mut out_cardinality = 0usize;
-            for i in 0..BITMAP_WORDS {
-                out_bits[i] = a_bits[i] & b_bits[i];
-                out_cardinality += out_bits[i].count_ones() as usize;
-            }
-            if out_cardinality <= ARRAY_TO_BITMAP_THRESHOLD {
-                let mut values = Vec::with_capacity(out_cardinality);
-                for (word_idx, word) in out_bits.iter().enumerate() {
-                    let mut w = *word;
-                    while w != 0 {
-                        let tz = w.trailing_zeros() as usize;
-                        values.push((word_idx * 64 + tz) as u16);
-                        w &= w - 1;
-                    }
-                }
-                Container::Array(values)
-            } else {
-                Container::Bitmap {
-                    bits: out_bits,
-                    cardinality: out_cardinality,
-                }
-            }
-        }
-    }
-}
-
-fn dedup_sorted(values: &mut Vec<u16>) {
-    if values.is_empty() {
-        return;
-    }
-    let mut out_idx = 1usize;
-    for i in 1..values.len() {
-        if values[i] != values[out_idx - 1] {
-            values[out_idx] = values[i];
-            out_idx += 1;
-        }
-    }
-    values.truncate(out_idx);
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct BitmapSet {
-    containers: BTreeMap<u16, Container>,
+    inner: RoaringBitmap,
 }
 
 impl BitmapSet {
@@ -267,76 +19,73 @@ impl BitmapSet {
 
     pub fn grow(&mut self, _new_len: usize) {}
 
+    #[inline]
+    fn id_to_bitmap(id: usize) -> Option<u32> {
+        u32::try_from(id).ok()
+    }
+
     pub fn insert(&mut self, id: usize) {
-        let value = id as u32;
-        let high = (value >> 16) as u16;
-        let low = (value & 0xFFFF) as u16;
-        self.containers
-            .entry(high)
-            .or_insert_with(Container::empty)
-            .insert(low);
+        if let Some(id32) = Self::id_to_bitmap(id) {
+            self.inner.insert(id32);
+        }
     }
 
     pub fn contains(&self, id: usize) -> bool {
-        let value = id as u32;
-        let high = (value >> 16) as u16;
-        let low = (value & 0xFFFF) as u16;
-        self.containers
-            .get(&high)
-            .map(|c| c.contains(low))
+        Self::id_to_bitmap(id)
+            .map(|id32| self.inner.contains(id32))
             .unwrap_or(false)
     }
 
-    pub fn count_ones<R>(&self, _range: R) -> usize
+    pub fn count_ones<R>(&self, range: R) -> usize
     where
         R: RangeBounds<usize>,
     {
-        self.cardinality()
+        let start = match range.start_bound() {
+            Bound::Included(v) => *v,
+            Bound::Excluded(v) => v.saturating_add(1),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(v) => *v,
+            Bound::Excluded(v) => v.saturating_sub(1),
+            Bound::Unbounded => u32::MAX as usize,
+        };
+        if start > end {
+            return 0;
+        }
+        let start_u32 = match u32::try_from(start) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let end_u32 = u32::try_from(end).unwrap_or(u32::MAX);
+        self.inner
+            .range_cardinality(RangeInclusive::new(start_u32, end_u32)) as usize
     }
 
     pub fn cardinality(&self) -> usize {
-        self.containers.values().map(Container::cardinality).sum()
+        self.inner.len() as usize
     }
 
     pub fn is_empty(&self) -> bool {
-        self.containers.is_empty()
+        self.inner.is_empty()
     }
 
     pub fn ones(&self) -> Vec<usize> {
-        let mut out = Vec::with_capacity(self.cardinality());
-        for (high, container) in &self.containers {
-            for low in container.values() {
-                out.push(((*high as usize) << 16) | low as usize);
-            }
-        }
-        out
+        self.inner.iter().map(|id| id as usize).collect()
+    }
+
+    pub fn iter_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.inner.iter().map(|id| id as usize)
     }
 
     pub fn union_with(&mut self, other: &Self) {
-        for (high, other_container) in &other.containers {
-            match self.containers.get(high) {
-                Some(this_container) => {
-                    let merged = union_container(this_container, other_container);
-                    self.containers.insert(*high, merged);
-                }
-                None => {
-                    self.containers.insert(*high, other_container.clone());
-                }
-            }
-        }
+        self.inner |= &other.inner;
     }
 
     pub fn intersect(&self, other: &Self) -> Self {
-        let mut out = Self::default();
-        for (high, this_container) in &self.containers {
-            if let Some(other_container) = other.containers.get(high) {
-                let inter = intersect_container(this_container, other_container);
-                if inter.cardinality() > 0 {
-                    out.containers.insert(*high, inter);
-                }
-            }
-        }
-        out
+        let mut inner = self.inner.clone();
+        inner &= &other.inner;
+        Self { inner }
     }
 }
 
@@ -387,8 +136,10 @@ impl FilterIndex {
                 continue;
             }
             let tag_id = self.intern_tag(&key);
-            let entry = self.tag_bitmaps.entry(tag_id).or_default();
-            entry.insert(vector_id);
+            self.tag_bitmaps
+                .entry(tag_id)
+                .or_default()
+                .insert(vector_id);
         }
 
         let bpm_bucket = metadata.bpm.floor() as i32;
@@ -407,6 +158,7 @@ impl FilterIndex {
                 .or_default()
                 .insert(vector_id);
         }
+
         let bpm_bucket = bpm.floor() as i32;
         self.bpm_buckets
             .entry(bpm_bucket)
@@ -462,7 +214,7 @@ impl FilterIndex {
             }
 
             let mut bpm_exact = BitmapSet::default();
-            for id in bpm_union.ones() {
+            for id in bpm_union.iter_ids() {
                 if let Some(bpm) = self.bpm_values.get(&id) {
                     if *bpm >= lower && *bpm <= upper {
                         bpm_exact.insert(id);
@@ -486,7 +238,7 @@ mod tests {
     use vibrato_core::metadata::VectorMetadata;
 
     #[test]
-    fn roaring_like_bitmap_sparse_dense_union_and_intersect() {
+    fn roaring_bitmap_sparse_dense_union_and_intersect() {
         let mut a = BitmapSet::default();
         let mut b = BitmapSet::default();
         for i in (0..10_000usize).step_by(3) {
@@ -510,11 +262,11 @@ mod tests {
     }
 
     #[test]
-    fn roaring_like_bitmap_handles_multiple_high_containers() {
+    fn roaring_bitmap_handles_multiple_high_ranges() {
         let mut bm = BitmapSet::default();
         bm.insert(1);
-        bm.insert(65_537); // different high-16 container
-        bm.insert(131_073); // another container
+        bm.insert(65_537);
+        bm.insert(131_073);
 
         assert!(bm.contains(1));
         assert!(bm.contains(65_537));

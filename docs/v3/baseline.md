@@ -238,6 +238,52 @@ Code review findings fixed:
 - Fixed by copying candidates out of scratch scope before predicate evaluation.
 
 Optimization headroom:
+
+## 2026-02-22 Validation Snapshot
+
+Command:
+
+```bash
+CARGO_BUILD_JOBS=4 cargo test --workspace --exclude vibrato-vst
+```
+
+Result:
+
+```text
+workspace test gate passed (all non-ignored suites green)
+```
+
+Direct stress (release, admin chaos enabled):
+
+```bash
+VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 \
+  cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture
+```
+
+Observed:
+
+```text
+elapsed=23.60s (best warm run in this session)
+elapsed~38-41s (noisy runs on same host under admin chaos)
+admin_ok range: 26..76
+admin_skipped range: 899..981
+```
+
+Direct stress (release, admin chaos disabled):
+
+```bash
+VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=0 \
+  cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture
+```
+
+Observed:
+
+```text
+elapsed=16.77s reads=60071 writes=39929 write_batches=408 verify_samples=200
+```
+
+Note:
+- Network-bound stress/admin suites are environment-dependent when localhost bind is restricted.
 - Replace `BinaryHeap` in search hot path with fixed-capacity bounded heaps for small `ef` values.
 - Add optional CPU affinity / scheduler controls in benchmark harness to reduce OS-tail jitter.
 
@@ -332,3 +378,75 @@ Code review findings fixed:
 Optimization headroom:
 - Add explicit per-batch Flight ingest metrics (`decode_us`, `commit_us`, `ack_us`) for throughput attribution.
 - Eliminate remaining row materialization (`extract_batch_entries -> Vec<...>`) by introducing an iterator-based ingest path into engine/catalog.
+
+### Phase F: Final ingest-path hardening (this run)
+
+Implemented:
+- Replaced idempotency batch lookup dynamic SQL (`IN (...)` + JSON row decode) with prepared index lookups:
+  - `SELECT vector_id FROM wal_entries WHERE collection_id=? AND idempotency_key=? LIMIT 1`
+  - removed hot-path SQL string building and serde/json parse overhead in batch ingest.
+- Replaced vector-id counter fetch/update JSON path with prepared statements (`SELECT next_id`, `UPDATE ... + ?`).
+- Removed `tag_registry_reverse` copy-on-write update path from ingest cache commit.
+- Added dedicated Flight decode lane (`rayon` pool in `ProductionState`) and removed Flight ingest dependence on Tokio global `spawn_blocking`.
+- Optimized Flight tags decoding to avoid per-row list downcast/materialization.
+- Extended Flight guard test to assert dedicated pool usage and reject `spawn_blocking` regression.
+
+Validation:
+- `cargo check --workspace --exclude vibrato-vst` pass
+- `cargo test --workspace --exclude vibrato-vst` pass
+- `cargo test --release --test v2_catalog_protocol_e2e -- --nocapture` pass (7/7)
+- `cargo test --release --test v2_catalog_timeout_e2e -- --nocapture` pass (1/1)
+- `cargo test --release --test v2_catalog_wal_growth_guard_e2e -- --nocapture` pass (1/1)
+- `cargo test --release --test v2_flight_ingest_e2e -- --nocapture` pass
+- `cargo test --release --test v2_flight_row_materialization_guard -- --nocapture` pass
+- `VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture` pass
+  - `elapsed=27.965877083s`
+  - `reads=60040 writes=38941 write_batches=1094 verify_samples=200 admin_ok=129 admin_skipped=890`
+
+Benchmark snapshot:
+- `cargo bench -p vibrato-core --bench simd`: all reported kernels improved vs prior criterion baseline.
+- `cargo bench -p vibrato-core --bench hnsw`: insert/search mean path improved or unchanged (no regressions detected).
+- `./scripts/bench_hnsw_p99.sh 5`:
+  - `ef=20 p99=16.08us`
+  - `ef=50 p99=34.21us`
+  - `ef=100 p99=64.54us`
+
+Remaining optimization headroom:
+- Implement per-collection `next_tag_id` allocators to avoid sparse global tag IDs in multi-collection deployments.
+- Add optional CPU affinity controls to p99 harness/CI perf runners to reduce host-noise tail jitter.
+
+### Phase G: Lock-shard completion + idempotency lookup batching (this run)
+
+Implemented:
+- Completed sharded filter-index migration in `/crates/vibrato-server/src/prod/engine.rs`:
+  - removed remaining stale `self.filter_index` usage,
+  - write path now updates filter + metadata under shard-local locks only,
+  - rebuild path now hydrates shard-local filter indexes.
+- Added `QueryFilter::is_empty()` fast-path in `/crates/vibrato-server/src/prod/model.rs` to bypass unnecessary allow-set assembly.
+- Added parallel shard union for allow-set construction (`build_allow_set_sharded`).
+- Batched idempotency-key existence lookups in `/crates/vibrato-server/src/prod/catalog.rs`:
+  - replaced N per-key point lookups with chunked `IN (?...)` prepared queries,
+  - enforced SQLite variable cap chunking (32,766 max variables),
+  - kept parameter binding (no unsafe SQL interpolation).
+- Removed low thread caps in `ProductionState` initialization:
+  - query pool now scales to `min(available_parallelism, 16)`,
+  - Flight decode pool now scales to `min(available_parallelism/2, 16)`.
+
+Validation:
+- `cargo check --workspace --exclude vibrato-vst` pass.
+- `cargo test --workspace --exclude vibrato-vst` pass.
+- `cargo test -p vibrato-server --lib -- --nocapture` pass (13/13).
+- `VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=0 cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture` pass
+  - `elapsed=19.767178583s`
+  - `reads=60116 writes=39884 write_batches=407 admin_skipped=0`
+- `VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture` pass
+  - `elapsed=23.833715084s`
+  - `reads=60065 writes=38951 write_batches=1065 admin_ok=27 admin_skipped=957`
+- `cargo bench -p vibrato-core --bench hnsw_p99`:
+  - `ef=20 p99=56.83us`
+  - `ef=50 p99=111.75us`
+  - `ef=100 p99=153.96us`
+
+Notes:
+- The p99 bench result above was a single noisy host run and is not representative by itself.
+- Use `./scripts/bench_hnsw_p99.sh 5` on a pinned/perf runner for release acceptance comparisons.

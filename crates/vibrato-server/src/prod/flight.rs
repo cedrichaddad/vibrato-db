@@ -16,6 +16,7 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::{stream, Stream, StreamExt, TryStreamExt};
+use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 use vibrato_core::metadata::VectorMetadata;
 
@@ -157,6 +158,7 @@ struct FlightBatchColumns<'a> {
     duration_ms: Option<&'a UInt16Array>,
     bpm: Option<&'a Float32Array>,
     tags: Option<&'a ListArray>,
+    tag_values: Option<&'a StringArray>,
     metadata_json: Option<&'a StringArray>,
     idempotency_key: Option<&'a StringArray>,
 }
@@ -200,6 +202,20 @@ fn parse_flight_batch_columns<'a>(
             Status::invalid_argument("column 'vector' values must be Float32 for Flight ingest")
         })?;
 
+    let tags = as_list_utf8_array(batch, "tags")?;
+    let tag_values = if let Some(col) = tags {
+        Some(
+            col.values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    Status::invalid_argument("tags column must be List<Utf8> for Flight ingest")
+                })?,
+        )
+    } else {
+        None
+    };
+
     Ok(FlightBatchColumns {
         dim,
         num_rows: batch.num_rows(),
@@ -209,7 +225,8 @@ fn parse_flight_batch_columns<'a>(
         start_time_ms: as_u32_array(batch, "start_time_ms")?,
         duration_ms: as_u16_array(batch, "duration_ms")?,
         bpm: as_f32_array(batch, "bpm")?,
-        tags: as_list_utf8_array(batch, "tags")?,
+        tags,
+        tag_values,
         metadata_json: as_string_array(batch, "metadata_json")?,
         idempotency_key: as_string_array(batch, "idempotency_key")?,
     })
@@ -258,19 +275,15 @@ fn decode_entry_at_row(
             metadata.bpm = col.value(row);
         }
     }
-    if let Some(col) = cols.tags {
+    if let (Some(col), Some(tag_values)) = (cols.tags, cols.tag_values) {
         if !col.is_null(row) {
-            let tag_values = col.value(row);
-            let tag_strings = tag_values
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    Status::invalid_argument("tags column must be List<Utf8> for Flight ingest")
-                })?;
-            let mut parsed = Vec::with_capacity(tag_strings.len());
-            for i in 0..tag_strings.len() {
-                if !tag_strings.is_null(i) {
-                    parsed.push(tag_strings.value(i).to_string());
+            let offsets = col.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let mut parsed = Vec::with_capacity(end.saturating_sub(start));
+            for i in start..end {
+                if !tag_values.is_null(i) {
+                    parsed.push(tag_values.value(i).to_string());
                 }
             }
             metadata.tags = parsed;
@@ -471,16 +484,17 @@ impl FlightService for VibratoFlightService {
                 .fetch_add(incoming_bytes, AtomicOrdering::Relaxed);
             let state_bg = self.state.clone();
             let dim = self.state.collection.dim;
-            let ingest_result = tokio::task::spawn_blocking(move || {
-                ingest_flight_batch_streaming(&state_bg, batch, dim)
-            })
-            .await;
+            let (result_tx, result_rx) = oneshot::channel();
+            self.state.flight_decode_pool.spawn_fifo(move || {
+                let _ = result_tx.send(ingest_flight_batch_streaming(&state_bg, batch, dim));
+            });
+            let ingest_result = result_rx.await;
             self.state
                 .inflight_decode_bytes
                 .fetch_sub(incoming_bytes, AtomicOrdering::Relaxed);
 
             let ingest_result = ingest_result
-                .map_err(|e| Status::internal(format!("flight ingest task join error: {e}")))??;
+                .map_err(|_| Status::internal("flight ingest worker dropped before returning"))??;
             accepted += ingest_result.results.len();
             created += ingest_result
                 .results
@@ -503,6 +517,7 @@ impl FlightService for VibratoFlightService {
                 .metrics
                 .flight_commit_us_total
                 .fetch_add(ingest_result.commit_us, AtomicOrdering::Relaxed);
+            tokio::task::yield_now().await;
         }
 
         let ack_started = Instant::now();

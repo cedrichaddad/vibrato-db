@@ -230,6 +230,18 @@ enum Commands {
         #[arg(long, default_value = "8589934592")]
         memory_budget_bytes: u64,
 
+        /// Query rayon pool threads (0 = auto)
+        #[arg(long, default_value = "0")]
+        query_pool_threads: usize,
+
+        /// Flight decode rayon pool threads (0 = auto)
+        #[arg(long, default_value = "0")]
+        flight_decode_pool_threads: usize,
+
+        /// Minimum shard count before filter allow-set union parallelizes
+        #[arg(long, default_value = "8")]
+        filter_parallel_min_shards: usize,
+
         /// Vector mmap advise mode for active segment vectors: normal|random
         #[arg(long, default_value = "normal")]
         vector_madvise_mode: String,
@@ -591,6 +603,9 @@ async fn main() -> anyhow::Result<()> {
             hot_index_shards,
             ingest_queue_capacity,
             memory_budget_bytes,
+            query_pool_threads,
+            flight_decode_pool_threads,
+            filter_parallel_min_shards,
             vector_madvise_mode,
             flight_host,
             flight_port,
@@ -610,6 +625,9 @@ async fn main() -> anyhow::Result<()> {
             config.hot_index_shards = hot_index_shards;
             config.ingest_queue_capacity = ingest_queue_capacity.max(1);
             config.memory_budget_bytes = memory_budget_bytes;
+            config.query_pool_threads = query_pool_threads;
+            config.flight_decode_pool_threads = flight_decode_pool_threads;
+            config.filter_parallel_min_shards = filter_parallel_min_shards.max(1);
             config.vector_madvise_mode = parse_vector_madvise_mode(&vector_madvise_mode)?;
 
             bootstrap_data_dirs(&config)?;

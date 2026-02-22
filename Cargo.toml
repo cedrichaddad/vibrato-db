@@ -79,6 +79,10 @@ harness = false
 name = "hnsw_p99"
 harness = false
 
+[[bench]]
+name = "query_filter_p99"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

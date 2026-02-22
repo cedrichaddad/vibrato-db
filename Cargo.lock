@@ -4928,6 +4928,7 @@ dependencies = [
  "rand",
  "rayon",
  "rmp-serde",
+ "roaring",
  "serde",
  "serde_json",
  "sha2",
@@ -4936,6 +4937,7 @@ dependencies = [
  "tonic",
  "tracing",
  "vibrato-core",
+ "xxhash-rust",
 ]
 
 [[package]]

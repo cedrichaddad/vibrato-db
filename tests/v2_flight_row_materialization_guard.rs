@@ -19,11 +19,19 @@ fn flight_ingest_path_uses_owned_batch_handoff() {
         "flight ingest path must hand off owned chunk buffers to avoid extra row-buffer cloning"
     );
     assert!(
+        contents.contains("flight_decode_pool.spawn_fifo"),
+        "flight ingest path must use the dedicated flight decode pool"
+    );
+    assert!(
         !contents.contains("ingest_batch(&entries)"),
         "flight ingest path regressed to borrowed-slice ingest and reintroduced row-buffer clone"
     );
     assert!(
         !contents.contains("entries.to_vec()"),
         "flight ingest path should not clone entry buffers with entries.to_vec()"
+    );
+    assert!(
+        !contents.contains("tokio::task::spawn_blocking"),
+        "flight ingest path should not use Tokio's global blocking pool"
     );
 }

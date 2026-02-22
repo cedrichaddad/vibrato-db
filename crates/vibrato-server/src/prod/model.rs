@@ -147,6 +147,16 @@ pub struct QueryFilter {
     pub bpm_lte: Option<f32>,
 }
 
+impl QueryFilter {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.tags_any.is_empty()
+            && self.tags_all.is_empty()
+            && self.bpm_gte.is_none()
+            && self.bpm_lte.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResultV2 {
     pub id: usize,

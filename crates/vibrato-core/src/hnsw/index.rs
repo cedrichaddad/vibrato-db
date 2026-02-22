@@ -147,6 +147,9 @@ pub struct HNSW {
     /// Map from node ID to index in nodes vector (O(1) lookup)
     id_to_index: FxHashMap<usize, usize>,
 
+    /// Highest node ID currently present in the graph.
+    max_node_id: usize,
+
     /// Entry point node ID (node on the highest layer)
     pub entry_point: Option<usize>,
 
@@ -228,6 +231,7 @@ impl HNSW {
         Self {
             nodes: Vec::new(),
             id_to_index: FxHashMap::default(),
+            max_node_id: 0,
             entry_point: None,
             max_layer: 0,
             m,
@@ -259,10 +263,12 @@ impl HNSW {
             .enumerate()
             .map(|(idx, node)| (node.id, idx))
             .collect();
+        let max_node_id = nodes.iter().map(|n| n.id).max().unwrap_or(0);
 
         Self {
             nodes,
             id_to_index,
+            max_node_id,
             entry_point,
             max_layer,
             m,
@@ -329,6 +335,7 @@ impl HNSW {
     pub fn insert(&mut self, id: usize) {
         let query = self.get_vector_owned(id);
         let node_layer = self.random_layer();
+        self.max_node_id = self.max_node_id.max(id);
 
         // Create node
         let mut node = Node::new(id, node_layer);
@@ -344,7 +351,7 @@ impl HNSW {
 
         let entry_point = self.entry_point.unwrap();
         let mut current_node = entry_point;
-        let mut visited = VisitedGuard::new(self.nodes.len().max(1024));
+        let mut visited = VisitedGuard::new(self.max_node_id);
         let mut scratch = SearchScratch::new(self.ef_construction.max(1));
         let mut layer_candidates: Vec<(usize, f32)> = Vec::new();
 
@@ -638,7 +645,7 @@ impl HNSW {
             } = &mut *slot;
             let entry_point = self.entry_point.unwrap();
             let mut current_node = entry_point;
-            let mut visited = VisitedGuard::new(self.nodes.len().max(1024));
+            let mut visited = VisitedGuard::new(self.max_node_id);
 
             // Phase 1: Greedy descent from top layer to layer 1
             for layer in (1..=self.max_layer).rev() {
@@ -716,7 +723,7 @@ impl HNSW {
             } = &mut *slot;
             let entry_point = self.entry_point.unwrap();
             let mut current_node = entry_point;
-            let mut visited = VisitedGuard::new(self.nodes.len().max(1024));
+            let mut visited = VisitedGuard::new(self.max_node_id);
 
             // Phase 1: Greedy descent (unfiltered — we don't filter hub nodes)
             for layer in (1..=self.max_layer).rev() {

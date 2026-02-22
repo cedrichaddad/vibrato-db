@@ -126,6 +126,12 @@ pub struct ProductionConfig {
     pub hot_index_shards: usize,
     pub ingest_queue_capacity: usize,
     pub memory_budget_bytes: u64,
+    /// Query rayon pool size (0 = auto).
+    pub query_pool_threads: usize,
+    /// Flight decode rayon pool size (0 = auto).
+    pub flight_decode_pool_threads: usize,
+    /// Minimum shard count before allow-set union parallelization is enabled.
+    pub filter_parallel_min_shards: usize,
     pub vector_madvise_mode: VectorMadviseMode,
     pub api_pepper: String,
 }
@@ -186,10 +192,12 @@ pub struct ProductionState {
     pub hot_vector_shards: Vec<ArcSwap<RwLock<HashMap<usize, Arc<Vec<f32>>>>>>,
     pub hot_indices: Vec<RwLock<HNSW>>,
     pub shard_mask: usize,
-    pub metadata_cache: Arc<RwLock<HashMap<usize, VectorMetadata>>>,
+    pub metadata_cache_shards: Vec<RwLock<HashMap<usize, VectorMetadata>>>,
     pub segments: ArcSwap<Vec<Arc<SegmentHandle>>>,
     pub archive_segments: ArcSwap<Vec<Arc<ArchivePqSegment>>>,
-    pub filter_index: Arc<RwLock<FilterIndex>>,
+    pub filter_index_shards: Vec<RwLock<FilterIndex>>,
+    filter_allow_cache: RwLock<HashMap<String, (u64, Arc<BitmapSet>)>>,
+    filter_cache_epoch: AtomicU64,
     pub retired_segments: std::sync::Mutex<HashMap<String, Weak<SegmentHandle>>>,
 
     pub metrics: Metrics,
@@ -204,6 +212,7 @@ pub struct ProductionState {
     pub compaction_lock: std::sync::Mutex<()>,
     pub background_pool: std::sync::Mutex<Option<Arc<ThreadPool>>>,
     background_io_throttle: Option<Arc<BackgroundIoThrottle>>,
+    pub flight_decode_pool: Arc<ThreadPool>,
     pub query_pool: Arc<ThreadPool>,
     pub audit_tx: SyncSender<AuditEvent>,
     pub audit_rx: std::sync::Mutex<Option<Receiver<AuditEvent>>>,
@@ -241,6 +250,9 @@ impl ProductionConfig {
             hot_index_shards: 8,
             ingest_queue_capacity: 1024,
             memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            query_pool_threads: 0,
+            flight_decode_pool_threads: 0,
+            filter_parallel_min_shards: 8,
             vector_madvise_mode: VectorMadviseMode::Normal,
             api_pepper: std::env::var("VIBRATO_API_PEPPER")
                 .unwrap_or_else(|_| "dev-pepper".to_string()),
@@ -253,6 +265,20 @@ impl ProductionConfig {
 }
 
 impl ProductionState {
+    #[inline]
+    fn auto_query_pool_threads(available: usize) -> usize {
+        if available <= 2 {
+            1
+        } else {
+            ((available * 3) / 4).clamp(2, 12)
+        }
+    }
+
+    #[inline]
+    fn auto_flight_decode_pool_threads(available: usize, query_threads: usize) -> usize {
+        query_threads.div_ceil(2).clamp(1, 8).min(available.max(1))
+    }
+
     pub fn initialize(config: ProductionConfig, catalog: Arc<SqliteCatalog>) -> Result<Arc<Self>> {
         let collection = catalog.ensure_collection(&config.collection_name, config.dim)?;
 
@@ -272,20 +298,41 @@ impl ProductionState {
                 ))
             })
             .collect::<Vec<_>>();
-        let metadata_cache = Arc::new(RwLock::new(HashMap::new()));
+        let metadata_cache_shards = (0..shard_count)
+            .map(|_| RwLock::new(HashMap::new()))
+            .collect::<Vec<_>>();
         let (audit_tx, audit_rx) = sync_channel(4096);
         let (ingest_writer_tx, ingest_writer_rx) =
             sync_channel(config.ingest_queue_capacity.max(1));
         let available = std::thread::available_parallelism()
             .map(|v| v.get())
             .unwrap_or(2);
-        let query_threads = (available / 2).clamp(1, 4);
+        let query_threads = if config.query_pool_threads > 0 {
+            config.query_pool_threads.min(available.max(1)).max(1)
+        } else {
+            Self::auto_query_pool_threads(available)
+        };
         let query_pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(query_threads)
                 .thread_name(|idx| format!("vibrato-query-{idx}"))
                 .build()
                 .context("building query pool")?,
+        );
+        let flight_decode_threads = if config.flight_decode_pool_threads > 0 {
+            config
+                .flight_decode_pool_threads
+                .min(available.max(1))
+                .max(1)
+        } else {
+            Self::auto_flight_decode_pool_threads(available, query_threads)
+        };
+        let flight_decode_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(flight_decode_threads)
+                .thread_name(|idx| format!("vibrato-flight-decode-{idx}"))
+                .build()
+                .context("building flight decode pool")?,
         );
         let background_io_throttle =
             if config.audio_colocated && config.background_io_mb_per_sec > 0 {
@@ -306,10 +353,14 @@ impl ProductionState {
             hot_vector_shards,
             hot_indices,
             shard_mask,
-            metadata_cache,
+            metadata_cache_shards,
             segments: ArcSwap::from_pointee(Vec::new()),
             archive_segments: ArcSwap::from_pointee(Vec::new()),
-            filter_index: Arc::new(RwLock::new(FilterIndex::default())),
+            filter_index_shards: (0..shard_count)
+                .map(|_| RwLock::new(FilterIndex::default()))
+                .collect(),
+            filter_allow_cache: RwLock::new(HashMap::new()),
+            filter_cache_epoch: AtomicU64::new(1),
             retired_segments: std::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
             ingest_writer_tx,
@@ -323,6 +374,7 @@ impl ProductionState {
             compaction_lock: std::sync::Mutex::new(()),
             background_pool: std::sync::Mutex::new(None),
             background_io_throttle,
+            flight_decode_pool,
             query_pool,
             audit_tx,
             audit_rx: std::sync::Mutex::new(Some(audit_rx)),
@@ -571,10 +623,13 @@ impl ProductionState {
         if let Some(index) = self.hot_indices.get(shard) {
             index.write().insert(vector_id);
         }
-        self.metadata_cache
-            .write()
-            .insert(vector_id, metadata.clone());
-        self.filter_index.write().add(vector_id, &metadata);
+        if let Some(metadata_shard) = self.metadata_cache_shards.get(shard) {
+            metadata_shard.write().insert(vector_id, metadata.clone());
+        }
+        if let Some(filter_shard) = self.filter_index_shards.get(shard) {
+            filter_shard.write().add(vector_id, &metadata);
+        }
+        self.bump_filter_cache_epoch();
         self.hot_vectors_bytes
             .fetch_add(vector_bytes, AtomicOrdering::Relaxed);
         self.metadata_cache_bytes
@@ -717,30 +772,50 @@ impl ProductionState {
 
         // 4. Update metadata cache + filter index in one pass.
         if created_count > 0 {
-            let mut meta_cache = self.metadata_cache.write();
-            let mut filter_idx = self.filter_index.write();
-            for (vector_id, metadata, _) in &metadata_updates {
-                meta_cache.insert(*vector_id, metadata.clone());
-                filter_idx.add(*vector_id, metadata);
-                self.metadata_cache_bytes.fetch_add(
-                    Self::estimate_metadata_bytes(metadata),
-                    AtomicOrdering::Relaxed,
+            let mut metadata_by_shard = vec![Vec::new(); self.metadata_cache_shards.len()];
+            let mut metadata_bytes_delta = 0u64;
+            let mut vector_bytes = 0u64;
+            for (vector_id, metadata, vec_len) in metadata_updates {
+                metadata_bytes_delta =
+                    metadata_bytes_delta.saturating_add(Self::estimate_metadata_bytes(&metadata));
+                vector_bytes = vector_bytes.saturating_add(
+                    (vec_len as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
                 );
-                self.hnsw_graph_bytes.fetch_add(
-                    self.estimate_hnsw_bytes_per_vector(),
-                    AtomicOrdering::Relaxed,
-                );
+                let shard = vector_id & self.shard_mask;
+                if let Some(bucket) = metadata_by_shard.get_mut(shard) {
+                    bucket.push((vector_id, metadata));
+                }
             }
-            let vector_bytes = metadata_updates.iter().fold(0u64, |acc, (_, _, vec_len)| {
-                acc.saturating_add(
-                    (*vec_len as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
-                )
-            });
+
+            for (shard, rows) in metadata_by_shard.into_iter().enumerate() {
+                if rows.is_empty() {
+                    continue;
+                }
+                if let (Some(filter_shard), Some(metadata_shard)) = (
+                    self.filter_index_shards.get(shard),
+                    self.metadata_cache_shards.get(shard),
+                ) {
+                    let mut filter_guard = filter_shard.write();
+                    let mut metadata_guard = metadata_shard.write();
+                    for (vector_id, metadata) in rows {
+                        filter_guard.add(vector_id, &metadata);
+                        metadata_guard.insert(vector_id, metadata);
+                    }
+                }
+            }
+
+            self.metadata_cache_bytes
+                .fetch_add(metadata_bytes_delta, AtomicOrdering::Relaxed);
+            self.hnsw_graph_bytes.fetch_add(
+                (created_count as u64).saturating_mul(self.estimate_hnsw_bytes_per_vector()),
+                AtomicOrdering::Relaxed,
+            );
             self.hot_vectors_bytes
                 .fetch_add(vector_bytes, AtomicOrdering::Relaxed);
             self.metrics
                 .ingest_total
                 .fetch_add(created_count as u64, AtomicOrdering::Relaxed);
+            self.bump_filter_cache_epoch();
         }
 
         // 5. Build output
@@ -760,12 +835,13 @@ impl ProductionState {
             ));
         }
 
-        let allow = request
-            .filter
-            .as_ref()
-            .map(|f| self.filter_index.read().build_allow_set(f));
-
-        let allow_bitmap = allow.flatten();
+        let allow_bitmap = request.filter.as_ref().and_then(|f| {
+            if f.is_empty() {
+                None
+            } else {
+                self.cached_allow_set(f)
+            }
+        });
 
         let mut best: HashMap<usize, f32> = HashMap::new();
 
@@ -780,7 +856,7 @@ impl ProductionState {
                             &request.vector,
                             request.k,
                             request.ef,
-                            allow_bitmap.as_ref(),
+                            allow_bitmap.as_deref(),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -810,7 +886,7 @@ impl ProductionState {
                         &request.vector,
                         request.k,
                         request.ef,
-                        allow_bitmap.as_ref(),
+                        allow_bitmap.as_deref(),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -831,7 +907,7 @@ impl ProductionState {
                             seg,
                             &request.vector,
                             request.k,
-                            allow_bitmap.as_ref(),
+                            allow_bitmap.as_deref(),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -2064,20 +2140,39 @@ impl ProductionState {
         let tag_dictionary = self.catalog.fetch_tag_dictionary(&self.collection.id)?;
         let filter_rows = self.catalog.fetch_filter_rows(&self.collection.id)?;
 
-        let mut index = FilterIndex::with_dictionary(tag_dictionary);
+        let mut index_shards = (0..self.filter_index_shards.len())
+            .map(|_| FilterIndex::with_dictionary(tag_dictionary.clone()))
+            .collect::<Vec<_>>();
         for row in filter_rows {
-            index.add_with_tag_ids(row.vector_id, row.bpm, &row.tag_ids);
+            let shard = row.vector_id & self.shard_mask;
+            if let Some(index) = index_shards.get_mut(shard) {
+                index.add_with_tag_ids(row.vector_id, row.bpm, &row.tag_ids);
+            }
         }
-        let mut metadata_cache = HashMap::with_capacity(entries.len());
+        let mut metadata_shards = (0..self.metadata_cache_shards.len())
+            .map(|_| HashMap::new())
+            .collect::<Vec<HashMap<usize, VectorMetadata>>>();
         let mut metadata_bytes = 0u64;
         for (id, meta) in entries {
             metadata_bytes = metadata_bytes.saturating_add(Self::estimate_metadata_bytes(&meta));
-            metadata_cache.insert(id, meta);
+            let shard = id & self.shard_mask;
+            if let Some(shard_map) = metadata_shards.get_mut(shard) {
+                shard_map.insert(id, meta);
+            }
         }
-        *self.filter_index.write() = index;
-        *self.metadata_cache.write() = metadata_cache;
+        for (idx, index) in index_shards.into_iter().enumerate() {
+            if let Some(shard) = self.filter_index_shards.get(idx) {
+                *shard.write() = index;
+            }
+        }
+        for (idx, shard_data) in metadata_shards.into_iter().enumerate() {
+            if let Some(shard) = self.metadata_cache_shards.get(idx) {
+                *shard.write() = shard_data;
+            }
+        }
         self.metadata_cache_bytes
             .store(metadata_bytes, AtomicOrdering::Relaxed);
+        self.bump_filter_cache_epoch();
         Ok(())
     }
 
@@ -2088,23 +2183,25 @@ impl ProductionState {
 
         let mut out = HashMap::with_capacity(ids.len());
         let mut missing = Vec::new();
-        {
-            let cache = self.metadata_cache.read();
-            for id in ids {
-                if let Some(meta) = cache.get(id) {
+        for id in ids {
+            let shard = *id & self.shard_mask;
+            if let Some(cache) = self.metadata_cache_shards.get(shard) {
+                if let Some(meta) = cache.read().get(id) {
                     out.insert(*id, meta.clone());
-                } else {
-                    missing.push(*id);
+                    continue;
                 }
             }
+            missing.push(*id);
         }
 
         if !missing.is_empty() {
             let fetched = self.catalog.fetch_metadata(&self.collection.id, &missing)?;
             if !fetched.is_empty() {
-                let mut cache = self.metadata_cache.write();
                 for (id, meta) in &fetched {
-                    cache.insert(*id, meta.clone());
+                    let shard = *id & self.shard_mask;
+                    if let Some(cache) = self.metadata_cache_shards.get(shard) {
+                        cache.write().insert(*id, meta.clone());
+                    }
                 }
             }
             for (id, meta) in fetched {
@@ -2113,6 +2210,101 @@ impl ProductionState {
         }
 
         Ok(out)
+    }
+
+    fn build_allow_set_sharded(&self, filter: &super::model::QueryFilter) -> Option<BitmapSet> {
+        let clause_weight = filter.tags_all.len()
+            + filter.tags_any.len()
+            + usize::from(filter.bpm_gte.is_some() || filter.bpm_lte.is_some());
+        let should_parallelize = self.filter_index_shards.len()
+            >= self.config.filter_parallel_min_shards
+            && clause_weight >= 2;
+
+        if should_parallelize {
+            let shard_sets = self.query_pool.install(|| {
+                self.filter_index_shards
+                    .par_iter()
+                    .filter_map(|shard| shard.read().build_allow_set(filter))
+                    .collect::<Vec<_>>()
+            });
+
+            let mut iter = shard_sets.into_iter();
+            let mut allow = iter.next()?;
+            for local in iter {
+                allow.union_with(&local);
+            }
+            Some(allow)
+        } else {
+            let mut allow: Option<BitmapSet> = None;
+            for shard in &self.filter_index_shards {
+                if let Some(local) = shard.read().build_allow_set(filter) {
+                    if let Some(existing) = allow.as_mut() {
+                        existing.union_with(&local);
+                    } else {
+                        allow = Some(local);
+                    }
+                }
+            }
+            allow
+        }
+    }
+
+    fn bump_filter_cache_epoch(&self) {
+        self.filter_cache_epoch
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn filter_cache_key(filter: &super::model::QueryFilter) -> String {
+        let mut tags_any = filter
+            .tags_any
+            .iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>();
+        tags_any.sort();
+        tags_any.dedup();
+
+        let mut tags_all = filter
+            .tags_all
+            .iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>();
+        tags_all.sort();
+        tags_all.dedup();
+
+        let mut key = String::with_capacity(128);
+        key.push_str("any=");
+        key.push_str(&tags_any.join(","));
+        key.push_str("|all=");
+        key.push_str(&tags_all.join(","));
+        key.push_str("|gte=");
+        if let Some(v) = filter.bpm_gte {
+            key.push_str(&format!("{v:.3}"));
+        }
+        key.push_str("|lte=");
+        if let Some(v) = filter.bpm_lte {
+            key.push_str(&format!("{v:.3}"));
+        }
+        key
+    }
+
+    fn cached_allow_set(&self, filter: &super::model::QueryFilter) -> Option<Arc<BitmapSet>> {
+        let epoch = self.filter_cache_epoch.load(AtomicOrdering::Relaxed);
+        let key = Self::filter_cache_key(filter);
+        if let Some((entry_epoch, bitmap)) = self.filter_allow_cache.read().get(&key) {
+            if *entry_epoch == epoch {
+                return Some(Arc::clone(bitmap));
+            }
+        }
+
+        let bitmap = Arc::new(self.build_allow_set_sharded(filter)?);
+        let mut cache = self.filter_allow_cache.write();
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(key, (epoch, Arc::clone(&bitmap)));
+        Some(bitmap)
     }
 
     pub fn gc_obsolete_segment_files(&self) -> Result<usize> {
@@ -2928,7 +3120,7 @@ fn search_index_with_dynamic_fallback(
     }
 
     let allow = allow_set.unwrap();
-    let cardinality = allow.count_ones(..);
+    let cardinality = allow.cardinality();
     if cardinality == 0 {
         return Vec::new();
     }
