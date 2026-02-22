@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use arrow_array::{
@@ -23,6 +24,7 @@ use super::engine::{IngestBackpressureDecision, ProductionState};
 use super::model::IngestMetadata;
 
 type TonicStream<T> = Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send + 'static>>;
+const FLIGHT_DECODE_CHUNK_ROWS: usize = 2048;
 
 pub async fn start_flight_server(state: Arc<ProductionState>, addr: SocketAddr) -> Result<()> {
     let service = VibratoFlightService { state };
@@ -145,10 +147,34 @@ fn as_list_utf8_array<'a>(
         .ok_or_else(|| Status::invalid_argument(format!("column '{name}' must be List<Utf8>")))
 }
 
-fn extract_batch_entries(
-    batch: &RecordBatch,
+struct FlightBatchColumns<'a> {
     dim: usize,
-) -> std::result::Result<Vec<(Vec<f32>, VectorMetadata, Option<String>)>, Status> {
+    num_rows: usize,
+    vectors: &'a FixedSizeListArray,
+    vector_values: &'a [f32],
+    source_file: Option<&'a StringArray>,
+    start_time_ms: Option<&'a UInt32Array>,
+    duration_ms: Option<&'a UInt16Array>,
+    bpm: Option<&'a Float32Array>,
+    tags: Option<&'a ListArray>,
+    metadata_json: Option<&'a StringArray>,
+    idempotency_key: Option<&'a StringArray>,
+}
+
+struct FlightBatchIngestResult {
+    results: Vec<(usize, bool)>,
+    decode_us: u64,
+    commit_us: u64,
+}
+
+fn elapsed_micros_u64(duration: std::time::Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+fn parse_flight_batch_columns<'a>(
+    batch: &'a RecordBatch,
+    dim: usize,
+) -> std::result::Result<FlightBatchColumns<'a>, Status> {
     let vector_idx = batch
         .schema()
         .index_of("vector")
@@ -173,87 +199,144 @@ fn extract_batch_entries(
         .ok_or_else(|| {
             Status::invalid_argument("column 'vector' values must be Float32 for Flight ingest")
         })?;
-    let vector_values_slice = vector_values.values();
 
-    let source_file = as_string_array(batch, "source_file")?;
-    let start_time_ms = as_u32_array(batch, "start_time_ms")?;
-    let duration_ms = as_u16_array(batch, "duration_ms")?;
-    let bpm = as_f32_array(batch, "bpm")?;
-    let tags = as_list_utf8_array(batch, "tags")?;
-    let metadata_json = as_string_array(batch, "metadata_json")?;
-    let idempotency_key = as_string_array(batch, "idempotency_key")?;
+    Ok(FlightBatchColumns {
+        dim,
+        num_rows: batch.num_rows(),
+        vectors,
+        vector_values: vector_values.values(),
+        source_file: as_string_array(batch, "source_file")?,
+        start_time_ms: as_u32_array(batch, "start_time_ms")?,
+        duration_ms: as_u16_array(batch, "duration_ms")?,
+        bpm: as_f32_array(batch, "bpm")?,
+        tags: as_list_utf8_array(batch, "tags")?,
+        metadata_json: as_string_array(batch, "metadata_json")?,
+        idempotency_key: as_string_array(batch, "idempotency_key")?,
+    })
+}
 
-    let mut entries = Vec::with_capacity(batch.num_rows());
-    for row in 0..batch.num_rows() {
-        if vectors.is_null(row) {
-            return Err(Status::invalid_argument("vector row must not be null"));
-        }
-        let start = row * dim;
-        let vector = vector_values_slice[start..start + dim].to_vec();
+fn decode_entry_at_row(
+    cols: &FlightBatchColumns<'_>,
+    row: usize,
+) -> std::result::Result<(Vec<f32>, VectorMetadata, Option<String>), Status> {
+    if cols.vectors.is_null(row) {
+        return Err(Status::invalid_argument("vector row must not be null"));
+    }
 
-        let mut metadata = if let Some(col) = metadata_json {
-            if !col.is_null(row) {
-                serde_json::from_str::<IngestMetadata>(col.value(row)).map_err(|e| {
-                    Status::invalid_argument(format!("invalid metadata_json at row {row}: {e}"))
-                })?
-            } else {
-                IngestMetadata::default()
-            }
+    let start = row * cols.dim;
+    let vector = cols.vector_values[start..start + cols.dim].to_vec();
+
+    let mut metadata = if let Some(col) = cols.metadata_json {
+        if !col.is_null(row) {
+            serde_json::from_str::<IngestMetadata>(col.value(row)).map_err(|e| {
+                Status::invalid_argument(format!("invalid metadata_json at row {row}: {e}"))
+            })?
         } else {
             IngestMetadata::default()
-        };
+        }
+    } else {
+        IngestMetadata::default()
+    };
 
-        if let Some(col) = source_file {
-            if !col.is_null(row) {
-                metadata.source_file = col.value(row).to_string();
-            }
+    if let Some(col) = cols.source_file {
+        if !col.is_null(row) {
+            metadata.source_file = col.value(row).to_string();
         }
-        if let Some(col) = start_time_ms {
-            if !col.is_null(row) {
-                metadata.start_time_ms = col.value(row);
-            }
+    }
+    if let Some(col) = cols.start_time_ms {
+        if !col.is_null(row) {
+            metadata.start_time_ms = col.value(row);
         }
-        if let Some(col) = duration_ms {
-            if !col.is_null(row) {
-                metadata.duration_ms = col.value(row);
-            }
+    }
+    if let Some(col) = cols.duration_ms {
+        if !col.is_null(row) {
+            metadata.duration_ms = col.value(row);
         }
-        if let Some(col) = bpm {
-            if !col.is_null(row) {
-                metadata.bpm = col.value(row);
-            }
+    }
+    if let Some(col) = cols.bpm {
+        if !col.is_null(row) {
+            metadata.bpm = col.value(row);
         }
-        if let Some(col) = tags {
-            if !col.is_null(row) {
-                let tag_values = col.value(row);
-                let tag_strings = tag_values
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        Status::invalid_argument("tags column must be List<Utf8> for Flight ingest")
-                    })?;
-                let mut parsed = Vec::with_capacity(tag_strings.len());
-                for i in 0..tag_strings.len() {
-                    if !tag_strings.is_null(i) {
-                        parsed.push(tag_strings.value(i).to_string());
-                    }
+    }
+    if let Some(col) = cols.tags {
+        if !col.is_null(row) {
+            let tag_values = col.value(row);
+            let tag_strings = tag_values
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    Status::invalid_argument("tags column must be List<Utf8> for Flight ingest")
+                })?;
+            let mut parsed = Vec::with_capacity(tag_strings.len());
+            for i in 0..tag_strings.len() {
+                if !tag_strings.is_null(i) {
+                    parsed.push(tag_strings.value(i).to_string());
                 }
-                metadata.tags = parsed;
             }
+            metadata.tags = parsed;
         }
+    }
 
-        let idempotency = idempotency_key.and_then(|col| {
-            if col.is_null(row) {
-                None
-            } else {
-                Some(col.value(row).to_string())
-            }
-        });
+    let idempotency = cols.idempotency_key.and_then(|col| {
+        if col.is_null(row) {
+            None
+        } else {
+            Some(col.value(row).to_string())
+        }
+    });
 
-        entries.push((vector, metadata.into(), idempotency));
+    Ok((vector, metadata.into(), idempotency))
+}
+
+#[cfg(test)]
+fn extract_batch_entries(
+    batch: &RecordBatch,
+    dim: usize,
+) -> std::result::Result<Vec<(Vec<f32>, VectorMetadata, Option<String>)>, Status> {
+    let cols = parse_flight_batch_columns(batch, dim)?;
+    let mut entries = Vec::with_capacity(cols.num_rows);
+    for row in 0..cols.num_rows {
+        entries.push(decode_entry_at_row(&cols, row)?);
     }
 
     Ok(entries)
+}
+
+fn ingest_flight_batch_streaming(
+    state: &ProductionState,
+    batch: RecordBatch,
+    dim: usize,
+) -> std::result::Result<FlightBatchIngestResult, Status> {
+    let cols = parse_flight_batch_columns(&batch, dim)?;
+    let mut results = Vec::with_capacity(cols.num_rows);
+    let chunk_capacity = FLIGHT_DECODE_CHUNK_ROWS.min(cols.num_rows.max(1));
+    let mut chunk = Vec::with_capacity(chunk_capacity);
+    let mut decode_us = 0u64;
+    let mut commit_us = 0u64;
+    let mut row = 0usize;
+
+    while row < cols.num_rows {
+        let end = (row + FLIGHT_DECODE_CHUNK_ROWS).min(cols.num_rows);
+        let decode_started = Instant::now();
+        for idx in row..end {
+            chunk.push(decode_entry_at_row(&cols, idx)?);
+        }
+        decode_us = decode_us.saturating_add(elapsed_micros_u64(decode_started.elapsed()));
+
+        let commit_started = Instant::now();
+        let mut batch_results = state
+            .ingest_batch_owned(std::mem::take(&mut chunk))
+            .map_err(map_ingest_error)?;
+        commit_us = commit_us.saturating_add(elapsed_micros_u64(commit_started.elapsed()));
+        results.append(&mut batch_results);
+        row = end;
+    }
+
+    Ok(FlightBatchIngestResult {
+        results,
+        decode_us,
+        commit_us,
+    })
 }
 
 fn estimate_batch_ingest_bytes(
@@ -367,6 +450,7 @@ impl FlightService for VibratoFlightService {
             if batch.num_rows() == 0 {
                 continue;
             }
+            let row_count = batch.num_rows() as u64;
             let incoming_bytes = estimate_batch_ingest_bytes(&batch, self.state.collection.dim)?;
             match self.state.ingest_backpressure_decision(incoming_bytes) {
                 IngestBackpressureDecision::Reject { .. } => {
@@ -387,14 +471,9 @@ impl FlightService for VibratoFlightService {
                 .fetch_add(incoming_bytes, AtomicOrdering::Relaxed);
             let state_bg = self.state.clone();
             let dim = self.state.collection.dim;
-            let ingest_result = tokio::task::spawn_blocking(
-                move || -> std::result::Result<Vec<(usize, bool)>, Status> {
-                    let entries = extract_batch_entries(&batch, dim)?;
-                    state_bg
-                        .ingest_batch_owned(entries)
-                        .map_err(map_ingest_error)
-                },
-            )
+            let ingest_result = tokio::task::spawn_blocking(move || {
+                ingest_flight_batch_streaming(&state_bg, batch, dim)
+            })
             .await;
             self.state
                 .inflight_decode_bytes
@@ -402,13 +481,31 @@ impl FlightService for VibratoFlightService {
 
             let ingest_result = ingest_result
                 .map_err(|e| Status::internal(format!("flight ingest task join error: {e}")))??;
-            accepted += ingest_result.len();
+            accepted += ingest_result.results.len();
             created += ingest_result
+                .results
                 .iter()
                 .filter(|(_, was_created)| *was_created)
                 .count();
+            self.state
+                .metrics
+                .flight_ingest_batches_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.state
+                .metrics
+                .flight_ingest_rows_total
+                .fetch_add(row_count, AtomicOrdering::Relaxed);
+            self.state
+                .metrics
+                .flight_decode_us_total
+                .fetch_add(ingest_result.decode_us, AtomicOrdering::Relaxed);
+            self.state
+                .metrics
+                .flight_commit_us_total
+                .fetch_add(ingest_result.commit_us, AtomicOrdering::Relaxed);
         }
 
+        let ack_started = Instant::now();
         let metadata = serde_json::json!({
             "collection_id": self.state.collection.id,
             "accepted": accepted,
@@ -417,6 +514,10 @@ impl FlightService for VibratoFlightService {
         })
         .to_string()
         .into_bytes();
+        self.state.metrics.flight_ack_us_total.fetch_add(
+            elapsed_micros_u64(ack_started.elapsed()),
+            AtomicOrdering::Relaxed,
+        );
 
         let out_stream = stream::once(async move {
             Ok(PutResult {

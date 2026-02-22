@@ -135,6 +135,11 @@ pub struct Metrics {
     pub query_total: AtomicU64,
     pub identify_total: AtomicU64,
     pub ingest_total: AtomicU64,
+    pub flight_ingest_batches_total: AtomicU64,
+    pub flight_ingest_rows_total: AtomicU64,
+    pub flight_decode_us_total: AtomicU64,
+    pub flight_commit_us_total: AtomicU64,
+    pub flight_ack_us_total: AtomicU64,
     pub auth_failures_total: AtomicU64,
     pub audit_failures_total: AtomicU64,
     pub checkpoint_total: AtomicU64,
@@ -692,6 +697,8 @@ impl ProductionState {
         // 3. Insert into hot index shards in parallel — one lock acquisition per shard.
         // Consumes shard buckets to move vector buffers directly into Arc.
         by_shard.into_par_iter().for_each(|(shard, items)| {
+            // Preserve visibility invariant for concurrent readers:
+            // vector store is populated before IDs become discoverable in HNSW.
             let vector_ids = items.iter().map(|item| item.vector_id).collect::<Vec<_>>();
             if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
                 let guard = shard_vectors.load();
@@ -1208,6 +1215,41 @@ impl ProductionState {
         out.push_str(&format!(
             "vibrato_ingest_requests_total {}\n",
             self.metrics.ingest_total.load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_flight_ingest_batches_total counter\n");
+        out.push_str(&format!(
+            "vibrato_flight_ingest_batches_total {}\n",
+            self.metrics
+                .flight_ingest_batches_total
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_flight_ingest_rows_total counter\n");
+        out.push_str(&format!(
+            "vibrato_flight_ingest_rows_total {}\n",
+            self.metrics
+                .flight_ingest_rows_total
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_flight_decode_us_total counter\n");
+        out.push_str(&format!(
+            "vibrato_flight_decode_us_total {}\n",
+            self.metrics
+                .flight_decode_us_total
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_flight_commit_us_total counter\n");
+        out.push_str(&format!(
+            "vibrato_flight_commit_us_total {}\n",
+            self.metrics
+                .flight_commit_us_total
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_flight_ack_us_total counter\n");
+        out.push_str(&format!(
+            "vibrato_flight_ack_us_total {}\n",
+            self.metrics
+                .flight_ack_us_total
+                .load(AtomicOrdering::Relaxed)
         ));
         out.push_str("# TYPE vibrato_ingest_backpressure_soft_total counter\n");
         out.push_str(&format!(

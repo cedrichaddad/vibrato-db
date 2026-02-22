@@ -11,8 +11,12 @@ fn flight_ingest_path_uses_owned_batch_handoff() {
     let contents = std::fs::read_to_string(&source).expect("read flight.rs source");
 
     assert!(
-        contents.contains("ingest_batch_owned(entries)"),
-        "flight ingest path must use owned batch handoff to avoid extra row-buffer cloning"
+        contents.contains("ingest_flight_batch_streaming(&state_bg, batch, dim)"),
+        "flight ingest path must stream/decode batches in chunks instead of materializing all rows up front"
+    );
+    assert!(
+        contents.contains("ingest_batch_owned(std::mem::take(&mut chunk))"),
+        "flight ingest path must hand off owned chunk buffers to avoid extra row-buffer cloning"
     );
     assert!(
         !contents.contains("ingest_batch(&entries)"),
