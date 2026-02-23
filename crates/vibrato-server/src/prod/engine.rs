@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::io::{BufReader, Read, Seek};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -35,6 +36,31 @@ use super::model::{
     MetadataEnvelopeV3, QueryRequestV2, QueryResponseV2, QueryResultV2, SearchTier,
     StatsResponseV2,
 };
+
+#[derive(Default)]
+pub struct FastIdHasher(u64);
+
+impl Hasher for FastIdHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(11) ^ (b as u64);
+        }
+        self.0 = self.0.wrapping_mul(0x517cc1b727220a95);
+    }
+
+    #[inline(always)]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (i as u64).wrapping_mul(0x517cc1b727220a95);
+    }
+}
+
+pub type FastIdMap<V> = HashMap<usize, V, BuildHasherDefault<FastIdHasher>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorMadviseMode {
@@ -193,7 +219,7 @@ pub struct ArchivePqSegment {
 }
 
 pub struct HotShard {
-    pub vectors: HashMap<usize, Arc<Vec<f32>>>,
+    pub vectors: FastIdMap<Arc<Vec<f32>>>,
     pub index: HNSW,
 }
 
@@ -265,7 +291,7 @@ impl ProductionConfig {
             quarantine_max_files: 50,
             quarantine_max_bytes: 5 * 1024 * 1024 * 1024,
             background_io_mb_per_sec: 40,
-            hot_index_shards: 8,
+            hot_index_shards: 64,
             ingest_queue_capacity: 1024,
             memory_budget_bytes: 8 * 1024 * 1024 * 1024,
             query_pool_threads: 0,
@@ -309,7 +335,7 @@ impl ProductionState {
         let hot_shards = (0..shard_count)
             .map(|_| {
                 RwLock::new(HotShard {
-                    vectors: HashMap::new(),
+                    vectors: FastIdMap::default(),
                     index: make_empty_hot_hnsw(config.hnsw_m, config.hnsw_ef_construction),
                 })
             })
@@ -873,10 +899,9 @@ impl ProductionState {
                 .hot_shards
                 .get(shard)
                 .unwrap_or_else(|| panic!("data integrity fault: missing hot shard {}", shard));
-
-            let mut shard_guard = shard_lock.write();
-            let HotShard { vectors, index } = &mut *shard_guard;
             for item in items {
+                let mut shard_guard = shard_lock.write();
+                let HotShard { vectors, index } = &mut *shard_guard;
                 vectors.insert(item.vector_id, Arc::new(item.vector));
                 let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
                     let vector = vectors.get(&id).unwrap_or_else(|| {
@@ -965,7 +990,7 @@ impl ProductionState {
             }
         });
 
-        let mut best: HashMap<usize, f32> = HashMap::new();
+        let mut best: FastIdMap<f32> = FastIdMap::default();
         let selective_allow = allow_bitmap
             .as_ref()
             .map(|bm| bm.cardinality() <= 5_000)
@@ -1192,7 +1217,7 @@ impl ProductionState {
         }
 
         let seq_len = request.vectors.len();
-        let mut best: HashMap<usize, f32> = HashMap::new();
+        let mut best: FastIdMap<f32> = FastIdMap::default();
 
         let raw_tier_allowed = |level: i64| match request.search_tier {
             SearchTier::Active => level <= 1,
@@ -2272,6 +2297,7 @@ impl ProductionState {
         let mut pending = self.catalog.pending_wal_after_lsn(&self.collection.id, 0)?;
         // Enforce LSN order even if upstream query ordering changes.
         pending.sort_by_key(|e| e.lsn);
+        let max_lsn = pending.last().map(|e| e.lsn).unwrap_or(0);
         let shard_count = self.hot_shards.len();
         let mut pending_by_shard: Vec<Vec<WalEntry>> = vec![Vec::new(); shard_count];
         for entry in pending {
@@ -2284,7 +2310,8 @@ impl ProductionState {
         // 1. Build shadow shard map/index pairs off-thread state.
         let mut shadow_shards = Vec::with_capacity(shard_count);
         for entries in pending_by_shard {
-            let mut vectors = HashMap::with_capacity(entries.len());
+            let mut vectors: FastIdMap<Arc<Vec<f32>>> = FastIdMap::default();
+            vectors.reserve(entries.len());
             for entry in entries {
                 vectors.insert(entry.vector_id, Arc::new(entry.vector));
             }
@@ -2313,7 +2340,9 @@ impl ProductionState {
         }
 
         // 3. Catch-up phase: replay rows committed while rebuilding shadow shards.
-        let mut pending_catchup = self.catalog.pending_wal_after_lsn(&self.collection.id, 0)?;
+        let mut pending_catchup = self
+            .catalog
+            .pending_wal_after_lsn(&self.collection.id, max_lsn)?;
         pending_catchup.sort_by_key(|e| e.lsn);
 
         let mut catchup_by_shard: Vec<Vec<WalEntry>> = vec![Vec::new(); shard_count];
@@ -3140,7 +3169,10 @@ fn legacy_segment_metadata(metadata: &VectorMetadataV3) -> VectorMetadata {
     }
 }
 
-fn merge_best(best: &mut HashMap<usize, f32>, id: usize, score: f32) {
+fn merge_best<S>(best: &mut HashMap<usize, f32, S>, id: usize, score: f32)
+where
+    S: BuildHasher,
+{
     match best.get_mut(&id) {
         Some(existing) => {
             if score > *existing {
