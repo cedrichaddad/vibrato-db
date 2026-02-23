@@ -15,7 +15,7 @@ Raw logs:
 Command:
 
 ```bash
-cargo test --release --test v2_admin_ops_e2e -- --nocapture
+cargo test --release --test v3_admin_ops_e2e -- --nocapture
 ```
 
 Exit: `0`
@@ -44,7 +44,7 @@ Command:
 
 ```bash
 VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 \
-  cargo test --release --test v2_stress_million_ops -- --ignored --nocapture
+  cargo test --release --test v3_stress_million_ops -- --ignored --nocapture
 ```
 
 Exit: `0`
@@ -75,7 +75,7 @@ Command:
 
 ```bash
 VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 \
-  cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture
+  cargo test --release --test v3_stress_million_ops_direct -- --ignored --nocapture
 ```
 
 Exit: `0`
@@ -113,7 +113,7 @@ Extracted baseline counters:
 Command:
 
 ```bash
-cargo test --release --test v2_identify_protocol_e2e -- --nocapture
+cargo test --release --test v3_identify_protocol_e2e -- --nocapture
 ```
 
 Exit: `0`
@@ -153,7 +153,7 @@ Command:
 
 ```bash
 VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 \
-  cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture
+  cargo test --release --test v3_stress_million_ops_direct -- --ignored --nocapture
 ```
 
 Latest counters:
@@ -165,10 +165,10 @@ direct stress summary seed=42 total_ops=100000 concurrency=16 elapsed=33.4877797
 Additional verification suites:
 
 ```text
-cargo test --release --test v2_catalog_protocol_e2e -- --nocapture
+cargo test --release --test v3_catalog_protocol_e2e -- --nocapture
   -> 7 passed, 0 failed
 
-cargo test --release --test v2_catalog_timeout_e2e -- --nocapture
+cargo test --release --test v3_catalog_timeout_e2e -- --nocapture
   -> 1 passed, 0 failed
 ```
 
@@ -257,7 +257,7 @@ Direct stress (release, admin chaos enabled):
 
 ```bash
 VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 \
-  cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture
+  cargo test --release --test v3_stress_million_ops_direct -- --ignored --nocapture
 ```
 
 Observed:
@@ -273,7 +273,7 @@ Direct stress (release, admin chaos disabled):
 
 ```bash
 VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=0 \
-  cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture
+  cargo test --release --test v3_stress_million_ops_direct -- --ignored --nocapture
 ```
 
 Observed:
@@ -294,8 +294,8 @@ Implemented:
 - Tag ID resolution now stays RAM-first (`tag_registry_forward`) and persists misses in the same transaction.
 
 Validation:
-- `cargo test --release --test v2_catalog_protocol_e2e -- --nocapture` (7/7 pass)
-- `cargo test --release --test v2_catalog_timeout_e2e -- --nocapture` (1/1 pass)
+- `cargo test --release --test v3_catalog_protocol_e2e -- --nocapture` (7/7 pass)
+- `cargo test --release --test v3_catalog_timeout_e2e -- --nocapture` (1/1 pass)
 
 Optimization headroom:
 - Replace idempotency `IN (...)` JSON query path with prepared-row lookup to cut remaining string/JSON overhead.
@@ -323,7 +323,7 @@ Optimization headroom:
 
 Implemented:
 - Added `crates/vibrato-server/src/prod/flight.rs` with `FlightService` implementation.
-- Added `start_flight_server(state, addr)` and wired `serve-v2` flags:
+- Added `start_flight_server(state, addr)` and wired `serve-v3` flags:
   - `--flight-host`
   - `--flight-port`
 - Implemented `do_put` ingest path with:
@@ -335,7 +335,7 @@ Implemented:
 
 Validation:
 - `cargo test -p vibrato-server flight:: -- --nocapture` (2/2 pass)
-- `cargo test --release --test v2_catalog_protocol_e2e -- --nocapture` (7/7 pass)
+- `cargo test --release --test v3_catalog_protocol_e2e -- --nocapture` (7/7 pass)
 - `VIBRATO_STRESS_TOTAL_OPS=100000 ... v2_stress_million_ops_direct -- --ignored --nocapture` pass
 
 Code review findings fixed:
@@ -352,20 +352,20 @@ Implemented:
 - Added owned-batch ingest handoff in engine:
   - `ProductionState::ingest_batch_owned(...)`
   - dedicated writer lane now returns `IngestWriteOutcome { wal_results, entries }`
-  - removed extra full-batch clone on `/v2/vectors/batch` and Flight `do_put` paths.
+  - removed extra full-batch clone on `/v3/vectors/batch` and Flight `do_put` paths.
 - Optimized engine post-WAL ingest path to avoid cloning vector payloads when inserting into
   hot shards (moves `Vec<f32>` buffers into `Arc<Vec<f32>>`).
 - Optimized Flight backpressure byte estimator to O(columns) using Arrow array memory accounting
   (`get_array_memory_size`) instead of O(rows) string/tag scans on the async path.
 - Added Flight integration and guard suites:
-  - `tests/v2_flight_ingest_e2e.rs`
-  - `tests/v2_flight_row_materialization_guard.rs`
-  - `tests/v2_flight_stress_million_ops.rs` (ignored harness)
+  - `tests/v3_flight_ingest_e2e.rs`
+  - `tests/v3_flight_row_materialization_guard.rs`
+  - `tests/v3_flight_stress_million_ops.rs` (ignored harness)
 
 Validation:
-- `cargo test --test v2_flight_row_materialization_guard -- --nocapture` pass
-- `cargo test --test v2_flight_ingest_e2e -- --nocapture` pass
-- `cargo test --release --test v2_flight_stress_million_ops -- --ignored --nocapture` pass
+- `cargo test --test v3_flight_row_materialization_guard -- --nocapture` pass
+- `cargo test --test v3_flight_ingest_e2e -- --nocapture` pass
+- `cargo test --release --test v3_flight_stress_million_ops -- --ignored --nocapture` pass
 - `cargo test --workspace --exclude vibrato-vst` pass
 
 Code review findings fixed:
@@ -394,12 +394,12 @@ Implemented:
 Validation:
 - `cargo check --workspace --exclude vibrato-vst` pass
 - `cargo test --workspace --exclude vibrato-vst` pass
-- `cargo test --release --test v2_catalog_protocol_e2e -- --nocapture` pass (7/7)
-- `cargo test --release --test v2_catalog_timeout_e2e -- --nocapture` pass (1/1)
-- `cargo test --release --test v2_catalog_wal_growth_guard_e2e -- --nocapture` pass (1/1)
-- `cargo test --release --test v2_flight_ingest_e2e -- --nocapture` pass
-- `cargo test --release --test v2_flight_row_materialization_guard -- --nocapture` pass
-- `VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture` pass
+- `cargo test --release --test v3_catalog_protocol_e2e -- --nocapture` pass (7/7)
+- `cargo test --release --test v3_catalog_timeout_e2e -- --nocapture` pass (1/1)
+- `cargo test --release --test v3_catalog_wal_growth_guard_e2e -- --nocapture` pass (1/1)
+- `cargo test --release --test v3_flight_ingest_e2e -- --nocapture` pass
+- `cargo test --release --test v3_flight_row_materialization_guard -- --nocapture` pass
+- `VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 cargo test --release --test v3_stress_million_ops_direct -- --ignored --nocapture` pass
   - `elapsed=27.965877083s`
   - `reads=60040 writes=38941 write_batches=1094 verify_samples=200 admin_ok=129 admin_skipped=890`
 
@@ -436,10 +436,10 @@ Validation:
 - `cargo check --workspace --exclude vibrato-vst` pass.
 - `cargo test --workspace --exclude vibrato-vst` pass.
 - `cargo test -p vibrato-server --lib -- --nocapture` pass (13/13).
-- `VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=0 cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture` pass
+- `VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=0 cargo test --release --test v3_stress_million_ops_direct -- --ignored --nocapture` pass
   - `elapsed=19.767178583s`
   - `reads=60116 writes=39884 write_batches=407 admin_skipped=0`
-- `VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 cargo test --release --test v2_stress_million_ops_direct -- --ignored --nocapture` pass
+- `VIBRATO_STRESS_TOTAL_OPS=100000 VIBRATO_STRESS_CONCURRENCY=16 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 cargo test --release --test v3_stress_million_ops_direct -- --ignored --nocapture` pass
   - `elapsed=23.833715084s`
   - `reads=60065 writes=38951 write_batches=1065 admin_ok=27 admin_skipped=957`
 - `cargo bench -p vibrato-core --bench hnsw_p99`:

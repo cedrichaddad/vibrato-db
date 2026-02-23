@@ -17,7 +17,8 @@ fn reserve_local_port() -> Option<u16> {
 
 async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
-    cmd.arg("serve-v2")
+    cmd.arg("serve-v3")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--collection")
@@ -39,7 +40,7 @@ async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
 
 async fn wait_for_ready(base_url: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let ready_url = format!("{}/v2/health/ready", base_url);
+    let ready_url = format!("{}/v3/health/ready", base_url);
     for _ in 0..80 {
         if let Ok(resp) = client.get(&ready_url).send().await {
             if resp.status() == StatusCode::OK {
@@ -59,6 +60,7 @@ async fn stop_server(child: &mut Child) {
 fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_vibrato-db"))
         .arg("key-create")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--name")
@@ -124,7 +126,7 @@ async fn identify_endpoint_auth_validation_and_metrics() {
     wait_for_ready(&base_url).await.expect("ready");
 
     let unauth = client
-        .post(format!("{}/v2/identify", base_url))
+        .post(format!("{}/v3/identify", base_url))
         .json(&serde_json::json!({
             "vectors": [[1.0, 0.0]],
             "k": 1,
@@ -136,7 +138,7 @@ async fn identify_endpoint_auth_validation_and_metrics() {
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
 
     let empty_vectors = client
-        .post(format!("{}/v2/identify", base_url))
+        .post(format!("{}/v3/identify", base_url))
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "vectors": [],
@@ -149,7 +151,7 @@ async fn identify_endpoint_auth_validation_and_metrics() {
     assert_eq!(empty_vectors.status(), StatusCode::BAD_REQUEST);
 
     let bad_dim = client
-        .post(format!("{}/v2/identify", base_url))
+        .post(format!("{}/v3/identify", base_url))
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "vectors": [[1.0, 0.0, 0.0]],
@@ -162,7 +164,7 @@ async fn identify_endpoint_auth_validation_and_metrics() {
     assert_eq!(bad_dim.status(), StatusCode::BAD_REQUEST);
 
     let ingest = client
-        .post(format!("{}/v2/vectors", base_url))
+        .post(format!("{}/v3/vectors", base_url))
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "vector": [1.0, 0.0],
@@ -181,7 +183,7 @@ async fn identify_endpoint_auth_validation_and_metrics() {
     assert_eq!(ingest.status(), StatusCode::CREATED);
 
     let k_zero = client
-        .post(format!("{}/v2/identify", base_url))
+        .post(format!("{}/v3/identify", base_url))
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "vectors": [[1.0, 0.0]],
@@ -201,7 +203,7 @@ async fn identify_endpoint_auth_validation_and_metrics() {
     );
 
     let ok_identify = client
-        .post(format!("{}/v2/identify", base_url))
+        .post(format!("{}/v3/identify", base_url))
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "vectors": [[1.0, 0.0]],
@@ -214,7 +216,7 @@ async fn identify_endpoint_auth_validation_and_metrics() {
     assert_eq!(ok_identify.status(), StatusCode::OK);
 
     let metrics = client
-        .get(format!("{}/v2/metrics", base_url))
+        .get(format!("{}/v3/metrics", base_url))
         .bearer_auth(&token)
         .send()
         .await

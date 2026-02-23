@@ -57,7 +57,8 @@ fn reserve_local_port() -> Option<u16> {
 
 async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
-    cmd.arg("serve-v2")
+    cmd.arg("serve-v3")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--collection")
@@ -81,7 +82,7 @@ async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
 
 async fn wait_for_ready(base_url: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let ready_url = format!("{}/v2/health/ready", base_url);
+    let ready_url = format!("{}/v3/health/ready", base_url);
     for _ in 0..180 {
         if let Ok(resp) = client.get(&ready_url).send().await {
             if resp.status() == StatusCode::OK {
@@ -101,6 +102,7 @@ async fn stop_server(child: &mut Child) {
 fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_vibrato-db"))
         .arg("key-create")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--name")
@@ -198,7 +200,7 @@ async fn ingest_frame(
     let mut last_err: Option<String> = None;
     for attempt in 0..HTTP_RETRY_ATTEMPTS {
         let req = client
-            .post(format!("{}/v2/vectors", base_url))
+            .post(format!("{}/v3/vectors", base_url))
             .bearer_auth(token)
             .json(&body);
         match req.send().await {
@@ -250,7 +252,7 @@ async fn ingest_frame_for_track(
     let mut last_err: Option<String> = None;
     for attempt in 0..HTTP_RETRY_ATTEMPTS {
         let req = client
-            .post(format!("{}/v2/vectors", base_url))
+            .post(format!("{}/v3/vectors", base_url))
             .bearer_auth(token)
             .json(&body);
         match req.send().await {
@@ -295,7 +297,7 @@ async fn identify(
     });
     for attempt in 0..HTTP_RETRY_ATTEMPTS {
         let req = client
-            .post(format!("{}/v2/identify", base_url))
+            .post(format!("{}/v3/identify", base_url))
             .bearer_auth(token)
             .json(&body);
         match req.send().await {

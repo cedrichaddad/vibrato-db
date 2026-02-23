@@ -170,7 +170,7 @@ cargo run --release -- snapshot-restore --data-dir ./vibrato_data --snapshot-dir
 cargo run --release -- replay-to-lsn --data-dir ./vibrato_data --collection default --target-lsn 1000
 ```
 
-See `/Users/cedrichaddad/vibrato-db/docs/PRODUCTION_RUNBOOK_V21.md` for full operations guidance.
+See `/Users/cedrichaddad/vibrato-db/docs/PRODUCTION_RUNBOOK_V3.md` for full operations guidance.
 
 Arrow Flight ingest notes:
 - Flight service is enabled only when `--flight-port` is set.
@@ -265,19 +265,19 @@ crates/
 cargo test --workspace
 
 # Flight ingest integration + guard
-cargo test --test v2_flight_ingest_e2e -- --nocapture
-cargo test --test v2_flight_row_materialization_guard -- --nocapture
+cargo test --test v3_flight_ingest_e2e -- --nocapture
+cargo test --test v3_flight_row_materialization_guard -- --nocapture
 
 # Optional high-load Flight stress harness
 VIBRATO_STRESS_TOTAL_OPS=100000 \
 VIBRATO_STRESS_CONCURRENCY=16 \
 VIBRATO_STRESS_ENABLE_ADMIN_CHAOS=1 \
-cargo test --release --test v2_flight_stress_million_ops -- --ignored --nocapture
+cargo test --release --test v3_flight_stress_million_ops -- --ignored --nocapture
 
 # Optional explicit performance gates (hardware dependent)
 VIBRATO_STRESS_MIN_OPS_PER_SEC=3500 \
 VIBRATO_STRESS_MAX_ELAPSED_SECS=300 \
-cargo test --release --test v2_flight_stress_million_ops -- --ignored --nocapture
+cargo test --release --test v3_flight_stress_million_ops -- --ignored --nocapture
 ```
 
 ### Running Benchmarks

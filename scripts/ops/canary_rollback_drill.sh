@@ -4,12 +4,13 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-./vibrato_data}"
 COLLECTION="${COLLECTION:-default}"
 PORT="${PORT:-18081}"
+: "${VIBRATO_API_PEPPER:?VIBRATO_API_PEPPER must be set}"
 
 echo "[canary] creating pre-canary snapshot"
 cargo run --release -- snapshot-create --data-dir "${DATA_DIR}" --collection "${COLLECTION}"
 
 echo "[canary] starting canary server on :${PORT}"
-cargo run --release -- serve-v2 \
+cargo run --release -- serve-v3 \
   --data-dir "${DATA_DIR}" \
   --collection "${COLLECTION}" \
   --dim 128 \
@@ -23,7 +24,7 @@ trap 'kill ${SERVER_PID} >/dev/null 2>&1 || true' EXIT
 
 echo "[canary] waiting for readiness"
 for _ in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:${PORT}/v2/health/ready" >/dev/null 2>&1; then
+  if curl -fsS "http://127.0.0.1:${PORT}/v3/health/ready" >/dev/null 2>&1; then
     break
   fi
   sleep 1

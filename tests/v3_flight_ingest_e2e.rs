@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::types::Float32Type;
-use arrow_array::{FixedSizeListArray, RecordBatch, StringArray};
+use arrow_array::{BinaryArray, FixedSizeListArray, RecordBatch, StringArray, UInt64Array};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::{FlightClient, PutResult};
@@ -22,7 +22,9 @@ const DIM: usize = 8;
 #[derive(Clone)]
 struct FlightRow {
     vector: Vec<f32>,
-    metadata_json: Option<String>,
+    entity_id: u64,
+    sequence_ts: u64,
+    payload: Vec<u8>,
     idempotency_key: Option<String>,
 }
 
@@ -35,7 +37,8 @@ fn reserve_local_port() -> Option<u16> {
 
 async fn start_server(data_dir: &Path, http_port: u16, flight_port: u16) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
-    cmd.arg("serve-v2")
+    cmd.arg("serve-v3")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--collection")
@@ -61,7 +64,7 @@ async fn start_server(data_dir: &Path, http_port: u16, flight_port: u16) -> std:
 
 async fn wait_for_ready(base_url: &str, token: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let ready_url = format!("{}/v2/health/ready", base_url);
+    let ready_url = format!("{}/v3/health/ready", base_url);
 
     for _ in 0..100 {
         if let Ok(resp) = client.get(&ready_url).bearer_auth(token).send().await {
@@ -117,6 +120,7 @@ async fn stop_server_with_logs(child: &mut Child) {
 fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_vibrato-db"))
         .arg("key-create")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--name")
@@ -148,11 +152,9 @@ fn build_batch(rows: &[FlightRow], dim: usize) -> RecordBatch {
             .map(|row| Some(row.vector.iter().copied().map(Some).collect::<Vec<_>>())),
         dim as i32,
     );
-    let metadata_json = StringArray::from(
-        rows.iter()
-            .map(|row| row.metadata_json.as_deref())
-            .collect::<Vec<_>>(),
-    );
+    let entity_id = UInt64Array::from(rows.iter().map(|row| row.entity_id).collect::<Vec<_>>());
+    let sequence_ts = UInt64Array::from(rows.iter().map(|row| row.sequence_ts).collect::<Vec<_>>());
+    let payload = BinaryArray::from_iter_values(rows.iter().map(|row| row.payload.as_slice()));
     let idempotency_key = StringArray::from(
         rows.iter()
             .map(|row| row.idempotency_key.as_deref())
@@ -168,7 +170,9 @@ fn build_batch(rows: &[FlightRow], dim: usize) -> RecordBatch {
             ),
             false,
         ),
-        Field::new("metadata_json", DataType::Utf8, true),
+        Field::new("entity_id", DataType::UInt64, false),
+        Field::new("sequence_ts", DataType::UInt64, false),
+        Field::new("payload", DataType::Binary, false),
         Field::new("idempotency_key", DataType::Utf8, true),
     ]));
 
@@ -176,7 +180,9 @@ fn build_batch(rows: &[FlightRow], dim: usize) -> RecordBatch {
         schema,
         vec![
             Arc::new(vectors),
-            Arc::new(metadata_json),
+            Arc::new(entity_id),
+            Arc::new(sequence_ts),
+            Arc::new(payload),
             Arc::new(idempotency_key),
         ],
     )
@@ -240,28 +246,30 @@ async fn flight_ingest_roundtrip_and_idempotency_ack() {
     let rows = vec![
         FlightRow {
             vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            metadata_json: Some(
-                r#"{"source_file":"a.wav","start_time_ms":10,"duration_ms":15,"bpm":120.0,"tags":["flight","drums"]}"#
-                    .to_string(),
-            ),
+            entity_id: 101,
+            sequence_ts: 10,
+            payload: b"payload-a".to_vec(),
             idempotency_key: Some("flight-k1".to_string()),
         },
         FlightRow {
             vector: vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            metadata_json: Some(
-                r#"{"source_file":"b.wav","start_time_ms":20,"duration_ms":12,"bpm":121.0,"tags":["flight","bass"]}"#
-                    .to_string(),
-            ),
+            entity_id: 102,
+            sequence_ts: 20,
+            payload: b"payload-b".to_vec(),
             idempotency_key: Some("flight-k2".to_string()),
         },
         FlightRow {
             vector: vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            metadata_json: None,
+            entity_id: 103,
+            sequence_ts: 30,
+            payload: Vec::new(),
             idempotency_key: Some("flight-k3".to_string()),
         },
         FlightRow {
             vector: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-            metadata_json: None,
+            entity_id: 104,
+            sequence_ts: 40,
+            payload: Vec::new(),
             idempotency_key: Some("flight-k4".to_string()),
         },
     ];
@@ -287,7 +295,7 @@ async fn flight_ingest_roundtrip_and_idempotency_ack() {
 
     let client = reqwest::Client::new();
     let stats_resp = client
-        .get(format!("{}/v2/admin/stats", base_url))
+        .get(format!("{}/v3/admin/stats", base_url))
         .bearer_auth(&token)
         .send()
         .await
@@ -308,7 +316,7 @@ async fn flight_ingest_roundtrip_and_idempotency_ack() {
             "search_tier": "active"
         });
         let query_resp = client
-            .post(format!("{}/v2/query", base_url))
+            .post(format!("{}/v3/query", base_url))
             .bearer_auth(&token)
             .json(&query)
             .send()
@@ -366,7 +374,9 @@ async fn flight_ingest_requires_auth_and_rejects_dim_mismatch() {
 
     let rows = vec![FlightRow {
         vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        metadata_json: None,
+        entity_id: 201,
+        sequence_ts: 1,
+        payload: Vec::new(),
         idempotency_key: Some("auth-k1".to_string()),
     }];
 
@@ -381,7 +391,14 @@ async fn flight_ingest_requires_auth_and_rejects_dim_mismatch() {
         other => panic!("expected tonic unauthenticated error, got {other}"),
     }
 
-    let bad_dim_batch = build_batch(&rows, DIM + 1);
+    let bad_dim_rows = vec![FlightRow {
+        vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        entity_id: 202,
+        sequence_ts: 2,
+        payload: Vec::new(),
+        idempotency_key: Some("auth-k2".to_string()),
+    }];
+    let bad_dim_batch = build_batch(&bad_dim_rows, DIM + 1);
     let bad_dim_err = flight_do_put(&flight_endpoint, Some(&token), bad_dim_batch)
         .await
         .expect_err("expected invalid-argument for dim mismatch");

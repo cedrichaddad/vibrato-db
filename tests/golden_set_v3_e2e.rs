@@ -17,7 +17,8 @@ fn reserve_local_port() -> Option<u16> {
 
 async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
-    cmd.arg("serve-v2")
+    cmd.arg("serve-v3")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--collection")
@@ -39,7 +40,7 @@ async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
 
 async fn wait_for_ready(base_url: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let ready_url = format!("{}/v2/health/ready", base_url);
+    let ready_url = format!("{}/v3/health/ready", base_url);
 
     for _ in 0..80 {
         if let Ok(resp) = client.get(&ready_url).send().await {
@@ -61,6 +62,7 @@ async fn stop_server(child: &mut Child) {
 fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_vibrato-db"))
         .arg("key-create")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--name")
@@ -129,7 +131,7 @@ async fn test_golden_set_day_in_life_restart_integrity() {
         });
 
         let resp = client
-            .post(format!("{}/v2/vectors", base_url))
+            .post(format!("{}/v3/vectors", base_url))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -150,7 +152,7 @@ async fn test_golden_set_day_in_life_restart_integrity() {
     });
 
     let query_resp = client
-        .post(format!("{}/v2/query", base_url))
+        .post(format!("{}/v3/query", base_url))
         .bearer_auth(&token)
         .json(&query_body)
         .send()
@@ -159,7 +161,7 @@ async fn test_golden_set_day_in_life_restart_integrity() {
     assert_eq!(query_resp.status(), StatusCode::OK);
 
     let checkpoint_resp = client
-        .post(format!("{}/v2/admin/checkpoint", base_url))
+        .post(format!("{}/v3/admin/checkpoint", base_url))
         .bearer_auth(&token)
         .send()
         .await
@@ -167,7 +169,7 @@ async fn test_golden_set_day_in_life_restart_integrity() {
     assert_eq!(checkpoint_resp.status(), StatusCode::OK);
 
     let snapshot_resp = client
-        .post(format!("{}/v2/admin/snapshot", base_url))
+        .post(format!("{}/v3/admin/snapshot", base_url))
         .bearer_auth(&token)
         .send()
         .await
@@ -184,7 +186,7 @@ async fn test_golden_set_day_in_life_restart_integrity() {
         .expect("server ready after restart");
 
     let stats_resp = client
-        .get(format!("{}/v2/admin/stats", base_url))
+        .get(format!("{}/v3/admin/stats", base_url))
         .bearer_auth(&token)
         .send()
         .await
@@ -198,7 +200,7 @@ async fn test_golden_set_day_in_life_restart_integrity() {
     assert_eq!(total_vectors, 100);
 
     let query_resp_after = client
-        .post(format!("{}/v2/query", base_url))
+        .post(format!("{}/v3/query", base_url))
         .bearer_auth(&token)
         .json(&query_body)
         .send()

@@ -17,7 +17,8 @@ fn reserve_local_port() -> Option<u16> {
 
 async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
-    cmd.arg("serve-v2")
+    cmd.arg("serve-v3")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--collection")
@@ -39,8 +40,8 @@ async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
 
 async fn wait_for_ready(base_url: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let ready_url = format!("{}/v2/health/ready", base_url);
-    for _ in 0..80 {
+    let ready_url = format!("{}/v3/health/ready", base_url);
+    for _ in 0..120 {
         if let Ok(resp) = client.get(&ready_url).send().await {
             if resp.status() == StatusCode::OK {
                 return Ok(());
@@ -59,14 +60,14 @@ async fn stop_server(child: &mut Child) {
 fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_vibrato-db"))
         .arg("key-create")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--name")
-        .arg("compact-levels")
+        .arg("identify-archive")
         .arg("--roles")
         .arg("admin,query,ingest")
         .output()?;
-
     if !output.status.success() {
         anyhow::bail!(
             "key-create failed: {}",
@@ -82,7 +83,12 @@ fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
     anyhow::bail!("token not found in key-create output: {}", stdout)
 }
 
-async fn ingest_range(
+fn frame(id: usize) -> [f32; 2] {
+    let t = id as f32 * 0.37;
+    [t.sin(), t.cos()]
+}
+
+async fn ingest_batch(
     client: &reqwest::Client,
     base_url: &str,
     token: &str,
@@ -92,19 +98,20 @@ async fn ingest_range(
 ) {
     for i in 0..count {
         let id = start + i;
+        let v = frame(id);
         let body = serde_json::json!({
-            "vector": [id as f32 / 100.0, 1.0 - (id as f32 / 100.0)],
+            "vector": v,
             "metadata": {
                 "source_file": format!("{}-{}.wav", prefix, id),
                 "start_time_ms": id * 10,
-                "duration_ms": 200,
+                "duration_ms": 100,
                 "bpm": 120.0,
-                "tags": ["archive", prefix]
+                "tags": ["identify", "archive"]
             },
             "idempotency_key": format!("{}-{}", prefix, id)
         });
         let resp = client
-            .post(format!("{}/v2/vectors", base_url))
+            .post(format!("{}/v3/vectors", base_url))
             .bearer_auth(token)
             .json(&body)
             .send()
@@ -121,18 +128,18 @@ async fn run_admin_job(client: &reqwest::Client, base_url: &str, token: &str, pa
         .send()
         .await
         .expect("admin request");
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::OK, "job path {}", path);
 }
 
 #[tokio::test]
-async fn test_compaction_builds_level2_archive_segment() {
+async fn identify_can_search_archive_tier() {
     let dir = tempdir().expect("tempdir");
-    let data_dir: PathBuf = dir.path().join("compact_levels_data");
+    let data_dir: PathBuf = dir.path().join("identify_archive_data");
     std::fs::create_dir_all(&data_dir).expect("create data dir");
     let token = create_api_key(&data_dir).expect("create key");
 
     let Some(port) = reserve_local_port() else {
-        eprintln!("skipping compaction levels test: localhost bind unavailable");
+        eprintln!("skipping identify archive test: localhost bind unavailable");
         return;
     };
     let base_url = format!("http://127.0.0.1:{}", port);
@@ -142,72 +149,54 @@ async fn test_compaction_builds_level2_archive_segment() {
         Ok(child) => child,
         Err(e) => {
             eprintln!(
-                "skipping compaction levels test: failed to spawn server: {}",
+                "skipping identify archive test: failed to spawn server: {}",
                 e
             );
             return;
         }
     };
+    wait_for_ready(&base_url).await.expect("ready");
 
-    wait_for_ready(&base_url).await.expect("server ready");
-
-    ingest_range(&client, &base_url, &token, "batch-a", 0, 20).await;
+    ingest_batch(&client, &base_url, &token, "a", 0, 64).await;
     run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
-
-    ingest_range(&client, &base_url, &token, "batch-b", 20, 20).await;
+    ingest_batch(&client, &base_url, &token, "b", 64, 64).await;
     run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // -> level 1
+    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // L1 #1
 
-    ingest_range(&client, &base_url, &token, "batch-c", 40, 20).await;
+    ingest_batch(&client, &base_url, &token, "c", 128, 64).await;
     run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
-
-    ingest_range(&client, &base_url, &token, "batch-d", 60, 20).await;
+    ingest_batch(&client, &base_url, &token, "d", 192, 64).await;
     run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // -> level 1
-    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // level1 + level1 -> level 2
+    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // L1 #2
+    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // L2 archive
 
-    let archive_query = serde_json::json!({
-        "vector": [0.03, 0.97],
-        "k": 5,
-        "ef": 50,
-        "search_tier": "archive",
-        "include_metadata": true,
-        "filter": {"tags_any": ["archive"]}
-    });
-    let archive_resp = client
-        .post(format!("{}/v2/query", base_url))
+    let query_seq: Vec<[f32; 2]> = (140..146).map(frame).collect();
+    let identify = client
+        .post(format!("{}/v3/identify", base_url))
         .bearer_auth(&token)
-        .json(&archive_query)
+        .json(&serde_json::json!({
+            "vectors": query_seq,
+            "k": 8,
+            "ef": 200,
+            "search_tier": "archive",
+            "include_metadata": true
+        }))
         .send()
         .await
-        .expect("archive query");
-    assert_eq!(archive_resp.status(), StatusCode::OK);
+        .expect("identify archive");
+    assert_eq!(identify.status(), StatusCode::OK);
+    let payload: serde_json::Value = identify.json().await.expect("identify payload");
+    let results = payload["data"]["results"]
+        .as_array()
+        .expect("identify results array");
+    assert!(
+        !results.is_empty(),
+        "archive identify should return at least one candidate"
+    );
+    assert!(
+        results.iter().any(|row| row["id"].as_u64() == Some(140)),
+        "expected true archive sequence start id (140) in top-k"
+    );
 
     stop_server(&mut server).await;
-
-    let catalog_path = data_dir.join("catalog.sqlite3");
-    let sql_out = std::process::Command::new("sqlite3")
-        .arg("-json")
-        .arg(&catalog_path)
-        .arg("SELECT COUNT(*) AS n FROM segments WHERE state='active' AND level=2;")
-        .output()
-        .expect("run sqlite3");
-    assert!(
-        sql_out.status.success(),
-        "sqlite3 failed: {}",
-        String::from_utf8_lossy(&sql_out.stderr)
-    );
-    let rows: serde_json::Value =
-        serde_json::from_slice(&sql_out.stdout).expect("parse sqlite json");
-    let n = rows
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|row| row.get("n"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    assert!(
-        n >= 1,
-        "expected at least one active level-2 segment, got {}",
-        n
-    );
 }

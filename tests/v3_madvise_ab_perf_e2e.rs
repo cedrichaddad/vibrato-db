@@ -23,7 +23,8 @@ fn reserve_local_port() -> Option<u16> {
 
 async fn start_server(data_dir: &Path, port: u16, madvise_mode: &str) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
-    cmd.arg("serve-v2")
+    cmd.arg("serve-v3")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--collection")
@@ -47,7 +48,7 @@ async fn start_server(data_dir: &Path, port: u16, madvise_mode: &str) -> std::io
 
 async fn wait_for_ready(base_url: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let ready_url = format!("{}/v2/health/ready", base_url);
+    let ready_url = format!("{}/v3/health/ready", base_url);
     for _ in 0..160 {
         if let Ok(resp) = client.get(&ready_url).send().await {
             if resp.status() == StatusCode::OK {
@@ -67,6 +68,7 @@ async fn stop_server(child: &mut Child) {
 fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_vibrato-db"))
         .arg("key-create")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--name")
@@ -125,7 +127,7 @@ async fn ingest_dataset(client: &reqwest::Client, base_url: &str, token: &str) {
             "idempotency_key": format!("madvise-{i}")
         });
         let resp = client
-            .post(format!("{}/v2/vectors", base_url))
+            .post(format!("{}/v3/vectors", base_url))
             .bearer_auth(token)
             .json(&body)
             .send()
@@ -135,7 +137,7 @@ async fn ingest_dataset(client: &reqwest::Client, base_url: &str, token: &str) {
     }
 
     let checkpoint = client
-        .post(format!("{}/v2/admin/checkpoint", base_url))
+        .post(format!("{}/v3/admin/checkpoint", base_url))
         .bearer_auth(token)
         .send()
         .await
@@ -159,7 +161,7 @@ async fn measure_query_p99_us(
             "search_tier": "active"
         });
         let resp = client
-            .post(format!("{}/v2/query", base_url))
+            .post(format!("{}/v3/query", base_url))
             .bearer_auth(token)
             .json(&body)
             .send()

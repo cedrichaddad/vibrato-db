@@ -22,7 +22,8 @@ async fn start_server(
     public_health_metrics: bool,
 ) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
-    cmd.arg("serve-v2")
+    cmd.arg("serve-v3")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--collection")
@@ -50,7 +51,7 @@ async fn start_server(
 
 async fn wait_for_ready(base_url: &str, token: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let ready_url = format!("{}/v2/health/ready", base_url);
+    let ready_url = format!("{}/v3/health/ready", base_url);
 
     for _ in 0..80 {
         if let Ok(resp) = client.get(&ready_url).bearer_auth(token).send().await {
@@ -71,7 +72,7 @@ async fn stop_server(child: &mut Child) {
 
 async fn wait_for_unauthorized_with_child(child: &mut Child, base_url: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let live_url = format!("{}/v2/health/live", base_url);
+    let live_url = format!("{}/v3/health/live", base_url);
 
     for _ in 0..200 {
         if let Ok(Some(status)) = child.try_wait() {
@@ -103,6 +104,7 @@ async fn wait_for_unauthorized_with_child(child: &mut Child, base_url: &str) -> 
 fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_vibrato-db"))
         .arg("key-create")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--name")
@@ -171,7 +173,7 @@ async fn test_ops_health_auth_and_replay_to_lsn() {
             "idempotency_key": format!("ops-{}", i)
         });
         let resp = client
-            .post(format!("{}/v2/vectors", base_url))
+            .post(format!("{}/v3/vectors", base_url))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -207,7 +209,7 @@ async fn test_ops_health_auth_and_replay_to_lsn() {
         .expect("ready after replay");
 
     let stats_resp = client
-        .get(format!("{}/v2/admin/stats", base_url))
+        .get(format!("{}/v3/admin/stats", base_url))
         .bearer_auth(&token)
         .send()
         .await

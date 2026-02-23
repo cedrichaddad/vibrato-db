@@ -7,7 +7,6 @@ use reqwest::StatusCode;
 use tempfile::tempdir;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
-use vibrato_core::format_v2::VdbHeaderV2;
 
 fn reserve_local_port() -> Option<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
@@ -18,7 +17,8 @@ fn reserve_local_port() -> Option<u16> {
 
 async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
-    cmd.arg("serve-v2")
+    cmd.arg("serve-v3")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--collection")
@@ -40,8 +40,8 @@ async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
 
 async fn wait_for_ready(base_url: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let ready_url = format!("{}/v2/health/ready", base_url);
-    for _ in 0..120 {
+    let ready_url = format!("{}/v3/health/ready", base_url);
+    for _ in 0..80 {
         if let Ok(resp) = client.get(&ready_url).send().await {
             if resp.status() == StatusCode::OK {
                 return Ok(());
@@ -60,13 +60,15 @@ async fn stop_server(child: &mut Child) {
 fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_vibrato-db"))
         .arg("key-create")
+        .env("VIBRATO_API_PEPPER", "test-pepper")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--name")
-        .arg("archive-pq")
+        .arg("compact-levels")
         .arg("--roles")
         .arg("admin,query,ingest")
         .output()?;
+
     if !output.status.success() {
         anyhow::bail!(
             "key-create failed: {}",
@@ -82,7 +84,7 @@ fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
     anyhow::bail!("token not found in key-create output: {}", stdout)
 }
 
-async fn ingest_batch(
+async fn ingest_range(
     client: &reqwest::Client,
     base_url: &str,
     token: &str,
@@ -92,20 +94,19 @@ async fn ingest_batch(
 ) {
     for i in 0..count {
         let id = start + i;
-        let v = id as f32 / 300.0;
         let body = serde_json::json!({
-            "vector": [v, 1.0 - v],
+            "vector": [id as f32 / 100.0, 1.0 - (id as f32 / 100.0)],
             "metadata": {
                 "source_file": format!("{}-{}.wav", prefix, id),
-                "start_time_ms": id * 5,
-                "duration_ms": 220,
-                "bpm": 124.0,
-                "tags": ["archive", "pq", prefix]
+                "start_time_ms": id * 10,
+                "duration_ms": 200,
+                "bpm": 120.0,
+                "tags": ["archive", prefix]
             },
             "idempotency_key": format!("{}-{}", prefix, id)
         });
         let resp = client
-            .post(format!("{}/v2/vectors", base_url))
+            .post(format!("{}/v3/vectors", base_url))
             .bearer_auth(token)
             .json(&body)
             .send()
@@ -122,18 +123,18 @@ async fn run_admin_job(client: &reqwest::Client, base_url: &str, token: &str, pa
         .send()
         .await
         .expect("admin request");
-    assert_eq!(resp.status(), StatusCode::OK, "job path {}", path);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
-async fn level2_archive_segments_are_pq_encoded_and_queryable() {
+async fn test_compaction_builds_level2_archive_segment() {
     let dir = tempdir().expect("tempdir");
-    let data_dir: PathBuf = dir.path().join("archive_pq_data");
+    let data_dir: PathBuf = dir.path().join("compact_levels_data");
     std::fs::create_dir_all(&data_dir).expect("create data dir");
     let token = create_api_key(&data_dir).expect("create key");
 
     let Some(port) = reserve_local_port() else {
-        eprintln!("skipping archive pq test: localhost bind unavailable");
+        eprintln!("skipping compaction levels test: localhost bind unavailable");
         return;
     };
     let base_url = format!("http://127.0.0.1:{}", port);
@@ -142,50 +143,47 @@ async fn level2_archive_segments_are_pq_encoded_and_queryable() {
     let mut server = match start_server(&data_dir, port).await {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("skipping archive pq test: failed to spawn server: {}", e);
+            eprintln!(
+                "skipping compaction levels test: failed to spawn server: {}",
+                e
+            );
             return;
         }
     };
-    wait_for_ready(&base_url).await.expect("ready");
 
-    ingest_batch(&client, &base_url, &token, "a", 0, 64).await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
-    ingest_batch(&client, &base_url, &token, "b", 64, 64).await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // L1 #1
+    wait_for_ready(&base_url).await.expect("server ready");
 
-    ingest_batch(&client, &base_url, &token, "c", 128, 64).await;
+    ingest_range(&client, &base_url, &token, "batch-a", 0, 20).await;
     run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
-    ingest_batch(&client, &base_url, &token, "d", 192, 64).await;
+
+    ingest_range(&client, &base_url, &token, "batch-b", 20, 20).await;
     run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // L1 #2
+    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // -> level 1
 
-    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // L2 from two L1s
+    ingest_range(&client, &base_url, &token, "batch-c", 40, 20).await;
+    run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
 
-    let query = serde_json::json!({
-        "vector": [0.22, 0.78],
-        "k": 10,
+    ingest_range(&client, &base_url, &token, "batch-d", 60, 20).await;
+    run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
+    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // -> level 1
+    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // level1 + level1 -> level 2
+
+    let archive_query = serde_json::json!({
+        "vector": [0.03, 0.97],
+        "k": 5,
         "ef": 50,
         "search_tier": "archive",
         "include_metadata": true,
-        "filter": {"tags_any": ["pq"]}
+        "filter": {"tags_any": ["archive"]}
     });
-    let query_resp = client
-        .post(format!("{}/v2/query", base_url))
+    let archive_resp = client
+        .post(format!("{}/v3/query", base_url))
         .bearer_auth(&token)
-        .json(&query)
+        .json(&archive_query)
         .send()
         .await
         .expect("archive query");
-    assert_eq!(query_resp.status(), StatusCode::OK);
-    let payload: serde_json::Value = query_resp.json().await.expect("query payload");
-    let results = payload["data"]["results"]
-        .as_array()
-        .expect("results array");
-    assert!(
-        !results.is_empty(),
-        "archive query should return at least one candidate"
-    );
+    assert_eq!(archive_resp.status(), StatusCode::OK);
 
     stop_server(&mut server).await;
 
@@ -193,31 +191,25 @@ async fn level2_archive_segments_are_pq_encoded_and_queryable() {
     let sql_out = std::process::Command::new("sqlite3")
         .arg("-json")
         .arg(&catalog_path)
-        .arg("SELECT path FROM segments WHERE state='active' AND level=2 ORDER BY row_count DESC LIMIT 1;")
+        .arg("SELECT COUNT(*) AS n FROM segments WHERE state='active' AND level=2;")
         .output()
-        .expect("sqlite3 query");
+        .expect("run sqlite3");
     assert!(
         sql_out.status.success(),
-        "sqlite query failed: {}",
+        "sqlite3 failed: {}",
         String::from_utf8_lossy(&sql_out.stderr)
     );
-    let rows: serde_json::Value = serde_json::from_slice(&sql_out.stdout).expect("parse json rows");
-    let path = rows
+    let rows: serde_json::Value =
+        serde_json::from_slice(&sql_out.stdout).expect("parse sqlite json");
+    let n = rows
         .as_array()
         .and_then(|arr| arr.first())
-        .and_then(|r| r.get("path"))
-        .and_then(|v| v.as_str())
-        .expect("active level-2 segment path");
-
-    let bytes = std::fs::read(path).expect("read level2 segment");
-    let header = VdbHeaderV2::from_bytes(&bytes).expect("parse v2 header");
+        .and_then(|row| row.get("n"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     assert!(
-        header.is_pq_enabled(),
-        "archive level-2 segment must be pq-enabled"
-    );
-    assert!(header.pq_subspaces > 0, "pq_subspaces should be set");
-    assert!(
-        header.codebook_offset > 0,
-        "pq codebook offset should be set"
+        n >= 1,
+        "expected at least one active level-2 segment, got {}",
+        n
     );
 }

@@ -152,14 +152,14 @@ Full nightly gate (100 seeds):
 VIBRATO_CRASH_SEEDS=100 bash scripts/ci/run_crash_matrix.sh
 ```
 
-The harness lives in `/Users/cedrichaddad/vibrato-db/tests/v2_crash_matrix_kill9_e2e.rs` and performs kill-9 during ingest/checkpoint/compaction windows, restart, and acknowledged-write integrity verification.
+The harness lives in `/Users/cedrichaddad/vibrato-db/tests/v3_crash_matrix_kill9_e2e.rs` and performs kill-9 during ingest/checkpoint/compaction windows, restart, and acknowledged-write integrity verification.
 
 ## 10. WAL Growth Guard
 
 Run:
 
 ```bash
-cargo test --test v2_catalog_wal_growth_guard_e2e
+cargo test --test v3_catalog_wal_growth_guard_e2e
 ```
 
 This validates bounded SQLite WAL file growth under timeout-prone read workload plus write pressure.
@@ -186,7 +186,7 @@ Run mixed ingest/query/checkpoint/compaction soak:
 VIBRATO_SOAK_SECS=86400 VIBRATO_SOAK_SEED=42 bash scripts/soak/run_mixed_workload_soak.sh
 ```
 
-Harness file: `/Users/cedrichaddad/vibrato-db/tests/v2_soak_mixed_workload_e2e.rs`.
+Harness file: `/Users/cedrichaddad/vibrato-db/tests/v3_soak_mixed_workload_e2e.rs`.
 
 ## 13. Canary + Rollback Drill (72h)
 

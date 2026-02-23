@@ -210,6 +210,7 @@ pub struct ProductionState {
     filter_allow_cache: Arc<SccHashMap<String, (u64, Arc<BitmapSet>)>>,
     filter_cache_epoch: AtomicU64,
     pub retired_segments: std::sync::Mutex<HashMap<String, Weak<SegmentHandle>>>,
+    hot_swap_barrier: RwLock<()>,
 
     pub metrics: Metrics,
     ingest_writer_tx: SyncSender<IngestWriteJob>,
@@ -379,6 +380,7 @@ impl ProductionState {
             filter_allow_cache,
             filter_cache_epoch: AtomicU64::new(1),
             retired_segments: std::sync::Mutex::new(HashMap::new()),
+            hot_swap_barrier: RwLock::new(()),
             metrics: Metrics::default(),
             ingest_writer_tx,
             ingest_writer_handle: std::sync::Mutex::new(None),
@@ -417,6 +419,12 @@ impl ProductionState {
                 if state.config.audio_colocated {
                     set_background_worker_priority();
                 }
+                let fault_panic_after =
+                    std::env::var("VIBRATO_TEST_FAULT_INGEST_WRITER_PANIC_AFTER_JOBS")
+                        .ok()
+                        .and_then(|raw| raw.parse::<usize>().ok())
+                        .filter(|value| *value > 0);
+                let mut processed_jobs = 0usize;
                 while let Ok(job) = ingest_writer_rx.recv() {
                     let entries = job.entries;
                     let result = state
@@ -428,6 +436,16 @@ impl ProductionState {
                         });
                     atomic_saturating_sub(&state.ingest_queue_bytes, job.estimated_bytes);
                     let _ = job.result_tx.send(result);
+                    processed_jobs = processed_jobs.saturating_add(1);
+                    if fault_panic_after
+                        .map(|threshold| processed_jobs >= threshold)
+                        .unwrap_or(false)
+                    {
+                        panic!(
+                            "fault injection: ingest writer panic after {} jobs",
+                            processed_jobs
+                        );
+                    }
                 }
             })
             .context("spawning ingest writer thread")?;
@@ -707,12 +725,19 @@ impl ProductionState {
         let vector_bytes = (vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
         let metadata_bytes = Self::estimate_cached_metadata_bytes(&metadata);
         let shard = vector_id & self.shard_mask;
-        if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
-            shard_vectors.load().upsert(vector_id, Arc::new(vector));
-        }
-        if let Some(index) = self.hot_indices.get(shard) {
-            index.write().insert(vector_id);
-        }
+        let _swap_guard = self.hot_swap_barrier.read();
+        let shard_vectors = self
+            .hot_vector_shards
+            .get(shard)
+            .unwrap_or_else(|| panic!("data integrity fault: missing hot vector shard {}", shard));
+        let index = self
+            .hot_indices
+            .get(shard)
+            .unwrap_or_else(|| panic!("data integrity fault: missing hot index shard {}", shard));
+        let vec_store = shard_vectors.load_full();
+        let mut idx_guard = index.write();
+        vec_store.upsert(vector_id, Arc::new(vector));
+        idx_guard.insert(vector_id);
         self.metadata_cache.upsert(vector_id, metadata.clone());
         for tag_id in &metadata.tags {
             match self.filter_index.entry(*tag_id) {
@@ -850,20 +875,23 @@ impl ProductionState {
         // 3. Insert into hot index shards in parallel — one lock acquisition per shard.
         // Consumes shard buckets to move vector buffers directly into Arc.
         by_shard.into_par_iter().for_each(|(shard, items)| {
+            // Hot shard publication is synchronized with checkpoint rebuild swaps:
+            // read barrier prevents map/index pairing inversion during swap.
+            let _swap_guard = self.hot_swap_barrier.read();
+            let shard_vectors = self.hot_vector_shards.get(shard).unwrap_or_else(|| {
+                panic!("data integrity fault: missing hot vector shard {}", shard)
+            });
+            let index = self.hot_indices.get(shard).unwrap_or_else(|| {
+                panic!("data integrity fault: missing hot index shard {}", shard)
+            });
+
             // Preserve visibility invariant for concurrent readers:
             // vector store is populated before IDs become discoverable in HNSW.
-            let vector_ids = items.iter().map(|item| item.vector_id).collect::<Vec<_>>();
-            if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
-                let vec_store = shard_vectors.load_full();
-                for item in items {
-                    vec_store.upsert(item.vector_id, Arc::new(item.vector));
-                }
-            }
-            if let Some(index) = self.hot_indices.get(shard) {
-                let mut idx_guard = index.write();
-                for vector_id in vector_ids {
-                    idx_guard.insert(vector_id);
-                }
+            let vec_store = shard_vectors.load_full();
+            let mut idx_guard = index.write();
+            for item in items {
+                vec_store.upsert(item.vector_id, Arc::new(item.vector));
+                idx_guard.insert(item.vector_id);
             }
         });
 
@@ -2246,16 +2274,19 @@ impl ProductionState {
             new_indices.push(hnsw);
         }
 
-        // 4. Atomic Swap
-        // We swap the vector shards FIRST, then the indices.
-        // HNSW indices hold a reference to the vector shards they were built with.
-        // By swapping the shards into the global ArcSwap, we ensure new ingests
-        // go to the same place the new indices are reading from.
-        for (i, shard) in new_shards.into_iter().enumerate() {
-            self.hot_vector_shards[i].store(shard);
-        }
-        for (i, hnsw) in new_indices.into_iter().enumerate() {
-            *self.hot_indices[i].write() = hnsw;
+        // 4. Atomic swap under write barrier.
+        // Prevents ingest threads from seeing mixed generations where vectors are written
+        // to old shards while IDs are inserted into new indices (or vice versa).
+        {
+            let _swap_guard = self.hot_swap_barrier.write();
+            // We swap vector shards first, then indices.
+            // New ingests are blocked by the barrier while this transition happens.
+            for (i, shard) in new_shards.into_iter().enumerate() {
+                self.hot_vector_shards[i].store(shard);
+            }
+            for (i, hnsw) in new_indices.into_iter().enumerate() {
+                *self.hot_indices[i].write() = hnsw;
+            }
         }
 
         // 5. Catch-up phase: replay WAL snapshot again after the swap to close
@@ -3103,7 +3134,10 @@ fn effective_hot_shard_ef(k: usize, requested_ef: usize, shard_count: usize) -> 
     if shard_count <= 1 {
         return requested;
     }
-    requested
+    // Distributed ANN heuristic: keep per-shard ef proportional to 1/sqrt(shards)
+    // to avoid evaluating requested_ef candidates on every shard.
+    let scaled = (requested as f32 / (shard_count as f32).sqrt()).ceil() as usize;
+    scaled.max(k).max(1)
 }
 
 fn salient_anchor_offsets(query_sequence: &[Vec<f32>]) -> Vec<usize> {
@@ -3864,5 +3898,18 @@ mod tests {
             "fallback must not leak non-filtered IDs"
         );
         assert_eq!(results[0].0, target_id);
+    }
+
+    #[test]
+    fn hot_shard_ef_scales_with_sqrt_of_shard_count() {
+        let ef = effective_hot_shard_ef(10, 64, 4);
+        // ceil(64 / sqrt(4)) = 32
+        assert_eq!(ef, 32);
+    }
+
+    #[test]
+    fn hot_shard_ef_never_drops_below_k() {
+        let ef = effective_hot_shard_ef(50, 64, 8);
+        assert_eq!(ef, 50);
     }
 }

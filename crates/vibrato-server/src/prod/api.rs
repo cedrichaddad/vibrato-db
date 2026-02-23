@@ -31,7 +31,7 @@ pub fn create_v3_router(state: Arc<ProductionState>) -> Router {
         .route("/v3/admin/snapshot", post(v2_admin_snapshot))
         .route("/v3/admin/stats", get(v2_admin_stats))
         .route("/v3/metrics", get(v2_metrics))
-        .route("/v2/{*path}", any(v2_deprecated))
+        .route("/v2/*path", any(v2_deprecated))
         .with_state(state)
 }
 
