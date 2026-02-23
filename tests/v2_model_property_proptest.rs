@@ -6,7 +6,9 @@ use std::time::Duration;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use vibrato_core::simd::dot_product;
-use vibrato_db::prod::model::{encode_payload_base64, MetadataEnvelopeV3, QueryFilter, QueryRequestV2, SearchTier};
+use vibrato_db::prod::model::{
+    encode_payload_base64, MetadataEnvelopeV3, QueryFilter, QueryRequestV2, SearchTier,
+};
 use vibrato_db::prod::{
     bootstrap_data_dirs, IngestMetadataV3Input, ProductionConfig, ProductionState, SqliteCatalog,
 };

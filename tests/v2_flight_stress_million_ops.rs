@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::types::Float32Type;
-use arrow_array::{
-    BinaryArray, FixedSizeListArray, RecordBatch, StringArray, UInt64Array,
-};
+use arrow_array::{BinaryArray, FixedSizeListArray, RecordBatch, StringArray, UInt64Array};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::FlightClient;
 use arrow_schema::{DataType, Field, Schema};
@@ -317,18 +315,9 @@ fn build_flight_batch(buffer: &[FlightWriteRequest]) -> RecordBatch {
             .map(|row| Some(row.vector.iter().copied().map(Some).collect::<Vec<_>>())),
         DIM as i32,
     );
-    let entity_id = UInt64Array::from(
-        buffer
-            .iter()
-            .map(|row| row.entity_id)
-            .collect::<Vec<_>>(),
-    );
-    let sequence_ts = UInt64Array::from(
-        buffer
-            .iter()
-            .map(|row| row.sequence_ts)
-            .collect::<Vec<_>>(),
-    );
+    let entity_id = UInt64Array::from(buffer.iter().map(|row| row.entity_id).collect::<Vec<_>>());
+    let sequence_ts =
+        UInt64Array::from(buffer.iter().map(|row| row.sequence_ts).collect::<Vec<_>>());
     let payload = BinaryArray::from_iter_values(
         buffer
             .iter()

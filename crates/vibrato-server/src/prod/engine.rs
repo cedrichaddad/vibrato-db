@@ -16,6 +16,7 @@ use rayon::ThreadPool;
 use scc::hash_map::Entry as SccEntry;
 use scc::HashMap as SccHashMap;
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 use vibrato_core::format_v2::{VdbHeaderV2, VdbWriterV2};
 use vibrato_core::hnsw::HNSW;
 use vibrato_core::metadata::{MetadataBuilder, VectorMetadata, VectorMetadataV3};
@@ -206,7 +207,7 @@ pub struct ProductionState {
     pub segments: ArcSwap<Vec<Arc<SegmentHandle>>>,
     pub archive_segments: ArcSwap<Vec<Arc<ArchivePqSegment>>>,
     pub filter_index: Arc<SccHashMap<u32, BitmapSet>>,
-    filter_allow_cache: RwLock<HashMap<String, (u64, Arc<BitmapSet>)>>,
+    filter_allow_cache: Arc<SccHashMap<String, (u64, Arc<BitmapSet>)>>,
     filter_cache_epoch: AtomicU64,
     pub retired_segments: std::sync::Mutex<HashMap<String, Weak<SegmentHandle>>>,
 
@@ -222,6 +223,7 @@ pub struct ProductionState {
     pub admin_ops_lock: std::sync::Mutex<()>,
     pub checkpoint_lock: std::sync::Mutex<()>,
     pub compaction_lock: std::sync::Mutex<()>,
+    background_cancel: CancellationToken,
     pub background_pool: std::sync::Mutex<Option<Arc<ThreadPool>>>,
     background_io_throttle: Option<Arc<BackgroundIoThrottle>>,
     pub flight_decode_pool: Arc<ThreadPool>,
@@ -316,6 +318,8 @@ impl ProductionState {
             .collect::<Vec<_>>();
         let metadata_cache = Arc::new(SccHashMap::new());
         let filter_index = Arc::new(SccHashMap::new());
+        let filter_allow_cache = Arc::new(SccHashMap::new());
+        let background_cancel = CancellationToken::new();
         let (audit_tx, audit_rx) = sync_channel(4096);
         let (ingest_writer_tx, ingest_writer_rx) =
             sync_channel(config.ingest_queue_capacity.max(1));
@@ -372,7 +376,7 @@ impl ProductionState {
             segments: ArcSwap::from_pointee(Vec::new()),
             archive_segments: ArcSwap::from_pointee(Vec::new()),
             filter_index,
-            filter_allow_cache: RwLock::new(HashMap::new()),
+            filter_allow_cache,
             filter_cache_epoch: AtomicU64::new(1),
             retired_segments: std::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
@@ -387,6 +391,7 @@ impl ProductionState {
             admin_ops_lock: std::sync::Mutex::new(()),
             checkpoint_lock: std::sync::Mutex::new(()),
             compaction_lock: std::sync::Mutex::new(()),
+            background_cancel,
             background_pool: std::sync::Mutex::new(None),
             background_io_throttle,
             flight_decode_pool,
@@ -455,8 +460,10 @@ impl ProductionState {
                     tracing::error!("ingest writer thread panicked");
                 }
             }
-            self.ingest_writer_failed.store(true, AtomicOrdering::SeqCst);
+            self.ingest_writer_failed
+                .store(true, AtomicOrdering::SeqCst);
             self.live.store(false, AtomicOrdering::SeqCst);
+            self.background_cancel.cancel();
         }
     }
 
@@ -607,6 +614,11 @@ impl ProductionState {
     pub fn set_ready(&self, ready: bool, report: impl Into<String>) {
         self.ready.store(ready, AtomicOrdering::SeqCst);
         *self.recovery_report.write() = report.into();
+    }
+
+    pub fn live_status(&self) -> bool {
+        self.refresh_ingest_writer_health();
+        self.live.load(AtomicOrdering::SeqCst)
     }
 
     fn observe_query_latency_us(&self, us: u64) {
@@ -925,9 +937,8 @@ impl ProductionState {
             .map(|bm| bm.cardinality() <= 5_000)
             .unwrap_or(false);
         let hot_shard_ef = effective_hot_shard_ef(request.k, request.ef, self.hot_indices.len());
-        let inline_hot_scan = allow_bitmap.is_none()
-            && request.ef <= 64
-            && self.hot_indices.len() <= 16;
+        let inline_hot_scan =
+            allow_bitmap.is_none() && request.ef <= 64 && self.hot_indices.len() <= 16;
 
         if !matches!(request.search_tier, SearchTier::Archive) {
             let hot_results = if selective_allow || inline_hot_scan {
@@ -1363,7 +1374,7 @@ impl ProductionState {
 
         Ok(StatsResponseV2 {
             ready: self.ready.load(AtomicOrdering::SeqCst),
-            live: self.live.load(AtomicOrdering::SeqCst),
+            live: self.live_status(),
             active_segments,
             obsolete_segments,
             failed_segments,
@@ -1732,14 +1743,13 @@ impl ProductionState {
             for pair in ids_raw.windows(2) {
                 if pair[1] > pair[0].saturating_add(1) {
                     tracing::warn!(
-                        "checkpoint gap detected between vector_id {} and {}; filling tombstones",
+                        "checkpoint sparse id gap detected between vector_id {} and {}; operation will fail to protect integrity",
                         pair[0],
                         pair[1]
                     );
                 }
             }
-            let (ids, vectors, metadata) =
-                densify_id_space(self.collection.dim, ids_raw, vectors_raw, metadata_raw)?;
+            let (ids, vectors, metadata) = densify_id_space(ids_raw, vectors_raw, metadata_raw)?;
             let hnsw = build_index_from_pairs(
                 self.config.hnsw_m,
                 self.config.hnsw_ef_construction,
@@ -1959,7 +1969,7 @@ impl ProductionState {
                     );
                 } else if next.vector_id_start != prev.vector_id_end.saturating_add(1) {
                     tracing::warn!(
-                        "compaction gap detected between {} [{}..={}] and {} [{}..={}]; filling tombstones",
+                        "compaction sparse id gap detected between {} [{}..={}] and {} [{}..={}]; operation will fail to protect integrity",
                         prev.id,
                         prev.vector_id_start,
                         prev.vector_id_end,
@@ -2008,8 +2018,7 @@ impl ProductionState {
                 .iter()
                 .map(|id| metadata_map.get(id).cloned().unwrap_or_default())
                 .collect::<Vec<_>>();
-            let (ids, vectors, metadata) =
-                densify_id_space(self.collection.dim, ids_raw, vectors_raw, metadata_raw)?;
+            let (ids, vectors, metadata) = densify_id_space(ids_raw, vectors_raw, metadata_raw)?;
             let use_archive_pq =
                 output_level >= 2 && should_use_archive_pq(self.collection.dim, vectors.len());
             let write_budget = if use_archive_pq {
@@ -2500,18 +2509,26 @@ impl ProductionState {
     fn cached_allow_set(&self, filter: &super::model::QueryFilter) -> Option<Arc<BitmapSet>> {
         let epoch = self.filter_cache_epoch.load(AtomicOrdering::Relaxed);
         let key = Self::filter_cache_key(filter);
-        if let Some((entry_epoch, bitmap)) = self.filter_allow_cache.read().get(&key) {
-            if *entry_epoch == epoch {
-                return Some(Arc::clone(bitmap));
-            }
+        if let Some(hit) = self
+            .filter_allow_cache
+            .read(&key, |_, (entry_epoch, bitmap)| {
+                if *entry_epoch == epoch {
+                    Some(Arc::clone(bitmap))
+                } else {
+                    None
+                }
+            })
+            .flatten()
+        {
+            return Some(hit);
         }
 
         let bitmap = Arc::new(self.build_allow_set(filter)?);
-        let mut cache = self.filter_allow_cache.write();
-        if cache.len() >= 512 {
-            cache.clear();
+        if self.filter_allow_cache.len() >= 512 {
+            self.filter_allow_cache.clear();
         }
-        cache.insert(key, (epoch, Arc::clone(&bitmap)));
+        self.filter_allow_cache
+            .upsert(key, (epoch, Arc::clone(&bitmap)));
         Some(bitmap)
     }
 
@@ -2583,6 +2600,8 @@ impl ProductionState {
         }
 
         let colocated = self.config.audio_colocated;
+        let checkpoint_cancel = self.background_cancel.child_token();
+        let compaction_cancel = self.background_cancel.child_token();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
             .thread_name(|idx| {
@@ -2608,10 +2627,10 @@ impl ProductionState {
         };
 
         let checkpoint_state = Arc::clone(self);
-        pool.spawn(move || checkpoint_loop(checkpoint_state));
+        pool.spawn(move || checkpoint_loop(checkpoint_state, checkpoint_cancel));
 
         let compaction_state = Arc::clone(self);
-        pool.spawn(move || compaction_loop(compaction_state));
+        pool.spawn(move || compaction_loop(compaction_state, compaction_cancel));
 
         *guard = Some(pool);
     }
@@ -2631,14 +2650,19 @@ impl ProductionState {
 
         let start = seg.vector_id_start;
         let count = store.count;
-        let dim = store.dim;
         let store_for_accessor = store.clone();
-        let zero_fallback = vec![0.0f32; dim];
+        let segment_id = seg.id.clone();
         let accessor = move |id: usize, sink: &mut dyn FnMut(&[f32])| {
             if id >= start && id < start + count {
                 sink(store_for_accessor.get(id - start));
             } else {
-                sink(&zero_fallback);
+                panic!(
+                    "data integrity fault: segment '{}' missing vector id={} range=[{}..{})",
+                    segment_id,
+                    id,
+                    start,
+                    start + count
+                );
             }
         };
 
@@ -2976,7 +3000,6 @@ fn build_index_from_pairs(
 }
 
 fn densify_id_space(
-    dim: usize,
     ids: Vec<usize>,
     vectors: Vec<Vec<f32>>,
     metadata: Vec<VectorMetadataV3>,
@@ -3011,8 +3034,7 @@ fn densify_id_space(
     }
 
     let start_id = rows.first().map(|r| r.0).unwrap_or(0);
-    let end_id = rows.last().map(|r| r.0).unwrap_or(start_id);
-    let dense_len = end_id.saturating_sub(start_id) + 1;
+    let dense_len = rows.len();
     let mut out_ids = Vec::with_capacity(dense_len);
     let mut out_vectors = Vec::with_capacity(dense_len);
     let mut out_metadata = Vec::with_capacity(dense_len);
@@ -3020,10 +3042,11 @@ fn densify_id_space(
     let mut cursor = start_id;
     for (id, vector, meta) in rows {
         while cursor < id {
-            out_ids.push(cursor);
-            out_vectors.push(vec![0.0f32; dim]);
-            out_metadata.push(VectorMetadataV3::default());
-            cursor = cursor.saturating_add(1);
+            return Err(anyhow!(
+                "data integrity fault: sparse vector id gap while building segment: missing_id={} next_present_id={}",
+                cursor,
+                id
+            ));
         }
         out_ids.push(id);
         out_vectors.push(vector);
@@ -3080,8 +3103,7 @@ fn effective_hot_shard_ef(k: usize, requested_ef: usize, shard_count: usize) -> 
     if shard_count <= 1 {
         return requested;
     }
-    // Multi-shard fan-out inflates total work: budget a slightly lower per-shard ef.
-    requested.div_ceil(2).max(k).max(8)
+    requested
 }
 
 fn salient_anchor_offsets(query_sequence: &[Vec<f32>]) -> Vec<usize> {
@@ -3497,18 +3519,30 @@ enum FlatScanHint {
     HotShard { shard: usize, shard_mask: usize },
 }
 
-fn checkpoint_loop(state: Arc<ProductionState>) {
+fn checkpoint_loop(state: Arc<ProductionState>, cancel: CancellationToken) {
     loop {
+        if cancel.is_cancelled() {
+            break;
+        }
         std::thread::sleep(state.config.checkpoint_interval);
+        if cancel.is_cancelled() {
+            break;
+        }
         if let Err(err) = state.checkpoint_once() {
             tracing::warn!("background checkpoint failed: {err}");
         }
     }
 }
 
-fn compaction_loop(state: Arc<ProductionState>) {
+fn compaction_loop(state: Arc<ProductionState>, cancel: CancellationToken) {
     loop {
+        if cancel.is_cancelled() {
+            break;
+        }
         std::thread::sleep(state.config.compaction_interval);
+        if cancel.is_cancelled() {
+            break;
+        }
         if let Err(err) = state.compact_once() {
             tracing::warn!("background compaction failed: {err}");
         }
@@ -3573,7 +3607,7 @@ fn make_hot_accessor(
     hot_vector_shard: Arc<SccHashMap<usize, Arc<Vec<f32>>>>,
     dim: usize,
 ) -> impl Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static {
-    let zero_fallback = Arc::new(vec![0.0f32; dim]);
+    let expected_dim = dim;
     move |id, sink| {
         let found = hot_vector_shard
             .read(&id, |_, v| {
@@ -3581,7 +3615,10 @@ fn make_hot_accessor(
             })
             .is_some();
         if !found {
-            sink(zero_fallback.as_slice());
+            panic!(
+                "data integrity fault: hot vector cache missing id={} (expected_dim={})",
+                id, expected_dim
+            );
         }
     }
 }

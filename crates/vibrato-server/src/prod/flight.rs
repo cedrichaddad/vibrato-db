@@ -1,6 +1,6 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::collections::HashMap;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -209,7 +209,10 @@ fn parse_flight_batch_columns<'a>(
     })
 }
 
-fn extract_dict_tags<K: ArrowDictionaryKeyType, F: FnMut(&str) -> std::result::Result<(), Status>>(
+fn extract_dict_tags<
+    K: ArrowDictionaryKeyType,
+    F: FnMut(&str) -> std::result::Result<(), Status>,
+>(
     dict: &DictionaryArray<K>,
     start: usize,
     end: usize,
@@ -364,7 +367,10 @@ fn decode_row_tags(
     let mut unique = Vec::<Arc<str>>::new();
     visit_row_tags(list, row, &mut |raw| {
         if let Some(tag) = normalize_tag_cached(tag_cache, raw, max_tag_len)? {
-            if !unique.iter().any(|existing| existing.as_ref() == tag.as_ref()) {
+            if !unique
+                .iter()
+                .any(|existing| existing.as_ref() == tag.as_ref())
+            {
                 unique.push(tag);
                 if unique.len() > max_tags {
                     return Err(Status::invalid_argument(format!(

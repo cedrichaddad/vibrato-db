@@ -4952,6 +4952,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tonic",
  "tracing",
  "vibrato-core",

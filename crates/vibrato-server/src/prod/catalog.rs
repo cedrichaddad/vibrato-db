@@ -158,6 +158,7 @@ pub struct FilterRow {
 struct TagRegistryCache {
     forward: HashMap<String, u32>,
     reverse: HashMap<String, String>,
+    collection_counts: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -215,6 +216,7 @@ unsafe extern "C" {
     fn sqlite3_clear_bindings(stmt: *mut Sqlite3Stmt) -> c_int;
     fn sqlite3_bind_null(stmt: *mut Sqlite3Stmt, idx: c_int) -> c_int;
     fn sqlite3_bind_int64(stmt: *mut Sqlite3Stmt, idx: c_int, value: i64) -> c_int;
+    fn sqlite3_bind_double(stmt: *mut Sqlite3Stmt, idx: c_int, value: f64) -> c_int;
     fn sqlite3_bind_text(
         stmt: *mut Sqlite3Stmt,
         idx: c_int,
@@ -342,6 +344,17 @@ impl PreparedStmt {
         let rc = unsafe { sqlite3_bind_int64(self.stmt, idx, value) };
         if rc != SQLITE_OK {
             return Err(anyhow!("sqlite bind_int64 failed: {}", unsafe {
+                c_ptr_to_string(sqlite3_errmsg(self.db))
+            }));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn bind_f64(&mut self, idx: c_int, value: f64) -> Result<()> {
+        let rc = unsafe { sqlite3_bind_double(self.stmt, idx, value) };
+        if rc != SQLITE_OK {
+            return Err(anyhow!("sqlite bind_double failed: {}", unsafe {
                 c_ptr_to_string(sqlite3_errmsg(self.db))
             }));
         }
@@ -1081,6 +1094,26 @@ impl SqliteCatalog {
         format!("{}\u{1f}{}", collection_id, tag_id)
     }
 
+    fn cache_insert_tag(
+        cache: &mut TagRegistryCache,
+        collection_id: &str,
+        tag_id: u32,
+        tag_text: &str,
+    ) -> bool {
+        let key = Self::tag_cache_key(collection_id, tag_text);
+        let is_new = !cache.forward.contains_key(&key);
+        cache.forward.insert(key, tag_id);
+        let id_key = Self::tag_id_cache_key(collection_id, tag_id);
+        cache.reverse.insert(id_key, tag_text.to_string());
+        if is_new {
+            *cache
+                .collection_counts
+                .entry(collection_id.to_string())
+                .or_insert(0) += 1;
+        }
+        is_new
+    }
+
     fn load_tag_registry_cache(&self) -> Result<()> {
         let rows = self.query_rows::<TagRegistryRow>(
             "SELECT collection_id, tag_id, tag_text FROM tag_registry ORDER BY collection_id ASC, tag_id ASC;",
@@ -1089,14 +1122,12 @@ impl SqliteCatalog {
         let mut cache = TagRegistryCache {
             forward: HashMap::with_capacity(rows.len()),
             reverse: HashMap::with_capacity(rows.len()),
+            collection_counts: HashMap::new(),
         };
         let mut max_tag_id = 0u32;
         for row in rows {
             max_tag_id = max_tag_id.max(row.tag_id);
-            let key = Self::tag_cache_key(&row.collection_id, &row.tag_text);
-            cache.forward.insert(key, row.tag_id);
-            let id_key = Self::tag_id_cache_key(&row.collection_id, row.tag_id);
-            cache.reverse.insert(id_key, row.tag_text);
+            Self::cache_insert_tag(&mut cache, &row.collection_id, row.tag_id, &row.tag_text);
         }
         *self
             .tag_registry_cache
@@ -1161,23 +1192,26 @@ impl SqliteCatalog {
             }
         }
 
-        if cache.forward.len().saturating_add(still_missing.len())
+        let current_collection_count = cache
+            .collection_counts
+            .get(collection_id)
+            .copied()
+            .unwrap_or(0);
+        if current_collection_count.saturating_add(still_missing.len())
             > self.options.max_tag_registry_size
         {
             return Err(anyhow!(
-                "tag_registry_overflow: limit={} current={} incoming_new={}",
+                "tag_registry_overflow: limit={} collection_id={} current={} incoming_new={}",
                 self.options.max_tag_registry_size,
-                cache.forward.len(),
+                collection_id,
+                current_collection_count,
                 still_missing.len()
             ));
         }
 
         for tag in still_missing {
             let allocated = self.next_tag_id.fetch_add(1, AtomicOrdering::Relaxed);
-            let key = Self::tag_cache_key(collection_id, &tag);
-            let id_key = Self::tag_id_cache_key(collection_id, allocated);
-            cache.forward.insert(key, allocated);
-            cache.reverse.insert(id_key, tag.clone());
+            Self::cache_insert_tag(&mut cache, collection_id, allocated, &tag);
             resolved.insert(tag.clone(), allocated);
             new_rows.push((allocated, tag));
         }
@@ -1197,13 +1231,7 @@ impl SqliteCatalog {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (tag_id, tag_text) in new_rows {
             max_seen = max_seen.max(*tag_id);
-            let key = Self::tag_cache_key(collection_id, tag_text);
-            if cache.forward.contains_key(&key) {
-                continue;
-            }
-            let id_key = Self::tag_id_cache_key(collection_id, *tag_id);
-            cache.forward.insert(key, *tag_id);
-            cache.reverse.insert(id_key, tag_text.clone());
+            Self::cache_insert_tag(&mut cache, collection_id, *tag_id, tag_text);
         }
         drop(cache);
 
@@ -1280,10 +1308,7 @@ impl SqliteCatalog {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for row in rows {
-                let key = Self::tag_cache_key(collection_id, &row.tag);
-                let id_key = Self::tag_id_cache_key(collection_id, row.id);
-                cache.forward.insert(key, row.id);
-                cache.reverse.insert(id_key, row.tag);
+                Self::cache_insert_tag(&mut cache, collection_id, row.id, &row.tag);
                 ids.push(row.id);
             }
         }
@@ -1337,10 +1362,7 @@ impl SqliteCatalog {
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 for row in rows {
-                    let key = Self::tag_cache_key(collection_id, &row.tag);
-                    let id_key = Self::tag_id_cache_key(collection_id, row.id);
-                    cache.forward.insert(key, row.id);
-                    cache.reverse.insert(id_key, row.tag.clone());
+                    Self::cache_insert_tag(&mut cache, collection_id, row.id, &row.tag);
                     out.insert(row.id, row.tag);
                 }
             }
@@ -2524,40 +2546,50 @@ impl SqliteCatalog {
             return Ok(());
         }
         let now = now_unix_ts();
-        let mut sql = String::with_capacity(events.len() * 200 + 50);
-        sql.push_str("BEGIN IMMEDIATE;");
-        sql.push_str("INSERT INTO audit_events(ts, request_id, api_key_id, endpoint, action, status_code, latency_ms, client_ip, details_json) VALUES ");
+        let guard = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.exec("BEGIN IMMEDIATE;")?;
 
-        for (i, event) in events.iter().enumerate() {
-            if i > 0 {
-                sql.push(',');
+        let tx_result = (|| -> Result<()> {
+            let mut insert_stmt = PreparedStmt::new(
+                &guard,
+                "INSERT INTO audit_events(
+                   ts,
+                   request_id,
+                   api_key_id,
+                   endpoint,
+                   action,
+                   status_code,
+                   latency_ms,
+                   client_ip,
+                   details_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8);",
+            )?;
+
+            for event in events {
+                insert_stmt.reset()?;
+                insert_stmt.bind_i64(1, now)?;
+                insert_stmt.bind_text(2, &event.request_id)?;
+                insert_stmt.bind_optional_text(3, event.api_key_id.as_deref())?;
+                insert_stmt.bind_text(4, &event.endpoint)?;
+                insert_stmt.bind_text(5, &event.action)?;
+                insert_stmt.bind_i64(6, event.status_code as i64)?;
+                insert_stmt.bind_f64(7, event.latency_ms)?;
+                insert_stmt.bind_text(8, &event.details.to_string())?;
+                insert_stmt.step_done()?;
             }
-            sql.push('(');
-            sql.push_str(&now.to_string());
-            sql.push_str(", '");
-            sql.push_str(&sql_quote(&event.request_id));
-            sql.push_str("', ");
-            if let Some(ak) = &event.api_key_id {
-                sql.push('\'');
-                sql.push_str(&sql_quote(ak));
-                sql.push('\'');
-            } else {
-                sql.push_str("NULL");
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => guard.exec("COMMIT;"),
+            Err(err) => {
+                let _ = guard.exec("ROLLBACK;");
+                Err(err)
             }
-            sql.push_str(", '");
-            sql.push_str(&sql_quote(&event.endpoint));
-            sql.push_str("', '");
-            sql.push_str(&sql_quote(&event.action));
-            sql.push_str("', ");
-            sql.push_str(&event.status_code.to_string());
-            sql.push_str(", ");
-            sql.push_str(&event.latency_ms.to_string());
-            sql.push_str(", NULL, '");
-            sql.push_str(&sql_quote(&event.details.to_string()));
-            sql.push_str("')");
         }
-        sql.push_str("; COMMIT;");
-        self.exec(&sql)
     }
 }
 
@@ -3480,6 +3512,8 @@ fn legacy_hash(pepper: &str, secret: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -3521,5 +3555,118 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn tag_registry_cap_is_enforced_per_collection() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("catalog.sqlite3");
+        let catalog = SqliteCatalog::open_with_options(
+            &path,
+            CatalogOptions {
+                max_tag_registry_size: 2,
+                ..CatalogOptions::default()
+            },
+        )
+        .expect("open catalog");
+
+        catalog
+            .ensure_collection("collection_a", 4)
+            .expect("ensure collection a");
+        catalog
+            .ensure_collection("collection_b", 4)
+            .expect("ensure collection b");
+
+        let vector = vec![0.1f32, 0.2, 0.3, 0.4];
+        let mk_meta = |tag: &str| IngestMetadataV3Input {
+            entity_id: 1,
+            sequence_ts: 1,
+            tags: vec![tag.to_string()],
+            payload: Vec::new(),
+        };
+
+        catalog
+            .ingest_wal_batch(
+                "collection_a",
+                &[
+                    (vector.clone(), mk_meta("a_one"), None),
+                    (vector.clone(), mk_meta("a_two"), None),
+                ],
+            )
+            .expect("ingest collection a tags");
+
+        // Different collection should maintain an independent cap budget.
+        catalog
+            .ingest_wal_batch(
+                "collection_b",
+                &[
+                    (vector.clone(), mk_meta("b_one"), None),
+                    (vector.clone(), mk_meta("b_two"), None),
+                ],
+            )
+            .expect("ingest collection b tags");
+
+        let overflow = catalog
+            .ingest_wal_batch(
+                "collection_a",
+                &[(vector.clone(), mk_meta("a_three"), None)],
+            )
+            .expect_err("expected collection_a overflow");
+        let overflow_msg = overflow.to_string();
+        assert!(overflow_msg.contains("tag_registry_overflow"));
+        assert!(overflow_msg.contains("collection_id=collection_a"));
+
+        let dict_a = catalog
+            .fetch_tag_dictionary("collection_a")
+            .expect("dictionary a");
+        let dict_b = catalog
+            .fetch_tag_dictionary("collection_b")
+            .expect("dictionary b");
+        assert_eq!(dict_a.len(), 2);
+        assert_eq!(dict_b.len(), 2);
+    }
+
+    #[test]
+    fn audit_events_batch_inserts_all_rows() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("catalog.sqlite3");
+        let catalog = SqliteCatalog::open(&path).expect("open catalog");
+
+        let events = vec![
+            AuditEvent {
+                request_id: "req_1".to_string(),
+                api_key_id: Some("vbk_1".to_string()),
+                endpoint: "/v3/query".to_string(),
+                action: "query".to_string(),
+                status_code: 200,
+                latency_ms: 1.5,
+                details: serde_json::json!({"ok": true}),
+            },
+            AuditEvent {
+                request_id: "req_2".to_string(),
+                api_key_id: None,
+                endpoint: "/v3/ingest".to_string(),
+                action: "ingest".to_string(),
+                status_code: 202,
+                latency_ms: 2.25,
+                details: serde_json::json!({"rows": 2}),
+            },
+        ];
+        catalog
+            .audit_events_batch(&events)
+            .expect("batch insert succeeds");
+
+        let rows = catalog
+            .query_json(
+                "SELECT request_id, api_key_id, endpoint, action, status_code
+                 FROM audit_events
+                 ORDER BY rowid ASC;",
+            )
+            .expect("query audit events");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["request_id"], serde_json::json!("req_1"));
+        assert_eq!(rows[0]["api_key_id"], serde_json::json!("vbk_1"));
+        assert_eq!(rows[1]["request_id"], serde_json::json!("req_2"));
+        assert_eq!(rows[1]["api_key_id"], serde_json::Value::Null);
     }
 }

@@ -625,8 +625,7 @@ impl HNSW {
             for &(existing_id, _) in &result {
                 let mut dist_to_existing = 0.0f32;
                 self.with_vector(existing_id, &mut |existing_vec| {
-                    dist_to_existing =
-                        -dot_product(candidate_vec_scratch.as_slice(), existing_vec);
+                    dist_to_existing = -dot_product(candidate_vec_scratch.as_slice(), existing_vec);
                 });
 
                 if dist_to_existing < candidate_dist {

@@ -12,7 +12,12 @@ fn test_config(data_dir: PathBuf) -> ProductionConfig {
     cfg
 }
 
-fn ingest_meta(entity_id: u64, sequence_ts: u64, payload: &str, tags: &[&str]) -> IngestMetadataV3Input {
+fn ingest_meta(
+    entity_id: u64,
+    sequence_ts: u64,
+    payload: &str,
+    tags: &[&str],
+) -> IngestMetadataV3Input {
     IngestMetadataV3Input {
         entity_id,
         sequence_ts,
@@ -456,7 +461,8 @@ fn ingest_wal_batch_preserves_idempotency_and_catalog_consistency() {
         .get(&r1[1].vector_id)
         .expect("metadata for idempotent row");
     assert_eq!(
-        existing.payload, b"b.wav".to_vec(),
+        existing.payload,
+        b"b.wav".to_vec(),
         "duplicate idempotent ingest must not overwrite metadata"
     );
 

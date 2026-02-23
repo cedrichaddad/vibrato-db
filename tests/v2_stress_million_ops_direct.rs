@@ -23,7 +23,12 @@ const BATCH_SIZE: usize = 100;
 const VERIFY_SAMPLE_CAP: usize = 1024;
 const WARMUP_VECTORS: usize = 128;
 
-fn ingest_meta(entity_id: u64, sequence_ts: u64, payload: &str, tags: Vec<String>) -> IngestMetadataV3Input {
+fn ingest_meta(
+    entity_id: u64,
+    sequence_ts: u64,
+    payload: &str,
+    tags: Vec<String>,
+) -> IngestMetadataV3Input {
     IngestMetadataV3Input {
         entity_id,
         sequence_ts,

@@ -37,6 +37,22 @@ use vibrato_db::server::{
 use vibrato_db::store::VectorStore;
 use vibrato_neural::inference::InferenceEngine;
 
+fn require_api_pepper_for_release() {
+    #[cfg(not(debug_assertions))]
+    {
+        let pepper_present = std::env::var("VIBRATO_API_PEPPER")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if !pepper_present {
+            let message =
+                "FATAL: VIBRATO_API_PEPPER environment variable is required for production startup.";
+            tracing::error!("{}", message);
+            eprintln!("{}", message);
+            std::process::exit(1);
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "vibrato-db")]
 #[command(about = "A persistent, disk-backed vector search engine")]
@@ -242,7 +258,7 @@ enum Commands {
         #[arg(long, default_value = "8")]
         filter_parallel_min_shards: usize,
 
-        /// Maximum global tag cardinality retained in registry cache/storage
+        /// Maximum per-collection tag cardinality retained in registry cache/storage
         #[arg(long, default_value = "500000")]
         max_tag_registry_size: usize,
 
@@ -631,6 +647,8 @@ async fn main() -> anyhow::Result<()> {
             flight_port,
             bootstrap_admin_key,
         } => {
+            require_api_pepper_for_release();
+
             let mut config = ProductionConfig::from_data_dir(data_dir, collection, dim);
             config.checkpoint_interval = std::time::Duration::from_secs(checkpoint_interval_secs);
             config.compaction_interval = std::time::Duration::from_secs(compaction_interval_secs);
@@ -707,6 +725,7 @@ async fn main() -> anyhow::Result<()> {
             name,
             roles,
         } => {
+            require_api_pepper_for_release();
             let config = ProductionConfig::from_data_dir(data_dir, "default".to_string(), 128);
             bootstrap_data_dirs(&config)?;
             let catalog = SqliteCatalog::open(&config.catalog_path())?;

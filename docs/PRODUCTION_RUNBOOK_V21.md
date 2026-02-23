@@ -1,11 +1,11 @@
-# Vibrato Production Runbook (v2.1)
+# Vibrato Production Runbook (v3)
 
-This runbook is executable against the current `v2` server in this repository.
+This runbook is executable against the current `v3` server in this repository.
 
 ## 1. Bootstrap and Start
 
 ```bash
-cargo run -- serve-v2 \
+cargo run -- serve-v3 \
   --data-dir ./vibrato_data \
   --collection default \
   --dim 128 \
@@ -17,6 +17,12 @@ cargo run -- serve-v2 \
   --audio-colocated true \
   --public-health-metrics true \
   --bootstrap-admin-key true
+```
+
+Before production startup, set `VIBRATO_API_PEPPER` (required in release builds):
+
+```bash
+export VIBRATO_API_PEPPER='<strong-random-secret>'
 ```
 
 If `--bootstrap-admin-key true` is used on first boot, capture `BOOTSTRAP_ADMIN_KEY=...` from stdout.
@@ -45,14 +51,14 @@ cargo run -- key-revoke \
 Manual checkpoint:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v2/admin/checkpoint \
+curl -X POST http://127.0.0.1:8080/v3/admin/checkpoint \
   -H "Authorization: Bearer <token>"
 ```
 
 Manual compaction:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v2/admin/compact \
+curl -X POST http://127.0.0.1:8080/v3/admin/compact \
   -H "Authorization: Bearer <token>"
 ```
 
@@ -63,7 +69,7 @@ Notes:
 Inspect engine state:
 
 ```bash
-curl http://127.0.0.1:8080/v2/admin/stats \
+curl http://127.0.0.1:8080/v3/admin/stats \
   -H "Authorization: Bearer <token>"
 ```
 
@@ -115,20 +121,20 @@ Startup recovery performs:
 - hot WAL tail/index rebuild
 
 Readiness:
-- `GET /v2/health/ready` is `503` when integrity blockers exist.
+- `GET /v3/health/ready` is `503` when integrity blockers exist.
 - Recovery report includes explicit blockers.
 
 ## 7. Health and Metrics Security
 
-- With `--public-health-metrics true`, `/v2/health/*` and `/v2/metrics` are public.
+- With `--public-health-metrics true`, `/v3/health/*` and `/v3/metrics` are public.
 - With `--public-health-metrics false`, health requires `query` role and metrics requires `admin` role.
 
 ## 8. SLO Triage Checklist
 
 When latency regresses:
-1. Inspect `/v2/admin/stats` for `wal_pending`, `checkpoint_jobs_inflight`, `compaction_jobs_inflight`.
+1. Inspect `/v3/admin/stats` for `wal_pending`, `checkpoint_jobs_inflight`, `compaction_jobs_inflight`.
 2. Trigger manual checkpoint if WAL tail is large.
-3. Verify background workers are running (`checkpoint_total` and `compaction_total` in `/v2/metrics`).
+3. Verify background workers are running (`checkpoint_total` and `compaction_total` in `/v3/metrics`).
 4. Check segment state drift (`active/obsolete/failed` counts).
 5. If filter-heavy workload regressed, test with and without filter to isolate Layer-0 filtered path.
 

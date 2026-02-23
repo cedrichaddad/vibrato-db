@@ -801,10 +801,11 @@ async fn v2_health_live(State(state): State<Arc<ProductionState>>, headers: Head
             );
         }
     }
+    let live = state.live_status();
     let payload = ApiResponse {
         data: HealthResponseV2 {
             status: "ok".to_string(),
-            ready: state.live.load(std::sync::atomic::Ordering::SeqCst),
+            ready: live,
             report: "live".to_string(),
         },
     };
@@ -838,12 +839,18 @@ async fn v2_health_ready(
             );
         }
     }
-    let ready = state.ready.load(std::sync::atomic::Ordering::SeqCst);
+    let live = state.live_status();
+    let ready = state.ready.load(std::sync::atomic::Ordering::SeqCst) && live;
+    let report = if live {
+        state.recovery_report.read().clone()
+    } else {
+        "ingest writer unavailable".to_string()
+    };
     let payload = ApiResponse {
         data: HealthResponseV2 {
             status: if ready { "ok" } else { "degraded" }.to_string(),
             ready,
-            report: state.recovery_report.read().clone(),
+            report,
         },
     };
     let status = if ready {

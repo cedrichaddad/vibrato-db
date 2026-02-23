@@ -54,7 +54,7 @@ cargo bench -p vibrato-core --bench hnsw_p99
 
 ## Technical Architecture
 
-Vibrato-DB is built on core pillars of systems engineering, evolved into a robust `v2` distributed system:
+Vibrato-DB is built on core pillars of systems engineering, evolved into the `v3` universal engine:
 
 ### 1. Zero-Copy Storage Engine (mmap)
 
@@ -63,7 +63,7 @@ Vectors are not loaded into the heap. The `.vdb` binary format is designed to be
 - **Benefit**: Instant startup time regardless of dataset size.
 - **Safety**: Uses `bytemuck` for alignment-checked casting from raw bytes to `&[f32]` slices.
 - **OS Optimization**: Relies on the kernel's Page Cache to handle hot/cold data swapping.
-- **Madvise Tuning**: Implements memory access pattern hints (AB tested in `v2`) to ensure page cache efficiency under random read load.
+- **Madvise Tuning**: Implements memory access pattern hints to ensure page cache efficiency under random read load.
 
 ### 2. Lock-Free HNSW Indexing
 
@@ -79,9 +79,9 @@ Distance kernels are strictly optimized for AVX2 (x86_64) and NEON (aarch64).
 - **Aligned Loads**: Exploits 32-byte alignment for AVX2 `vmovaps` when data layout permits.
 - **Runtime Dispatch**: Automatically selects the fastest kernel supported by the CPU.
 
-### 4. V2 Control Plane & Storage Tiers
+### 4. V3 Control Plane & Storage Tiers
 
-The `v2` architecture introduces an immutable segment lifecycle and distributed-ready semantics.
+The `v3` architecture introduces an immutable segment lifecycle and distributed-ready semantics.
 
 - **SQLite Catalog (`catalog.rs`)**: Centralizes metadata, segmented collections, API key authentication, and role-based access control (RBAC).
 - **WAL & Multi-Version Concurrency (`recovery.rs`)**: Write-Ahead Logs provide durability against crashes by replaying uncommitted ingestion events.
@@ -138,21 +138,22 @@ cargo run --release -- ingest --input vectors.json --output data.vdb
 cargo run --release -- search --query "0.1,0.2,..." --k 5
 ```
 
-### 3. Production v2 Control Plane
+### 3. Production v3 Control Plane
 
-`v2` adds SQLite catalog, WAL ingest, immutable segment lifecycle, admin auth, and recovery/orphan handling.
+`v3` adds SQLite catalog, WAL ingest, immutable segment lifecycle, admin auth, and recovery/orphan handling.
 It also includes roaring-style bitmap filter acceleration and PQ-encoded L2 archive segments for archive-tier search.
 
 ```bash
 # Start production server
-cargo run --release -- serve-v2 \
+export VIBRATO_API_PEPPER='<strong-random-secret>'
+cargo run --release -- serve-v3 \
   --data-dir ./vibrato_data \
   --collection default \
   --dim 128 \
   --bootstrap-admin-key true
 
 # Optional: enable Arrow Flight ingest data plane on a second port
-cargo run --release -- serve-v2 \
+cargo run --release -- serve-v3 \
   --data-dir ./vibrato_data \
   --collection default \
   --dim 128 \
@@ -176,8 +177,8 @@ Arrow Flight ingest notes:
 - Auth uses gRPC metadata header `authorization: Bearer vbk_<id>.<secret>`.
 - `do_put` expects a `RecordBatch` with:
   - required: `vector` (`FixedSizeList<Float32>`; fixed length must equal collection `dim`)
-  - optional: `metadata_json` (`Utf8`), `idempotency_key` (`Utf8`)
-  - optional metadata columns: `source_file` (`Utf8`), `start_time_ms` (`UInt32`), `duration_ms` (`UInt16`), `bpm` (`Float32`), `tags` (`List<Utf8>`)
+  - required metadata columns: `entity_id` (`UInt64`), `sequence_ts` (`UInt64`), `payload` (`Binary`)
+  - optional metadata columns: `tags` (`List<Utf8>` or `List<Dictionary<*, Utf8>>`), `idempotency_key` (`Utf8`)
 
 ### 4. Python Bindings
 
@@ -199,11 +200,13 @@ print(results) # [(id, score), ...]
 Search for similar vectors using a simple REST API.
 
 ```bash
-curl -X POST http://localhost:8080/search \
+curl -X POST http://localhost:8080/v3/query \
+  -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{
     "vector": [0.12, 0.05, ...],
-    "k": 5
+    "k": 5,
+    "ef": 64
   }'
 ```
 
@@ -244,8 +247,8 @@ src/
   main.rs         # CLI entry point
 
 crates/
-  vibrato-core    # Core engine (HNSW, SIMD, V2 Format)
-  vibrato-server  # V2 control/data plane services
+  vibrato-core    # Core engine (HNSW, SIMD, vector formats)
+  vibrato-server  # V3 control/data plane services
   vibrato-edge    # C-ABI edge embedding surface
   vibrato-midas   # Time-series constrained DTW search primitives
   vibrato-neural  # Audio pipeline (features, ONNX)
