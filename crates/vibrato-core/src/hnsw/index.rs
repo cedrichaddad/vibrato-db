@@ -23,7 +23,7 @@ use rand::SeedableRng;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::node::Node;
-use super::visited::VisitedGuard;
+use super::visited::{VisitedGuard, VisitedSet};
 use crate::simd::dot_product;
 
 /// Candidate for search (min-heap)
@@ -298,6 +298,25 @@ impl HNSW {
         (self.vectors)(id, sink);
     }
 
+    /// Returns true if `id` is present in the graph.
+    #[inline]
+    pub fn contains_id(&self, id: usize) -> bool {
+        self.id_to_index.contains_key(&id)
+    }
+
+    /// Score a node ID against a query vector if that node exists.
+    #[inline]
+    pub fn score_for_id(&self, query: &[f32], id: usize) -> Option<f32> {
+        if !self.contains_id(id) {
+            return None;
+        }
+        let mut score = 0.0f32;
+        self.with_vector(id, &mut |node_vec| {
+            score = dot_product(query, node_vec);
+        });
+        Some(score)
+    }
+
     /// Get an owned vector copy.
     ///
     /// This is used only where a long-lived query buffer is required (e.g. insert).
@@ -476,13 +495,13 @@ impl HNSW {
     /// Search for nearest neighbors on a single layer
     ///
     /// Greedy beam search with `ef` candidates.
-    fn search_layer_into(
+    fn search_layer_into<V: VisitedSet>(
         &self,
         query: &[f32],
         entry_points: &[usize],
         ef: usize,
         layer: usize,
-        visited: &mut VisitedGuard,
+        visited: &mut V,
         scratch: &mut SearchScratch,
         out: &mut Vec<(usize, f32)>,
     ) {

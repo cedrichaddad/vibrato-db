@@ -265,16 +265,19 @@ impl VisitedGuard {
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn is_visited(&self, id: usize) -> bool {
         self.set_ref_fast().is_visited(id)
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn visit(&mut self, id: usize) {
         self.set_mut_fast().visit(id);
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.set_mut_fast().clear();
     }
@@ -304,6 +307,28 @@ impl Drop for VisitedGuard {
         if let Some(set) = self.set.take() {
             VisitedPool::put(set);
         }
+    }
+}
+
+impl VisitedSet for VisitedGuard {
+    #[inline(always)]
+    fn prepare_for(&mut self, max_id: usize) {
+        self.set_mut().prepare_for(max_id);
+    }
+
+    #[inline(always)]
+    fn is_visited(&self, id: usize) -> bool {
+        self.set_ref_fast().is_visited(id)
+    }
+
+    #[inline(always)]
+    fn visit(&mut self, id: usize) {
+        self.set_mut_fast().visit(id);
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.set_mut_fast().clear();
     }
 }
 

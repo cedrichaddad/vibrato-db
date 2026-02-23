@@ -13,6 +13,7 @@ use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use rayon::ThreadPool;
+use scc::HashMap as SccHashMap;
 use serde_json::{json, Value};
 use vibrato_core::format_v2::{VdbHeaderV2, VdbWriterV2};
 use vibrato_core::hnsw::HNSW;
@@ -189,10 +190,10 @@ pub struct ProductionState {
     pub ready: AtomicBool,
     pub recovery_report: RwLock<String>,
 
-    pub hot_vector_shards: Vec<ArcSwap<RwLock<HashMap<usize, Arc<Vec<f32>>>>>>,
+    pub hot_vector_shards: Vec<ArcSwap<SccHashMap<usize, Arc<Vec<f32>>>>>,
     pub hot_indices: Vec<RwLock<HNSW>>,
     pub shard_mask: usize,
-    pub metadata_cache_shards: Vec<RwLock<HashMap<usize, VectorMetadata>>>,
+    pub metadata_cache_shards: Vec<SccHashMap<usize, VectorMetadata>>,
     pub segments: ArcSwap<Vec<Arc<SegmentHandle>>>,
     pub archive_segments: ArcSwap<Vec<Arc<ArchivePqSegment>>>,
     pub filter_index_shards: Vec<RwLock<FilterIndex>>,
@@ -285,7 +286,7 @@ impl ProductionState {
         let shard_count = next_power_of_two_at_least_one(config.hot_index_shards);
         let shard_mask = shard_count - 1;
         let hot_vector_shards = (0..shard_count)
-            .map(|_| ArcSwap::new(Arc::new(RwLock::new(HashMap::new()))))
+            .map(|_| ArcSwap::new(Arc::new(SccHashMap::new())))
             .collect::<Vec<_>>();
         let hot_indices = hot_vector_shards
             .iter()
@@ -299,7 +300,7 @@ impl ProductionState {
             })
             .collect::<Vec<_>>();
         let metadata_cache_shards = (0..shard_count)
-            .map(|_| RwLock::new(HashMap::new()))
+            .map(|_| SccHashMap::new())
             .collect::<Vec<_>>();
         let (audit_tx, audit_rx) = sync_channel(4096);
         let (ingest_writer_tx, ingest_writer_rx) =
@@ -615,16 +616,13 @@ impl ProductionState {
         let metadata_bytes = Self::estimate_metadata_bytes(&metadata);
         let shard = vector_id & self.shard_mask;
         if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
-            shard_vectors
-                .load()
-                .write()
-                .insert(vector_id, Arc::new(vector));
+            shard_vectors.load().upsert(vector_id, Arc::new(vector));
         }
         if let Some(index) = self.hot_indices.get(shard) {
             index.write().insert(vector_id);
         }
         if let Some(metadata_shard) = self.metadata_cache_shards.get(shard) {
-            metadata_shard.write().insert(vector_id, metadata.clone());
+            metadata_shard.upsert(vector_id, metadata.clone());
         }
         if let Some(filter_shard) = self.filter_index_shards.get(shard) {
             filter_shard.write().add(vector_id, &metadata);
@@ -756,10 +754,9 @@ impl ProductionState {
             // vector store is populated before IDs become discoverable in HNSW.
             let vector_ids = items.iter().map(|item| item.vector_id).collect::<Vec<_>>();
             if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
-                let guard = shard_vectors.load();
-                let mut vec_guard = guard.write();
+                let vec_store = shard_vectors.load_full();
                 for item in items {
-                    vec_guard.insert(item.vector_id, Arc::new(item.vector));
+                    vec_store.upsert(item.vector_id, Arc::new(item.vector));
                 }
             }
             if let Some(index) = self.hot_indices.get(shard) {
@@ -796,10 +793,9 @@ impl ProductionState {
                     self.metadata_cache_shards.get(shard),
                 ) {
                     let mut filter_guard = filter_shard.write();
-                    let mut metadata_guard = metadata_shard.write();
                     for (vector_id, metadata) in rows {
                         filter_guard.add(vector_id, &metadata);
-                        metadata_guard.insert(vector_id, metadata);
+                        metadata_shard.upsert(vector_id, metadata);
                     }
                 }
             }
@@ -1028,7 +1024,7 @@ impl ProductionState {
                 let total_hot = self
                     .hot_vector_shards
                     .iter()
-                    .map(|shard| shard.load().read().len())
+                    .map(|shard| shard.load().len())
                     .sum::<usize>();
                 if total_hot == 0 {
                     None
@@ -1037,13 +1033,12 @@ impl ProductionState {
                     let mut max_id = 0usize;
                     let mut ids = HashSet::with_capacity(total_hot);
                     for shard in &self.hot_vector_shards {
-                        let arc_guard = shard.load();
-                        let guard = arc_guard.read();
-                        for id in guard.keys().copied() {
+                        let map = shard.load_full();
+                        for_each_hot_id(&map, |id| {
                             min_id = min_id.min(id);
                             max_id = max_id.max(id);
                             ids.insert(id);
-                        }
+                        });
                     }
                     Some((min_id, max_id, Arc::new(ids)))
                 }
@@ -1238,7 +1233,7 @@ impl ProductionState {
         let hot_vectors = self
             .hot_vector_shards
             .iter()
-            .map(|shard| shard.load().read().len())
+            .map(|shard| shard.load().len())
             .sum();
         let wal_pending = self.catalog.count_wal_pending(&self.collection.id)?;
         let total_vectors = self.catalog.total_vectors(&self.collection.id)?;
@@ -2073,19 +2068,18 @@ impl ProductionState {
         // Enforce LSN order even if upstream query ordering changes.
         pending.sort_by_key(|e| e.lsn);
 
-        // 1. Create shadow shards (Arc<RwLock<HashMap>>)
+        // 1. Create shadow shards.
         let mut new_shards = Vec::with_capacity(self.hot_vector_shards.len());
         for _ in 0..self.hot_vector_shards.len() {
-            new_shards.push(Arc::new(RwLock::new(HashMap::new())));
+            new_shards.push(Arc::new(SccHashMap::new()));
         }
 
         // 2. Populate shadow shards
-        // This is done without holding any locks on the main index
+        // This is done without touching active shards.
         for (shard_idx, shard_vectors) in new_shards.iter().enumerate() {
-            let mut vectors = shard_vectors.write();
             for e in &pending {
                 if (e.vector_id & self.shard_mask) == shard_idx {
-                    vectors.insert(e.vector_id, Arc::new(e.vector.clone()));
+                    shard_vectors.upsert(e.vector_id, Arc::new(e.vector.clone()));
                 }
             }
         }
@@ -2150,14 +2144,14 @@ impl ProductionState {
             }
         }
         let mut metadata_shards = (0..self.metadata_cache_shards.len())
-            .map(|_| HashMap::new())
-            .collect::<Vec<HashMap<usize, VectorMetadata>>>();
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<(usize, VectorMetadata)>>>();
         let mut metadata_bytes = 0u64;
         for (id, meta) in entries {
             metadata_bytes = metadata_bytes.saturating_add(Self::estimate_metadata_bytes(&meta));
             let shard = id & self.shard_mask;
             if let Some(shard_map) = metadata_shards.get_mut(shard) {
-                shard_map.insert(id, meta);
+                shard_map.push((id, meta));
             }
         }
         for (idx, index) in index_shards.into_iter().enumerate() {
@@ -2167,7 +2161,10 @@ impl ProductionState {
         }
         for (idx, shard_data) in metadata_shards.into_iter().enumerate() {
             if let Some(shard) = self.metadata_cache_shards.get(idx) {
-                *shard.write() = shard_data;
+                shard.clear();
+                for (id, meta) in shard_data {
+                    shard.upsert(id, meta);
+                }
             }
         }
         self.metadata_cache_bytes
@@ -2186,8 +2183,8 @@ impl ProductionState {
         for id in ids {
             let shard = *id & self.shard_mask;
             if let Some(cache) = self.metadata_cache_shards.get(shard) {
-                if let Some(meta) = cache.read().get(id) {
-                    out.insert(*id, meta.clone());
+                if let Some(meta) = cache.read(id, |_, meta| meta.clone()) {
+                    out.insert(*id, meta);
                     continue;
                 }
             }
@@ -2200,7 +2197,7 @@ impl ProductionState {
                 for (id, meta) in &fetched {
                     let shard = *id & self.shard_mask;
                     if let Some(cache) = self.metadata_cache_shards.get(shard) {
-                        cache.write().insert(*id, meta.clone());
+                        cache.upsert(*id, meta.clone());
                     }
                 }
             }
@@ -3124,7 +3121,24 @@ fn search_index_with_dynamic_fallback(
     if cardinality == 0 {
         return Vec::new();
     }
+    if k == 0 {
+        return Vec::new();
+    }
     let target_hits = k.min(cardinality);
+
+    // Selective-filter fast path: bypass HNSW entirely and run a direct SIMD scan
+    // over the allowed ID bitmap to avoid "swiss-cheese" graph routing.
+    const FLAT_SCAN_MAX_IDS: usize = 5_000;
+    const FLAT_SCAN_HARD_CAP_IDS: usize = 50_000;
+    const FLAT_SCAN_SELECTIVITY_PERCENT: usize = 5;
+    let graph_nodes = index.len().max(1);
+    let selective = cardinality <= FLAT_SCAN_MAX_IDS
+        || (cardinality <= FLAT_SCAN_HARD_CAP_IDS
+            && cardinality.saturating_mul(100)
+                <= graph_nodes.saturating_mul(FLAT_SCAN_SELECTIVITY_PERCENT));
+    if selective {
+        return flat_scan_index_with_allow_set(index, query, k, allow);
+    }
 
     // Stage A (strict): evaluate only allowed IDs.
     let strict = index.search_filtered(query, k, ef.max(k), |id| allow.contains(id));
@@ -3179,6 +3193,65 @@ fn search_index_with_dynamic_fallback(
     } else {
         best
     }
+}
+
+fn flat_scan_index_with_allow_set(
+    index: &HNSW,
+    query: &[f32],
+    k: usize,
+    allow: &BitmapSet,
+) -> Vec<(usize, f32)> {
+    if k == 0 {
+        return Vec::new();
+    }
+
+    #[derive(Clone, Copy)]
+    struct MinScore {
+        id: usize,
+        score: f32,
+    }
+    impl PartialEq for MinScore {
+        fn eq(&self, other: &Self) -> bool {
+            self.score == other.score
+        }
+    }
+    impl Eq for MinScore {}
+    impl PartialOrd for MinScore {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for MinScore {
+        fn cmp(&self, other: &Self) -> Ordering {
+            // Reverse for min-heap behavior.
+            other
+                .score
+                .partial_cmp(&self.score)
+                .unwrap_or(Ordering::Equal)
+        }
+    }
+
+    let mut heap = std::collections::BinaryHeap::with_capacity(k + 1);
+    for id in allow.iter_ids() {
+        let Some(score) = index.score_for_id(query, id) else {
+            continue;
+        };
+        if heap.len() < k {
+            heap.push(MinScore { id, score });
+        } else if let Some(worst) = heap.peek() {
+            if score > worst.score {
+                heap.pop();
+                heap.push(MinScore { id, score });
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(heap.len());
+    while let Some(result) = heap.pop() {
+        out.push((result.id, result.score));
+    }
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    out
 }
 
 fn checkpoint_loop(state: Arc<ProductionState>) {
@@ -3254,21 +3327,32 @@ fn audit_worker_loop(state: Arc<ProductionState>, rx: Receiver<AuditEvent>) {
 }
 
 fn make_hot_accessor(
-    hot_vector_shard: Arc<RwLock<HashMap<usize, Arc<Vec<f32>>>>>,
+    hot_vector_shard: Arc<SccHashMap<usize, Arc<Vec<f32>>>>,
     dim: usize,
 ) -> impl Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static {
     let zero_fallback = Arc::new(vec![0.0f32; dim]);
     move |id, sink| {
-        // Important: do not hold the shard lock while executing `sink`.
-        // HNSW insert/search can invoke nested accessor callbacks.
-        let maybe_vec = {
-            let guard = hot_vector_shard.read();
-            guard.get(&id).cloned()
-        };
+        let maybe_vec = hot_vector_shard.read(&id, |_, v| Arc::clone(v));
         if let Some(v) = maybe_vec {
             sink(v.as_slice());
         } else {
             sink(zero_fallback.as_slice());
+        }
+    }
+}
+
+fn for_each_hot_id<F>(map: &SccHashMap<usize, Arc<Vec<f32>>>, mut f: F)
+where
+    F: FnMut(usize),
+{
+    if let Some(mut entry) = map.first_entry() {
+        loop {
+            f(*entry.key());
+            if let Some(next) = entry.next() {
+                entry = next;
+            } else {
+                break;
+            }
         }
     }
 }
