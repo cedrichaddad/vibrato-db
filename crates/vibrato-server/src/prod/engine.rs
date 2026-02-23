@@ -192,6 +192,11 @@ pub struct ArchivePqSegment {
     pub num_subspaces: usize,
 }
 
+pub struct HotShard {
+    pub vectors: HashMap<usize, Arc<Vec<f32>>>,
+    pub index: HNSW,
+}
+
 pub struct ProductionState {
     pub config: ProductionConfig,
     pub catalog: Arc<SqliteCatalog>,
@@ -200,8 +205,7 @@ pub struct ProductionState {
     pub ready: AtomicBool,
     pub recovery_report: RwLock<String>,
 
-    pub hot_vectors: Arc<SccHashMap<usize, Arc<Vec<f32>>>>,
-    pub hot_indices: Vec<RwLock<HNSW>>,
+    pub hot_shards: Vec<RwLock<HotShard>>,
     pub shard_mask: usize,
     pub metadata_cache: Arc<SccHashMap<usize, VectorMetadataV3>>,
     pub segments: ArcSwap<Vec<Arc<SegmentHandle>>>,
@@ -302,15 +306,12 @@ impl ProductionState {
 
         let shard_count = next_power_of_two_at_least_one(config.hot_index_shards);
         let shard_mask = shard_count - 1;
-        let hot_vectors = Arc::new(SccHashMap::new());
-        let hot_indices = (0..shard_count)
+        let hot_shards = (0..shard_count)
             .map(|_| {
-                let accessor = make_hot_accessor(hot_vectors.clone(), config.dim);
-                RwLock::new(HNSW::new_with_accessor(
-                    config.hnsw_m,
-                    config.hnsw_ef_construction,
-                    accessor,
-                ))
+                RwLock::new(HotShard {
+                    vectors: HashMap::new(),
+                    index: make_empty_hot_hnsw(config.hnsw_m, config.hnsw_ef_construction),
+                })
             })
             .collect::<Vec<_>>();
         let metadata_cache = Arc::new(SccHashMap::new());
@@ -366,8 +367,7 @@ impl ProductionState {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
             recovery_report: RwLock::new("initializing".to_string()),
-            hot_vectors,
-            hot_indices,
+            hot_shards,
             shard_mask,
             metadata_cache,
             segments: ArcSwap::from_pointee(Vec::new()),
@@ -720,13 +720,20 @@ impl ProductionState {
         let vector_bytes = (vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
         let metadata_bytes = Self::estimate_cached_metadata_bytes(&metadata);
         let shard = vector_id & self.shard_mask;
-        self.hot_vectors.upsert(vector_id, Arc::new(vector));
-        let index = self
-            .hot_indices
+        let shard_lock = self
+            .hot_shards
             .get(shard)
-            .unwrap_or_else(|| panic!("data integrity fault: missing hot index shard {}", shard));
-        let mut idx_guard = index.write();
-        idx_guard.insert(vector_id);
+            .unwrap_or_else(|| panic!("data integrity fault: missing hot shard {}", shard));
+        let mut shard_guard = shard_lock.write();
+        let HotShard { vectors, index } = &mut *shard_guard;
+        vectors.insert(vector_id, Arc::new(vector));
+        let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+            let vector = vectors.get(&id).unwrap_or_else(|| {
+                panic!("data integrity fault: hot shard missing id={id} shard={shard}")
+            });
+            sink(vector.as_slice());
+        };
+        index.insert_with_accessor(vector_id, &accessor);
         self.metadata_cache.upsert(vector_id, metadata.clone());
         for tag_id in &metadata.tags {
             match self.filter_index.entry(*tag_id) {
@@ -862,23 +869,28 @@ impl ProductionState {
         }
 
         let apply_shard_items = |shard: usize, items: Vec<CreatedShardItem>| {
-            let index = self.hot_indices.get(shard).unwrap_or_else(|| {
-                panic!("data integrity fault: missing hot index shard {}", shard)
-            });
+            let shard_lock = self
+                .hot_shards
+                .get(shard)
+                .unwrap_or_else(|| panic!("data integrity fault: missing hot shard {}", shard));
 
-            // Preserve visibility invariant for concurrent readers:
-            // vector store is populated before IDs become discoverable in HNSW.
-            let mut idx_guard = index.write();
+            let mut shard_guard = shard_lock.write();
+            let HotShard { vectors, index } = &mut *shard_guard;
             for item in items {
-                self.hot_vectors
-                    .upsert(item.vector_id, Arc::new(item.vector));
-                idx_guard.insert(item.vector_id);
+                vectors.insert(item.vector_id, Arc::new(item.vector));
+                let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+                    let vector = vectors.get(&id).unwrap_or_else(|| {
+                        panic!("data integrity fault: hot shard missing id={id} shard={shard}")
+                    });
+                    sink(vector.as_slice());
+                };
+                index.insert_with_accessor(item.vector_id, &accessor);
             }
         };
 
         // 3. Insert into hot index shards.
         // For small batches, avoid Rayon dispatch overhead.
-        let parallel_ingest_threshold = self.hot_indices.len().saturating_mul(64).max(256);
+        let parallel_ingest_threshold = self.hot_shards.len().saturating_mul(64).max(256);
         if created_count >= parallel_ingest_threshold {
             by_shard
                 .into_par_iter()
@@ -958,21 +970,30 @@ impl ProductionState {
             .as_ref()
             .map(|bm| bm.cardinality() <= 5_000)
             .unwrap_or(false);
-        let hot_shard_ef = effective_hot_shard_ef(request.k, request.ef, self.hot_indices.len());
+        let hot_shard_ef = effective_hot_shard_ef(request.k, request.ef, self.hot_shards.len());
         let inline_hot_scan =
-            allow_bitmap.is_none() && request.ef <= 64 && self.hot_indices.len() <= 16;
+            allow_bitmap.is_none() && request.ef <= 64 && self.hot_shards.len() <= 16;
 
         if !matches!(request.search_tier, SearchTier::Archive) {
             let hot_results = if selective_allow || inline_hot_scan {
                 // For selective filters and low-ef hot queries, per-shard work is
                 // small enough that Rayon dispatch overhead dominates.
-                self.hot_indices
+                self.hot_shards
                     .iter()
                     .enumerate()
-                    .map(|(shard, shard_index)| {
-                        let index = shard_index.read();
+                    .map(|(shard, shard_lock)| {
+                        let shard_guard = shard_lock.read();
+                        let HotShard { vectors, index } = &*shard_guard;
+                        let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+                            let vector = vectors.get(&id).unwrap_or_else(|| {
+                                panic!(
+                                    "data integrity fault: hot shard missing id={id} shard={shard}"
+                                )
+                            });
+                            sink(vector.as_slice());
+                        };
                         search_index_with_dynamic_fallback(
-                            &index,
+                            index,
                             &request.vector,
                             request.k,
                             hot_shard_ef,
@@ -981,18 +1002,26 @@ impl ProductionState {
                                 shard,
                                 shard_mask: self.shard_mask,
                             }),
+                            Some(&accessor),
                         )
                     })
                     .collect::<Vec<_>>()
             } else {
                 self.query_pool.install(|| {
-                    self.hot_indices
+                    self.hot_shards
                         .par_iter()
                         .enumerate()
-                        .map(|(shard, shard_index)| {
-                            let index = shard_index.read();
+                        .map(|(shard, shard_lock)| {
+                            let shard_guard = shard_lock.read();
+                            let HotShard { vectors, index } = &*shard_guard;
+                            let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+                                let vector = vectors.get(&id).unwrap_or_else(|| {
+                                    panic!("data integrity fault: hot shard missing id={id} shard={shard}")
+                                });
+                                sink(vector.as_slice());
+                            };
                             search_index_with_dynamic_fallback(
-                                &index,
+                                index,
                                 &request.vector,
                                 request.k,
                                 hot_shard_ef,
@@ -1001,6 +1030,7 @@ impl ProductionState {
                                     shard,
                                     shard_mask: self.shard_mask,
                                 }),
+                                Some(&accessor),
                             )
                         })
                         .collect::<Vec<_>>()
@@ -1032,6 +1062,7 @@ impl ProductionState {
                         request.k,
                         request.ef,
                         allow_bitmap.as_deref(),
+                        None,
                         None,
                     )
                 })
@@ -1171,18 +1202,22 @@ impl ProductionState {
 
         if !matches!(request.search_tier, SearchTier::Archive) {
             let hot_snapshot = {
-                let total_hot = self.hot_vectors.len();
-                if total_hot == 0 {
+                let mut min_id = usize::MAX;
+                let mut max_id = 0usize;
+                let mut ids = HashSet::new();
+
+                for shard_lock in &self.hot_shards {
+                    let shard_guard = shard_lock.read();
+                    for id in shard_guard.vectors.keys() {
+                        min_id = min_id.min(*id);
+                        max_id = max_id.max(*id);
+                        ids.insert(*id);
+                    }
+                }
+
+                if ids.is_empty() {
                     None
                 } else {
-                    let mut min_id = usize::MAX;
-                    let mut max_id = 0usize;
-                    let mut ids = HashSet::with_capacity(total_hot);
-                    for_each_hot_id(self.hot_vectors.as_ref(), |id| {
-                        min_id = min_id.min(id);
-                        max_id = max_id.max(id);
-                        ids.insert(id);
-                    });
                     Some((min_id, max_id, Arc::new(ids)))
                 }
             };
@@ -1190,17 +1225,28 @@ impl ProductionState {
             if let Some((min_id, max_id, hot_ids)) = hot_snapshot {
                 let total_vectors = max_id.saturating_add(1);
                 let results = self.query_pool.install(|| {
-                    self.hot_indices
+                    self.hot_shards
                         .par_iter()
-                        .map(|shard_index| {
-                            let index = shard_index.read();
+                        .enumerate()
+                        .map(|(shard_idx, shard_lock)| {
+                            let shard_guard = shard_lock.read();
+                            let HotShard { vectors, index } = &*shard_guard;
+                            let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+                                let vector = vectors.get(&id).unwrap_or_else(|| {
+                                    panic!(
+                                        "data integrity fault: hot shard missing id={id} shard={shard_idx}"
+                                    )
+                                });
+                                sink(vector.as_slice());
+                            };
                             let hot_ids = hot_ids.clone();
-                            index.search_subsequence_with_predicate(
+                            index.search_subsequence_with_predicate_and_accessor(
                                 &request.vectors,
                                 request.k,
                                 request.ef.max(request.k),
                                 total_vectors,
                                 move |id| hot_ids.contains(&id),
+                                &accessor,
                             )
                         })
                         .collect::<Vec<_>>()
@@ -1370,7 +1416,11 @@ impl ProductionState {
             .catalog
             .list_segments_by_state(&self.collection.id, &["failed"])?
             .len();
-        let hot_vectors = self.hot_vectors.len();
+        let hot_vectors = self
+            .hot_shards
+            .iter()
+            .map(|shard| shard.read().vectors.len())
+            .sum::<usize>();
         let wal_pending = self.catalog.count_wal_pending(&self.collection.id)?;
         let total_vectors = self.catalog.total_vectors(&self.collection.id)?;
         let checkpoint_jobs_inflight = self
@@ -1851,9 +1901,6 @@ impl ProductionState {
             });
 
             self.rebuild_hot_from_pending()?;
-            for entry in &pending {
-                let _ = self.hot_vectors.remove(&entry.vector_id);
-            }
 
             self.metrics
                 .checkpoint_total
@@ -2225,76 +2272,88 @@ impl ProductionState {
         let mut pending = self.catalog.pending_wal_after_lsn(&self.collection.id, 0)?;
         // Enforce LSN order even if upstream query ordering changes.
         pending.sort_by_key(|e| e.lsn);
-
-        // 1. Ensure global hot vector map contains all pending WAL vectors.
-        for entry in &pending {
-            self.hot_vectors
-                .upsert(entry.vector_id, Arc::new(entry.vector.clone()));
-        }
-
-        // 2. Group pending IDs by shard for deterministic index rebuild.
-        let mut pending_ids_by_shard = vec![Vec::new(); self.hot_indices.len()];
-        for entry in &pending {
+        let shard_count = self.hot_shards.len();
+        let mut pending_by_shard: Vec<Vec<WalEntry>> = vec![Vec::new(); shard_count];
+        for entry in pending {
             let shard = entry.vector_id & self.shard_mask;
-            if let Some(bucket) = pending_ids_by_shard.get_mut(shard) {
-                bucket.push(entry.vector_id);
+            if let Some(bucket) = pending_by_shard.get_mut(shard) {
+                bucket.push(entry);
             }
         }
 
-        // 3. Build shadow HNSW indices against the global hot vector map.
-        let mut new_indices = Vec::with_capacity(self.hot_indices.len());
-        for ids in &pending_ids_by_shard {
-            let mut hnsw = HNSW::new_with_accessor(
-                self.config.hnsw_m,
-                self.config.hnsw_ef_construction,
-                make_hot_accessor(self.hot_vectors.clone(), self.collection.dim),
-            );
+        // 1. Build shadow shard map/index pairs off-thread state.
+        let mut shadow_shards = Vec::with_capacity(shard_count);
+        for entries in pending_by_shard {
+            let mut vectors = HashMap::with_capacity(entries.len());
+            for entry in entries {
+                vectors.insert(entry.vector_id, Arc::new(entry.vector));
+            }
+
+            let mut index =
+                make_empty_hot_hnsw(self.config.hnsw_m, self.config.hnsw_ef_construction);
+            let mut ids = vectors.keys().copied().collect::<Vec<_>>();
+            ids.sort_unstable();
             for vector_id in ids {
-                hnsw.insert(*vector_id);
+                let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+                    let vector = vectors.get(&id).unwrap_or_else(|| {
+                        panic!("data integrity fault: rebuilding hot shard missing id={id}")
+                    });
+                    sink(vector.as_slice());
+                };
+                index.insert_with_accessor(vector_id, &accessor);
             }
-            new_indices.push(hnsw);
+
+            shadow_shards.push(HotShard { vectors, index });
         }
 
-        // 4. Atomic index swap (vector map is global and never swapped).
-        for (i, hnsw) in new_indices.into_iter().enumerate() {
-            *self.hot_indices[i].write() = hnsw;
+        // 2. Atomic shard swap (vectors+index move together per shard).
+        for (idx, shadow) in shadow_shards.into_iter().enumerate() {
+            let mut guard = self.hot_shards[idx].write();
+            *guard = shadow;
         }
 
-        // 5. Catch-up phase: replay WAL snapshot again after index swap.
+        // 3. Catch-up phase: replay rows committed while rebuilding shadow shards.
         let mut pending_catchup = self.catalog.pending_wal_after_lsn(&self.collection.id, 0)?;
         pending_catchup.sort_by_key(|e| e.lsn);
 
-        let mut catchup_ids_by_shard = vec![Vec::new(); self.hot_indices.len()];
-        for entry in &pending_catchup {
-            self.hot_vectors
-                .upsert(entry.vector_id, Arc::new(entry.vector.clone()));
+        let mut catchup_by_shard: Vec<Vec<WalEntry>> = vec![Vec::new(); shard_count];
+        let mut catchup_vector_bytes = 0u64;
+        let mut catchup_count = 0u64;
+        for entry in pending_catchup {
+            catchup_vector_bytes = catchup_vector_bytes.saturating_add(
+                (entry.vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
+            );
+            catchup_count = catchup_count.saturating_add(1);
             let shard = entry.vector_id & self.shard_mask;
-            if let Some(bucket) = catchup_ids_by_shard.get_mut(shard) {
-                bucket.push(entry.vector_id);
+            if let Some(bucket) = catchup_by_shard.get_mut(shard) {
+                bucket.push(entry);
             }
         }
 
-        for (shard_idx, ids) in catchup_ids_by_shard.into_iter().enumerate() {
-            if ids.is_empty() {
+        for (shard_idx, entries) in catchup_by_shard.into_iter().enumerate() {
+            if entries.is_empty() {
                 continue;
             }
-            if let Some(index) = self.hot_indices.get(shard_idx) {
-                let mut idx = index.write();
-                for vector_id in ids {
-                    idx.insert(vector_id);
-                }
+            let mut shard_guard = self.hot_shards[shard_idx].write();
+            let HotShard { vectors, index } = &mut *shard_guard;
+            for entry in entries {
+                vectors.insert(entry.vector_id, Arc::new(entry.vector));
+                let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+                    let vector = vectors.get(&id).unwrap_or_else(|| {
+                        panic!(
+                            "data integrity fault: catch-up hot shard missing id={id} shard={shard_idx}"
+                        )
+                    });
+                    sink(vector.as_slice());
+                };
+                index.insert_with_accessor(entry.vector_id, &accessor);
             }
         }
 
-        let vector_bytes = pending_catchup.iter().fold(0u64, |acc, e| {
-            acc.saturating_add(
-                (e.vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
-            )
-        });
         self.hot_vectors_bytes
-            .store(vector_bytes, AtomicOrdering::Relaxed);
+            .store(catchup_vector_bytes, AtomicOrdering::Relaxed);
         self.hnsw_graph_bytes.store(
-            (pending_catchup.len() as u64).saturating_mul(self.estimate_hnsw_bytes_per_vector()),
+            catchup_count.saturating_mul(self.estimate_hnsw_bytes_per_vector()),
             AtomicOrdering::Relaxed,
         );
 
@@ -3365,9 +3424,14 @@ fn search_index_with_dynamic_fallback(
     ef: usize,
     allow_set: Option<&BitmapSet>,
     flat_scan_hint: Option<FlatScanHint>,
+    accessor: Option<&(dyn Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync)>,
 ) -> Vec<(usize, f32)> {
     if allow_set.is_none() {
-        return index.search(query, k, ef);
+        return if let Some(accessor) = accessor {
+            index.search_with_accessor(query, k, ef, accessor)
+        } else {
+            index.search(query, k, ef)
+        };
     }
 
     let allow = allow_set.unwrap();
@@ -3391,11 +3455,15 @@ fn search_index_with_dynamic_fallback(
             && cardinality.saturating_mul(100)
                 <= graph_nodes.saturating_mul(FLAT_SCAN_SELECTIVITY_PERCENT));
     if selective {
-        return flat_scan_index_with_allow_set(index, query, k, allow, flat_scan_hint);
+        return flat_scan_index_with_allow_set(index, query, k, allow, flat_scan_hint, accessor);
     }
 
     // Stage A (strict): evaluate only allowed IDs.
-    let strict = index.search_filtered(query, k, ef.max(k), |id| allow.contains(id));
+    let strict = if let Some(accessor) = accessor {
+        index.search_filtered_with_accessor(query, k, ef.max(k), |id| allow.contains(id), accessor)
+    } else {
+        index.search_filtered(query, k, ef.max(k), |id| allow.contains(id))
+    };
     if strict.len() >= target_hits {
         return strict;
     }
@@ -3411,7 +3479,17 @@ fn search_index_with_dynamic_fallback(
     let mut best = strict;
     for mult in expansions {
         let expanded_ef = ef.max(k).saturating_mul(mult);
-        let expanded = index.search_filtered(query, k, expanded_ef, |id| allow.contains(id));
+        let expanded = if let Some(accessor) = accessor {
+            index.search_filtered_with_accessor(
+                query,
+                k,
+                expanded_ef,
+                |id| allow.contains(id),
+                accessor,
+            )
+        } else {
+            index.search_filtered(query, k, expanded_ef, |id| allow.contains(id))
+        };
         if expanded.len() > best.len() {
             best = expanded;
         }
@@ -3435,12 +3513,15 @@ fn search_index_with_dynamic_fallback(
         .min(node_cap);
     let route_ef = ef.max(overfetch_k).saturating_mul(2).min(8192);
 
-    let routed = index
-        .search(query, overfetch_k, route_ef)
-        .into_iter()
-        .filter(|(id, _)| allow.contains(*id))
-        .take(k)
-        .collect::<Vec<_>>();
+    let routed = (if let Some(accessor) = accessor {
+        index.search_with_accessor(query, overfetch_k, route_ef, accessor)
+    } else {
+        index.search(query, overfetch_k, route_ef)
+    })
+    .into_iter()
+    .filter(|(id, _)| allow.contains(*id))
+    .take(k)
+    .collect::<Vec<_>>();
 
     if routed.len() > best.len() {
         routed
@@ -3455,6 +3536,7 @@ fn flat_scan_index_with_allow_set(
     k: usize,
     allow: &BitmapSet,
     flat_scan_hint: Option<FlatScanHint>,
+    accessor: Option<&(dyn Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync)>,
 ) -> Vec<(usize, f32)> {
     if k == 0 {
         return Vec::new();
@@ -3493,7 +3575,12 @@ fn flat_scan_index_with_allow_set(
                 continue;
             }
         }
-        let Some(score) = index.score_for_id(query, id) else {
+        let maybe_score = if let Some(accessor) = accessor {
+            index.score_for_id_with_accessor(query, id, accessor)
+        } else {
+            index.score_for_id(query, id)
+        };
+        let Some(score) = maybe_score else {
             continue;
         };
         if heap.len() < k {
@@ -3603,40 +3690,10 @@ fn audit_worker_loop(state: Arc<ProductionState>, rx: Receiver<AuditEvent>) {
     }
 }
 
-fn make_hot_accessor(
-    hot_vectors: Arc<SccHashMap<usize, Arc<Vec<f32>>>>,
-    dim: usize,
-) -> impl Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static {
-    let expected_dim = dim;
-    move |id, sink| {
-        let found = hot_vectors
-            .read(&id, |_, v| {
-                sink(v.as_slice());
-            })
-            .is_some();
-        if !found {
-            panic!(
-                "data integrity fault: hot vector cache missing id={} (expected_dim={})",
-                id, expected_dim
-            );
-        }
-    }
-}
-
-fn for_each_hot_id<F>(map: &SccHashMap<usize, Arc<Vec<f32>>>, mut f: F)
-where
-    F: FnMut(usize),
-{
-    if let Some(mut entry) = map.first_entry() {
-        loop {
-            f(*entry.key());
-            if let Some(next) = entry.next() {
-                entry = next;
-            } else {
-                break;
-            }
-        }
-    }
+fn make_empty_hot_hnsw(m: usize, ef_construction: usize) -> HNSW {
+    HNSW::new_with_accessor(m, ef_construction, |id, _| {
+        panic!("data integrity fault: hot shard accessor was not provided for id={id}");
+    })
 }
 
 fn next_power_of_two_at_least_one(v: usize) -> usize {
@@ -3857,7 +3914,7 @@ mod tests {
         allow_set.insert(target_id);
 
         let results =
-            search_index_with_dynamic_fallback(&index, &query, 10, 1, Some(&allow_set), None);
+            search_index_with_dynamic_fallback(&index, &query, 10, 1, Some(&allow_set), None, None);
         assert!(!results.is_empty(), "expected at least one filtered hit");
         assert!(
             results.iter().all(|(id, _)| allow_set.contains(*id)),
