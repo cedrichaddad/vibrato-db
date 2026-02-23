@@ -996,8 +996,7 @@ impl ProductionState {
             .map(|bm| bm.cardinality() <= 5_000)
             .unwrap_or(false);
         let hot_shard_ef = effective_hot_shard_ef(request.k, request.ef, self.hot_shards.len());
-        let inline_hot_scan =
-            allow_bitmap.is_none() && request.ef <= 64 && self.hot_shards.len() <= 16;
+        let inline_hot_scan = allow_bitmap.is_none() && request.ef <= 64;
 
         if !matches!(request.search_tier, SearchTier::Archive) {
             let hot_results = if selective_allow || inline_hot_scan {
@@ -2307,31 +2306,35 @@ impl ProductionState {
             }
         }
 
-        // 1. Build shadow shard map/index pairs off-thread state.
-        let mut shadow_shards = Vec::with_capacity(shard_count);
-        for entries in pending_by_shard {
-            let mut vectors: FastIdMap<Arc<Vec<f32>>> = FastIdMap::default();
-            vectors.reserve(entries.len());
-            for entry in entries {
-                vectors.insert(entry.vector_id, Arc::new(entry.vector));
-            }
+        // 1. Build shadow shard map/index pairs in parallel.
+        let shadow_shards: Vec<HotShard> = self.query_pool.install(|| {
+            pending_by_shard
+                .into_par_iter()
+                .map(|entries| {
+                    let mut vectors: FastIdMap<Arc<Vec<f32>>> = FastIdMap::default();
+                    vectors.reserve(entries.len());
+                    for entry in entries {
+                        vectors.insert(entry.vector_id, Arc::new(entry.vector));
+                    }
 
-            let mut index =
-                make_empty_hot_hnsw(self.config.hnsw_m, self.config.hnsw_ef_construction);
-            let mut ids = vectors.keys().copied().collect::<Vec<_>>();
-            ids.sort_unstable();
-            for vector_id in ids {
-                let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                    let vector = vectors.get(&id).unwrap_or_else(|| {
-                        panic!("data integrity fault: rebuilding hot shard missing id={id}")
-                    });
-                    sink(vector.as_slice());
-                };
-                index.insert_with_accessor(vector_id, &accessor);
-            }
+                    let mut index =
+                        make_empty_hot_hnsw(self.config.hnsw_m, self.config.hnsw_ef_construction);
+                    let mut ids = vectors.keys().copied().collect::<Vec<_>>();
+                    ids.sort_unstable();
+                    for vector_id in ids {
+                        let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+                            let vector = vectors.get(&id).unwrap_or_else(|| {
+                                panic!("data integrity fault: rebuilding hot shard missing id={id}")
+                            });
+                            sink(vector.as_slice());
+                        };
+                        index.insert_with_accessor(vector_id, &accessor);
+                    }
 
-            shadow_shards.push(HotShard { vectors, index });
-        }
+                    HotShard { vectors, index }
+                })
+                .collect()
+        });
 
         // 2. Atomic shard swap (vectors+index move together per shard).
         for (idx, shadow) in shadow_shards.into_iter().enumerate() {
@@ -2363,9 +2366,10 @@ impl ProductionState {
             if entries.is_empty() {
                 continue;
             }
-            let mut shard_guard = self.hot_shards[shard_idx].write();
-            let HotShard { vectors, index } = &mut *shard_guard;
+            let shard_lock = &self.hot_shards[shard_idx];
             for entry in entries {
+                let mut shard_guard = shard_lock.write();
+                let HotShard { vectors, index } = &mut *shard_guard;
                 vectors.insert(entry.vector_id, Arc::new(entry.vector));
                 let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
                     let vector = vectors.get(&id).unwrap_or_else(|| {

@@ -133,8 +133,36 @@ impl QueryScratch {
     }
 }
 
+struct InsertScratch {
+    query: Vec<f32>,
+    search: SearchScratch,
+    layer_candidates: Vec<(usize, f32)>,
+    reverse_edges: Vec<(usize, usize, usize)>,
+    prune_ops: Vec<(usize, usize, Vec<usize>)>,
+    neighbor_vec: Vec<f32>,
+    all_neighbors: Vec<usize>,
+    neighbor_candidates: Vec<(usize, f32)>,
+}
+
+impl InsertScratch {
+    #[inline]
+    fn new(initial_ef: usize) -> Self {
+        Self {
+            query: Vec::with_capacity(64),
+            search: SearchScratch::new(initial_ef.max(1)),
+            layer_candidates: Vec::with_capacity(256),
+            reverse_edges: Vec::with_capacity(256),
+            prune_ops: Vec::with_capacity(128),
+            neighbor_vec: Vec::with_capacity(64),
+            all_neighbors: Vec::with_capacity(64),
+            neighbor_candidates: Vec::with_capacity(64),
+        }
+    }
+}
+
 thread_local! {
     static QUERY_SCRATCH: RefCell<QueryScratch> = RefCell::new(QueryScratch::new());
+    static INSERT_SCRATCH: RefCell<InsertScratch> = RefCell::new(InsertScratch::new(64));
 }
 
 /// HNSW Index
@@ -347,17 +375,6 @@ impl HNSW {
     }
 
     #[inline]
-    fn get_vector_owned_with_optional_accessor(
-        &self,
-        id: usize,
-        accessor: Option<VectorAccessorRef<'_>>,
-    ) -> Vec<f32> {
-        let mut out = Vec::new();
-        self.copy_vector_into_with_optional_accessor(id, &mut out, accessor);
-        out
-    }
-
-    #[inline]
     fn copy_vector_into_with_optional_accessor(
         &self,
         id: usize,
@@ -417,156 +434,176 @@ impl HNSW {
             return;
         }
 
-        let query = self.get_vector_owned_with_optional_accessor(id, accessor);
-        let node_layer = self.random_layer();
-        self.max_node_id = self.max_node_id.max(id);
+        INSERT_SCRATCH.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let InsertScratch {
+                query,
+                search,
+                layer_candidates,
+                reverse_edges,
+                prune_ops,
+                neighbor_vec,
+                all_neighbors,
+                neighbor_candidates,
+            } = &mut *slot;
 
-        // Create node
-        let mut node = Node::new(id, node_layer);
+            self.copy_vector_into_with_optional_accessor(id, query, accessor);
+            layer_candidates.clear();
+            reverse_edges.clear();
+            prune_ops.clear();
+            all_neighbors.clear();
+            neighbor_candidates.clear();
 
-        // First node becomes entry point
-        if self.entry_point.is_none() {
-            self.entry_point = Some(id);
-            self.max_layer = node_layer;
-            self.id_to_index.insert(id, 0); // First node always at index 0
-            self.nodes.push(node);
-            return;
-        }
+            let node_layer = self.random_layer();
+            self.max_node_id = self.max_node_id.max(id);
 
-        let entry_point = self.entry_point.unwrap();
-        let mut current_node = entry_point;
-        let mut visited = VisitedGuard::new(self.max_node_id);
-        let mut scratch = SearchScratch::new(self.ef_construction.max(1));
-        let mut layer_candidates: Vec<(usize, f32)> = Vec::new();
+            // Create node
+            let mut node = Node::new(id, node_layer);
 
-        // Phase 1: Zoom in from top layer to node_layer + 1
-        // Greedy search, single best neighbor per layer
-        for layer in (node_layer + 1..=self.max_layer).rev() {
-            self.search_layer_into_with_accessor(
-                &query,
-                &[current_node],
-                1,
-                layer,
-                &mut visited,
-                &mut scratch,
-                &mut layer_candidates,
-                accessor,
-            );
-            if let Some((nearest_id, _)) = layer_candidates.first() {
-                current_node = *nearest_id;
+            // First node becomes entry point
+            if self.entry_point.is_none() {
+                self.entry_point = Some(id);
+                self.max_layer = node_layer;
+                self.id_to_index.insert(id, 0); // First node always at index 0
+                self.nodes.push(node);
+                return;
             }
-        }
 
-        // Phase 2: Insert at layers from min(node_layer, max_layer) down to 0
-        // We collect all the updates needed, then apply them
-        let start_layer = node_layer.min(self.max_layer);
+            let entry_point = self.entry_point.unwrap();
+            let mut current_node = entry_point;
+            let mut visited = VisitedGuard::new(self.max_node_id);
 
-        // Collect updates to apply: (node_index, layer, neighbor_id_to_add)
-        let mut reverse_edges: Vec<(usize, usize, usize)> = Vec::new();
-        // Collect pruning operations: (node_index, layer, new_neighbors)
-        let mut prune_ops: Vec<(usize, usize, Vec<usize>)> = Vec::new();
-
-        for layer in (0..=start_layer).rev() {
-            let m_layer = if layer == 0 { self.m0 } else { self.m };
-            let mut neighbor_vec_scratch = Vec::new();
-
-            // Find candidates for this layer
-            self.search_layer_into_with_accessor(
-                &query,
-                &[current_node],
-                self.ef_construction,
-                layer,
-                &mut visited,
-                &mut scratch,
-                &mut layer_candidates,
-                accessor,
-            );
-
-            // Select neighbors using the heuristic
-            let neighbors =
-                self.select_neighbors_with_accessor(&query, &layer_candidates, m_layer, accessor);
-
-            // Add forward edges to new node
-            for &(neighbor_id, _) in &neighbors {
-                // `select_neighbors` returns unique IDs, so this is duplicate-safe.
-                node.add_neighbor_unchecked(layer, neighbor_id);
-
-                // Find the node index for this neighbor using O(1) HashMap
-                if let Some(node_idx) = self.get_node_index(neighbor_id) {
-                    reverse_edges.push((node_idx, layer, id));
-
-                    // Check if pruning will be needed
-                    let current_neighbors = self.nodes[node_idx].neighbors(layer);
-                    if current_neighbors.len() >= m_layer {
-                        // Will need pruning after adding new edge
-                        let mut all_neighbors: Vec<usize> = current_neighbors.to_vec();
-                        all_neighbors.push(id);
-
-                        // Compute distances and select.
-                        let mut neighbor_candidates: Vec<(usize, f32)> =
-                            Vec::with_capacity(all_neighbors.len());
-                        self.copy_vector_into_with_optional_accessor(
-                            neighbor_id,
-                            &mut neighbor_vec_scratch,
-                            accessor,
-                        );
-                        for &n in &all_neighbors {
-                            let mut dist = 0.0f32;
-                            self.with_vector_from(n, accessor, &mut |v| {
-                                dist = -dot_product(neighbor_vec_scratch.as_slice(), v);
-                            });
-                            neighbor_candidates.push((n, dist));
-                        }
-
-                        let pruned = self.select_neighbors_with_accessor(
-                            &[],
-                            &neighbor_candidates,
-                            m_layer,
-                            accessor,
-                        );
-                        let pruned_ids: Vec<usize> = pruned.iter().map(|(id, _)| *id).collect();
-                        prune_ops.push((node_idx, layer, pruned_ids));
-                    }
+            // Phase 1: Zoom in from top layer to node_layer + 1
+            // Greedy search, single best neighbor per layer
+            for layer in (node_layer + 1..=self.max_layer).rev() {
+                self.search_layer_into_with_accessor(
+                    query.as_slice(),
+                    &[current_node],
+                    1,
+                    layer,
+                    &mut visited,
+                    search,
+                    layer_candidates,
+                    accessor,
+                );
+                if let Some((nearest_id, _)) = layer_candidates.first() {
+                    current_node = *nearest_id;
                 }
             }
 
-            // Use first candidate as entry for next layer
-            if let Some((first_id, _)) = layer_candidates.first() {
-                current_node = *first_id;
+            // Phase 2: Insert at layers from min(node_layer, max_layer) down to 0
+            // We collect all the updates needed, then apply them.
+            let start_layer = node_layer.min(self.max_layer);
+
+            for layer in (0..=start_layer).rev() {
+                let m_layer = if layer == 0 { self.m0 } else { self.m };
+
+                // Find candidates for this layer.
+                self.search_layer_into_with_accessor(
+                    query.as_slice(),
+                    &[current_node],
+                    self.ef_construction,
+                    layer,
+                    &mut visited,
+                    search,
+                    layer_candidates,
+                    accessor,
+                );
+
+                // Select neighbors using the heuristic.
+                let neighbors = self.select_neighbors_with_accessor(
+                    query.as_slice(),
+                    layer_candidates,
+                    m_layer,
+                    accessor,
+                );
+
+                // Add forward edges to new node.
+                for &(neighbor_id, _) in &neighbors {
+                    // `select_neighbors` returns unique IDs, so this is duplicate-safe.
+                    node.add_neighbor_unchecked(layer, neighbor_id);
+
+                    // Find the node index for this neighbor using O(1) HashMap.
+                    if let Some(node_idx) = self.get_node_index(neighbor_id) {
+                        reverse_edges.push((node_idx, layer, id));
+
+                        // Check if pruning will be needed.
+                        let current_neighbors = self.nodes[node_idx].neighbors(layer);
+                        if current_neighbors.len() >= m_layer {
+                            // Will need pruning after adding new edge.
+                            all_neighbors.clear();
+                            all_neighbors.extend_from_slice(current_neighbors);
+                            all_neighbors.push(id);
+
+                            // Compute distances and select.
+                            neighbor_candidates.clear();
+                            if neighbor_candidates.capacity() < all_neighbors.len() {
+                                neighbor_candidates
+                                    .reserve(all_neighbors.len() - neighbor_candidates.capacity());
+                            }
+                            self.copy_vector_into_with_optional_accessor(
+                                neighbor_id,
+                                neighbor_vec,
+                                accessor,
+                            );
+                            for &n in all_neighbors.iter() {
+                                let mut dist = 0.0f32;
+                                self.with_vector_from(n, accessor, &mut |v| {
+                                    dist = -dot_product(neighbor_vec.as_slice(), v);
+                                });
+                                neighbor_candidates.push((n, dist));
+                            }
+
+                            let pruned = self.select_neighbors_with_accessor(
+                                &[],
+                                neighbor_candidates,
+                                m_layer,
+                                accessor,
+                            );
+                            let pruned_ids: Vec<usize> = pruned.iter().map(|(id, _)| *id).collect();
+                            prune_ops.push((node_idx, layer, pruned_ids));
+                        }
+                    }
+                }
+
+                // Use first candidate as entry for next layer.
+                if let Some((first_id, _)) = layer_candidates.first() {
+                    current_node = *first_id;
+                }
             }
-        }
 
-        // Apply reverse edges (avoiding those that will be overwritten by pruning)
-        let prune_targets: FxHashSet<(usize, usize)> = prune_ops
-            .iter()
-            .map(|(idx, layer, _)| (*idx, *layer))
-            .collect();
+            // Apply reverse edges (avoiding those that will be overwritten by pruning).
+            let prune_targets: FxHashSet<(usize, usize)> = prune_ops
+                .iter()
+                .map(|(idx, layer, _)| (*idx, *layer))
+                .collect();
 
-        for (node_idx, layer, neighbor_id) in reverse_edges {
-            if !prune_targets.contains(&(node_idx, layer)) {
-                // New node ID was not present before this insert, so edge is unique.
-                self.nodes[node_idx].add_neighbor_unchecked(layer, neighbor_id);
+            for &(node_idx, layer, neighbor_id) in reverse_edges.iter() {
+                if !prune_targets.contains(&(node_idx, layer)) {
+                    // New node ID was not present before this insert, so edge is unique.
+                    self.nodes[node_idx].add_neighbor_unchecked(layer, neighbor_id);
+                }
             }
-        }
 
-        // Apply pruning operations
-        for (node_idx, layer, new_neighbors) in prune_ops {
-            if let Some(layer_neighbors) = self.nodes[node_idx].neighbors_mut(layer) {
-                layer_neighbors.clear();
-                layer_neighbors.extend(new_neighbors);
+            // Apply pruning operations.
+            for (node_idx, layer, new_neighbors) in prune_ops.iter() {
+                if let Some(layer_neighbors) = self.nodes[*node_idx].neighbors_mut(*layer) {
+                    layer_neighbors.clear();
+                    layer_neighbors.extend(new_neighbors.iter().copied());
+                }
             }
-        }
 
-        // Update entry point if new node has higher layer
-        if node_layer > self.max_layer {
-            self.max_layer = node_layer;
-            self.entry_point = Some(id);
-        }
+            // Update entry point if new node has higher layer.
+            if node_layer > self.max_layer {
+                self.max_layer = node_layer;
+                self.entry_point = Some(id);
+            }
 
-        // Add to id_to_index map before pushing
-        let node_idx = self.nodes.len();
-        self.id_to_index.insert(id, node_idx);
-        self.nodes.push(node);
+            // Add to id_to_index map before pushing.
+            let node_idx = self.nodes.len();
+            self.id_to_index.insert(id, node_idx);
+            self.nodes.push(node);
+        });
     }
 
     /// Search for nearest neighbors on a single layer
