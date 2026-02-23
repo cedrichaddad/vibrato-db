@@ -23,10 +23,9 @@ struct AckRecord {
     vector_id: usize,
     idempotency_key: String,
     vector: Vec<f32>,
-    source_file: String,
-    start_time_ms: u32,
-    duration_ms: u16,
-    bpm: f32,
+    entity_id: u64,
+    sequence_ts: u64,
+    payload_base64: String,
     tags: Vec<String>,
 }
 
@@ -34,10 +33,9 @@ struct AckRecord {
 struct ReplayRecord {
     idempotency_key: String,
     vector: Vec<f32>,
-    source_file: String,
-    start_time_ms: u32,
-    duration_ms: u16,
-    bpm: f32,
+    entity_id: u64,
+    sequence_ts: u64,
+    payload_base64: String,
     tags: Vec<String>,
 }
 
@@ -69,6 +67,20 @@ struct IngestBatchResult {
     created: bool,
 }
 
+fn metadata_json(
+    entity_id: u64,
+    sequence_ts: u64,
+    tags: &[String],
+    payload_base64: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "entity_id": entity_id,
+        "sequence_ts": sequence_ts,
+        "tags": tags,
+        "payload_base64": payload_base64
+    })
+}
+
 fn reserve_local_port() -> Option<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
     let port = listener.local_addr().ok()?.port();
@@ -78,7 +90,7 @@ fn reserve_local_port() -> Option<u16> {
 
 async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
-    cmd.arg("serve-v2")
+    cmd.arg("serve-v3")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--collection")
@@ -102,7 +114,7 @@ async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
 
 async fn wait_for_ready(base_url: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let ready_url = format!("{}/v2/health/ready", base_url);
+    let ready_url = format!("{}/v3/health/ready", base_url);
     for _ in 0..200 {
         if let Ok(resp) = client.get(&ready_url).send().await {
             if resp.status() == StatusCode::OK {
@@ -170,26 +182,19 @@ async fn ingest_one(
     idx: usize,
 ) -> Option<AckRecord> {
     let vector = normalized_vector(seed, idx);
-    let source_file = format!("seed{seed}_sample_{idx}.wav");
-    let start_time_ms = (idx as u32).saturating_mul(10);
-    let duration_ms = 50u16;
-    let bpm = 90.0 + ((idx % 80) as f32 * 0.5);
+    let entity_id = (seed << 32) | (idx as u64);
+    let sequence_ts = (idx as u64).saturating_mul(10);
+    let payload_base64 = String::new();
     let tags = vec!["drums".to_string(), format!("seed-{seed}")];
     let idempotency_key = format!("seed-{seed}-vec-{idx}");
     let body = serde_json::json!({
         "vector": vector,
-        "metadata": {
-            "source_file": source_file,
-            "start_time_ms": start_time_ms,
-            "duration_ms": duration_ms,
-            "bpm": bpm,
-            "tags": tags
-        },
+        "metadata": metadata_json(entity_id, sequence_ts, &tags, &payload_base64),
         "idempotency_key": idempotency_key
     });
 
     let resp = client
-        .post(format!("{}/v2/vectors", base_url))
+        .post(format!("{}/v3/vectors", base_url))
         .bearer_auth(token)
         .json(&body)
         .send()
@@ -212,10 +217,9 @@ async fn ingest_one(
             vector_id,
             idempotency_key: format!("seed-{seed}-vec-{idx}"),
             vector,
-            source_file: format!("seed{seed}_sample_{idx}.wav"),
-            start_time_ms,
-            duration_ms,
-            bpm,
+            entity_id,
+            sequence_ts,
+            payload_base64,
             tags: vec!["drums".to_string(), format!("seed-{seed}")],
         });
     }
@@ -223,10 +227,9 @@ async fn ingest_one(
         vector_id,
         idempotency_key: format!("seed-{seed}-vec-{idx}"),
         vector,
-        source_file: format!("seed{seed}_sample_{idx}.wav"),
-        start_time_ms,
-        duration_ms,
-        bpm,
+        entity_id,
+        sequence_ts,
+        payload_base64,
         tags: vec!["drums".to_string(), format!("seed-{seed}")],
     })
 }
@@ -245,10 +248,9 @@ async fn ingest_batch(
     for i in 0..count {
         let idx = start_idx + i;
         let vector = normalized_vector(seed ^ ((worker_id as u64) << 32), idx);
-        let source_file = format!("jepsen_seed{seed}_w{worker_id}_{idx}.wav");
-        let start_time_ms = idx as u32;
-        let duration_ms = 48u16;
-        let bpm = 95.0 + ((idx % 100) as f32) * 0.25;
+        let entity_id = (seed << 32) | ((worker_id as u64) << 24) | (idx as u64);
+        let sequence_ts = idx as u64;
+        let payload_base64 = String::new();
         let tags = vec![
             "drums".to_string(),
             "crash".to_string(),
@@ -257,22 +259,15 @@ async fn ingest_batch(
         let idempotency_key = format!("jepsen-{seed}-{worker_id}-{idx}");
         requests.push(IngestRequest {
             vector: vector.clone(),
-            metadata: serde_json::json!({
-                "source_file": source_file,
-                "start_time_ms": start_time_ms,
-                "duration_ms": duration_ms,
-                "bpm": bpm,
-                "tags": tags
-            }),
+            metadata: metadata_json(entity_id, sequence_ts, &tags, &payload_base64),
             idempotency_key: Some(idempotency_key.clone()),
         });
         template.push(ReplayRecord {
             idempotency_key,
             vector,
-            source_file: format!("jepsen_seed{seed}_w{worker_id}_{idx}.wav"),
-            start_time_ms,
-            duration_ms,
-            bpm,
+            entity_id,
+            sequence_ts,
+            payload_base64,
             tags: vec![
                 "drums".to_string(),
                 "crash".to_string(),
@@ -283,7 +278,7 @@ async fn ingest_batch(
 
     let payload = IngestBatchRequest { vectors: requests };
     let response = match client
-        .post(format!("{}/v2/vectors/batch", base_url))
+        .post(format!("{}/v3/vectors/batch", base_url))
         .bearer_auth(token)
         .json(&payload)
         .send()
@@ -312,10 +307,9 @@ async fn ingest_batch(
             vector_id: result.id,
             idempotency_key: rec.idempotency_key.clone(),
             vector: rec.vector.clone(),
-            source_file: rec.source_file.clone(),
-            start_time_ms: rec.start_time_ms,
-            duration_ms: rec.duration_ms,
-            bpm: rec.bpm,
+            entity_id: rec.entity_id,
+            sequence_ts: rec.sequence_ts,
+            payload_base64: rec.payload_base64.clone(),
             tags: rec.tags.clone(),
         });
     }
@@ -339,17 +333,11 @@ async fn verify_ack_records(
     for rec in records {
         let body = serde_json::json!({
             "vector": rec.vector,
-            "metadata": {
-                "source_file": rec.source_file,
-                "start_time_ms": rec.start_time_ms,
-                "duration_ms": rec.duration_ms,
-                "bpm": rec.bpm,
-                "tags": rec.tags
-            },
+            "metadata": metadata_json(rec.entity_id, rec.sequence_ts, &rec.tags, &rec.payload_base64),
             "idempotency_key": rec.idempotency_key
         });
         let resp = client
-            .post(format!("{}/v2/vectors", base_url))
+            .post(format!("{}/v3/vectors", base_url))
             .bearer_auth(token)
             .json(&body)
             .send()
@@ -388,18 +376,12 @@ async fn replay_attempted_records(
     for rec in records {
         let body = serde_json::json!({
             "vector": rec.vector,
-            "metadata": {
-                "source_file": rec.source_file,
-                "start_time_ms": rec.start_time_ms,
-                "duration_ms": rec.duration_ms,
-                "bpm": rec.bpm,
-                "tags": rec.tags
-            },
+            "metadata": metadata_json(rec.entity_id, rec.sequence_ts, &rec.tags, &rec.payload_base64),
             "idempotency_key": rec.idempotency_key
         });
 
         let resp = client
-            .post(format!("{}/v2/vectors", base_url))
+            .post(format!("{}/v3/vectors", base_url))
             .bearer_auth(token)
             .json(&body)
             .send()
@@ -432,18 +414,13 @@ fn verify_metadata_integrity(data_dir: &Path, records: &[AckRecord]) -> anyhow::
             .get(&rec.vector_id)
             .ok_or_else(|| anyhow::anyhow!("metadata missing for vector_id {}", rec.vector_id))?;
         anyhow::ensure!(
-            meta.source_file == rec.source_file,
-            "metadata source_file mismatch for {}",
+            meta.entity_id == rec.entity_id,
+            "metadata entity_id mismatch for {}",
             rec.idempotency_key
         );
         anyhow::ensure!(
-            meta.start_time_ms == rec.start_time_ms,
-            "metadata start_time mismatch for {}",
-            rec.idempotency_key
-        );
-        anyhow::ensure!(
-            meta.duration_ms == rec.duration_ms,
-            "metadata duration mismatch for {}",
+            meta.sequence_ts == rec.sequence_ts,
+            "metadata sequence_ts mismatch for {}",
             rec.idempotency_key
         );
     }
@@ -503,7 +480,7 @@ async fn run_seed(seed: u64) -> anyhow::Result<()> {
                 }
                 next_idx += 1;
             }
-            let cp = admin_post(&client, &base_url, &token, "v2/admin/checkpoint");
+            let cp = admin_post(&client, &base_url, &token, "v3/admin/checkpoint");
             let jitter_ms = 5 + (rng.gen::<u64>() % 40);
             tokio::pin!(cp);
             tokio::select! {
@@ -524,9 +501,9 @@ async fn run_seed(seed: u64) -> anyhow::Result<()> {
                     }
                     next_idx += 1;
                 }
-                admin_post(&client, &base_url, &token, "v2/admin/checkpoint").await;
+                admin_post(&client, &base_url, &token, "v3/admin/checkpoint").await;
             }
-            let compact = admin_post(&client, &base_url, &token, "v2/admin/compact");
+            let compact = admin_post(&client, &base_url, &token, "v3/admin/compact");
             let jitter_ms = 5 + (rng.gen::<u64>() % 50);
             tokio::pin!(compact);
             tokio::select! {
@@ -680,7 +657,7 @@ async fn run_jepsen_seed(seed: u64) -> anyhow::Result<()> {
     verify_metadata_integrity(&data_dir, &verify_records)?;
 
     let stats_before_replay_resp = client
-        .get(format!("{}/v2/admin/stats", restart_url))
+        .get(format!("{}/v3/admin/stats", restart_url))
         .bearer_auth(&token)
         .send()
         .await?;
@@ -723,7 +700,7 @@ async fn run_jepsen_seed(seed: u64) -> anyhow::Result<()> {
     );
 
     let stats_after_replay_resp = client
-        .get(format!("{}/v2/admin/stats", restart_url))
+        .get(format!("{}/v3/admin/stats", restart_url))
         .bearer_auth(&token)
         .send()
         .await?;

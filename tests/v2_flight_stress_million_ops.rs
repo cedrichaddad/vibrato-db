@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::types::Float32Type;
 use arrow_array::{
-    FixedSizeListArray, Float32Array, RecordBatch, StringArray, UInt16Array, UInt32Array,
+    BinaryArray, FixedSizeListArray, RecordBatch, StringArray, UInt64Array,
 };
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::FlightClient;
@@ -45,10 +45,9 @@ const QUERY_EF: usize = 24;
 #[derive(Clone)]
 struct FlightWriteRequest {
     vector: Vec<f32>,
-    source_file: String,
-    start_time_ms: u32,
-    duration_ms: u16,
-    bpm: f32,
+    entity_id: u64,
+    sequence_ts: u64,
+    payload: Vec<u8>,
     idempotency_key: Option<String>,
 }
 
@@ -76,7 +75,7 @@ fn reserve_local_port() -> Option<u16> {
 
 async fn start_server(data_dir: &Path, http_port: u16, flight_port: u16) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
-    cmd.arg("serve-v2")
+    cmd.arg("serve-v3")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--collection")
@@ -106,7 +105,7 @@ async fn wait_for_ready_with_child(
     token: &str,
 ) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let ready_url = format!("{}/v2/health/ready", base_url);
+    let ready_url = format!("{}/v3/health/ready", base_url);
     for _ in 0..900 {
         if let Ok(Some(status)) = child.try_wait() {
             let mut stderr_text = String::new();
@@ -318,21 +317,24 @@ fn build_flight_batch(buffer: &[FlightWriteRequest]) -> RecordBatch {
             .map(|row| Some(row.vector.iter().copied().map(Some).collect::<Vec<_>>())),
         DIM as i32,
     );
-    let source_file = StringArray::from(
+    let entity_id = UInt64Array::from(
         buffer
             .iter()
-            .map(|row| Some(row.source_file.as_str()))
+            .map(|row| row.entity_id)
             .collect::<Vec<_>>(),
     );
-    let start_time_ms = UInt32Array::from(
+    let sequence_ts = UInt64Array::from(
         buffer
             .iter()
-            .map(|row| row.start_time_ms)
+            .map(|row| row.sequence_ts)
             .collect::<Vec<_>>(),
     );
-    let duration_ms =
-        UInt16Array::from(buffer.iter().map(|row| row.duration_ms).collect::<Vec<_>>());
-    let bpm = Float32Array::from(buffer.iter().map(|row| row.bpm).collect::<Vec<_>>());
+    let payload = BinaryArray::from_iter_values(
+        buffer
+            .iter()
+            .map(|row| row.payload.as_slice())
+            .collect::<Vec<_>>(),
+    );
     let idempotency_key = StringArray::from(
         buffer
             .iter()
@@ -349,10 +351,9 @@ fn build_flight_batch(buffer: &[FlightWriteRequest]) -> RecordBatch {
             ),
             false,
         ),
-        Field::new("source_file", DataType::Utf8, true),
-        Field::new("start_time_ms", DataType::UInt32, true),
-        Field::new("duration_ms", DataType::UInt16, true),
-        Field::new("bpm", DataType::Float32, true),
+        Field::new("entity_id", DataType::UInt64, false),
+        Field::new("sequence_ts", DataType::UInt64, false),
+        Field::new("payload", DataType::Binary, false),
         Field::new("idempotency_key", DataType::Utf8, true),
     ]));
 
@@ -360,10 +361,9 @@ fn build_flight_batch(buffer: &[FlightWriteRequest]) -> RecordBatch {
         schema,
         vec![
             Arc::new(vectors),
-            Arc::new(source_file),
-            Arc::new(start_time_ms),
-            Arc::new(duration_ms),
-            Arc::new(bpm),
+            Arc::new(entity_id),
+            Arc::new(sequence_ts),
+            Arc::new(payload),
             Arc::new(idempotency_key),
         ],
     )
@@ -558,16 +558,15 @@ async fn stress_test_million_ops_flight_mixed() {
         let body = serde_json::json!({
             "vector": vector,
             "metadata": {
-                "source_file": format!("warmup_{i}.wav"),
-                "start_time_ms": i * 10,
-                "duration_ms": 80,
-                "bpm": 120.0,
-                "tags": ["flight-stress", "warmup"]
+                "entity_id": i as u64,
+                "sequence_ts": (i * 10) as u64,
+                "tags": ["flight-stress", "warmup"],
+                "payload_base64": ""
             },
             "idempotency_key": format!("flight-warmup-{i}")
         });
         let resp = client
-            .post(format!("{}/v2/vectors", base_url))
+            .post(format!("{}/v3/vectors", base_url))
             .bearer_auth(&token)
             .timeout(http_timeout)
             .json(&body)
@@ -653,7 +652,7 @@ async fn stress_test_million_ops_flight_mixed() {
                         "search_tier": "active"
                     });
                     match client
-                        .post(format!("{}/v2/query", base_url))
+                        .post(format!("{}/v3/query", base_url))
                         .bearer_auth(&token)
                         .timeout(http_timeout)
                         .json(&body)
@@ -692,10 +691,10 @@ async fn stress_test_million_ops_flight_mixed() {
                     let vector = normalized_vector(seed, worker_id, local_idx + 1_000_000);
                     buffered_writes.push(FlightWriteRequest {
                         vector,
-                        source_file: format!("flight_stress_w{worker_id}_o{local_idx}.wav"),
-                        start_time_ms: local_idx as u32,
-                        duration_ms: 64,
-                        bpm: 100.0 + ((local_idx % 64) as f32),
+                        entity_id: ((worker_id as u64) << 32) | local_idx as u64,
+                        sequence_ts: local_idx as u64,
+                        payload: format!("flight_stress_w{worker_id}_o{local_idx}.wav")
+                            .into_bytes(),
                         idempotency_key: Some(format!("flight-{seed}-{worker_id}-{local_idx}")),
                     });
                     local_idx += 1;
@@ -754,9 +753,9 @@ async fn stress_test_million_ops_flight_mixed() {
                     }
 
                     let admin_path = if rng.gen::<u8>() % 10 < 9 {
-                        "/v2/admin/compact"
+                        "/v3/admin/compact"
                     } else {
-                        "/v2/admin/checkpoint"
+                        "/v3/admin/checkpoint"
                     };
                     let admin_resp = tokio::time::timeout(
                         http_timeout,
@@ -846,7 +845,7 @@ async fn stress_test_million_ops_flight_mixed() {
     }
 
     let ready = client
-        .get(format!("{}/v2/health/ready", base_url))
+        .get(format!("{}/v3/health/ready", base_url))
         .bearer_auth(&token)
         .send()
         .await
@@ -858,7 +857,7 @@ async fn stress_test_million_ops_flight_mixed() {
     );
 
     let stats_resp = client
-        .get(format!("{}/v2/admin/stats", base_url))
+        .get(format!("{}/v3/admin/stats", base_url))
         .bearer_auth(&token)
         .send()
         .await
@@ -914,7 +913,7 @@ async fn stress_test_million_ops_flight_mixed() {
                 "search_tier": if enable_admin_chaos { "all" } else { "active" }
             });
             let resp = client
-                .post(format!("{}/v2/query", base_url))
+                .post(format!("{}/v3/query", base_url))
                 .bearer_auth(&token)
                 .json(&body)
                 .send()

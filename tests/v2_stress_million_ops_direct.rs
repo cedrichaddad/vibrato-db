@@ -8,9 +8,10 @@ use parking_lot::{Mutex, RwLock};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tempfile::tempdir;
-use vibrato_core::metadata::VectorMetadata;
 use vibrato_db::prod::model::{QueryRequestV2, SearchTier};
-use vibrato_db::prod::{bootstrap_data_dirs, ProductionConfig, ProductionState, SqliteCatalog};
+use vibrato_db::prod::{
+    bootstrap_data_dirs, IngestMetadataV3Input, ProductionConfig, ProductionState, SqliteCatalog,
+};
 
 const DIM: usize = 16;
 const DEFAULT_TOTAL_OPS: usize = 1_000_000;
@@ -21,6 +22,15 @@ const QUERY_BANK_CAP: usize = 4096;
 const BATCH_SIZE: usize = 100;
 const VERIFY_SAMPLE_CAP: usize = 1024;
 const WARMUP_VECTORS: usize = 128;
+
+fn ingest_meta(entity_id: u64, sequence_ts: u64, payload: &str, tags: Vec<String>) -> IngestMetadataV3Input {
+    IngestMetadataV3Input {
+        entity_id,
+        sequence_ts,
+        tags,
+        payload: payload.as_bytes().to_vec(),
+    }
+}
 
 fn normalized_vector(seed: u64, worker_id: usize, op_idx: usize) -> Vec<f32> {
     let stream_seed =
@@ -70,7 +80,7 @@ fn record_failure(first_error: &Mutex<Option<String>>, stop: &AtomicBool, msg: S
 
 fn flush_write_buffer_direct(
     state: &Arc<ProductionState>,
-    buffer: &mut Vec<(Vec<f32>, VectorMetadata, Option<String>)>,
+    buffer: &mut Vec<(Vec<f32>, IngestMetadataV3Input, Option<String>)>,
     query_bank: &Arc<RwLock<Vec<Vec<f32>>>>,
     verification_samples: &Arc<Mutex<Vec<(usize, Vec<f32>)>>>,
     max_seen_id: &Arc<AtomicUsize>,
@@ -158,13 +168,12 @@ fn stress_test_million_ops_direct_engine() {
     let query_bank = Arc::new(RwLock::new(Vec::<Vec<f32>>::new()));
     for i in 0..WARMUP_VECTORS {
         let vector = normalized_vector(seed ^ 0xA5A5_5A5A, 0, i);
-        let metadata = VectorMetadata {
-            source_file: format!("warmup_{i}.wav"),
-            start_time_ms: (i * 10) as u32,
-            duration_ms: 80,
-            bpm: 120.0,
-            tags: vec!["stress".to_string(), "warmup".to_string()],
-        };
+        let metadata = ingest_meta(
+            i as u64,
+            (i * 10) as u64,
+            &format!("warmup_{i}.wav"),
+            vec!["stress".to_string(), "warmup".to_string()],
+        );
         state
             .ingest_vector(&vector, &metadata, Some(&format!("direct-warmup-{i}")))
             .expect("warmup ingest");
@@ -243,13 +252,12 @@ fn stress_test_million_ops_direct_engine() {
                         local_idx += 1;
                     } else if op_roll < write_threshold {
                         let vector = normalized_vector(seed, worker_id, local_idx + 1_000_000);
-                        let metadata = VectorMetadata {
-                            source_file: format!("stress_w{worker_id}_o{local_idx}.wav"),
-                            start_time_ms: local_idx as u32,
-                            duration_ms: 64,
-                            bpm: 100.0 + ((local_idx % 64) as f32),
-                            tags: vec!["stress".to_string(), format!("worker-{worker_id}")],
-                        };
+                        let metadata = ingest_meta(
+                            ((worker_id as u64) << 32) | (local_idx as u64),
+                            local_idx as u64,
+                            &format!("stress_w{worker_id}_o{local_idx}.wav"),
+                            vec!["stress".to_string(), format!("worker-{worker_id}")],
+                        );
                         buffered_writes.push((
                             vector,
                             metadata,

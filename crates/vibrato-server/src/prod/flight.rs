@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -208,18 +209,18 @@ fn parse_flight_batch_columns<'a>(
     })
 }
 
-fn extract_dict_tags<K: ArrowDictionaryKeyType>(
+fn extract_dict_tags<K: ArrowDictionaryKeyType, F: FnMut(&str) -> std::result::Result<(), Status>>(
     dict: &DictionaryArray<K>,
     start: usize,
     end: usize,
-) -> std::result::Result<Vec<String>, Status> {
+    visit: &mut F,
+) -> std::result::Result<(), Status> {
     let values = dict
         .values()
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| Status::invalid_argument("tags dictionary values must be Utf8"))?;
     let keys = dict.keys();
-    let mut out = Vec::with_capacity(end.saturating_sub(start));
     for idx in start..end {
         if keys.is_null(idx) {
             continue;
@@ -228,63 +229,66 @@ fn extract_dict_tags<K: ArrowDictionaryKeyType>(
         if value_idx >= values.len() || values.is_null(value_idx) {
             continue;
         }
-        out.push(values.value(value_idx).to_string());
+        visit(values.value(value_idx))?;
     }
-    Ok(out)
+    Ok(())
 }
 
-fn extract_row_tags(list: &ListArray, row: usize) -> std::result::Result<Vec<String>, Status> {
+fn visit_row_tags<F: FnMut(&str) -> std::result::Result<(), Status>>(
+    list: &ListArray,
+    row: usize,
+    visit: &mut F,
+) -> std::result::Result<(), Status> {
     if list.is_null(row) {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let offsets = list.value_offsets();
     let start = offsets[row] as usize;
     let end = offsets[row + 1] as usize;
     let values = list.values();
     if let Some(strings) = values.as_any().downcast_ref::<StringArray>() {
-        let mut out = Vec::with_capacity(end.saturating_sub(start));
         for idx in start..end {
             if !strings.is_null(idx) {
-                out.push(strings.value(idx).to_string());
+                visit(strings.value(idx))?;
             }
         }
-        return Ok(out);
+        return Ok(());
     }
 
     match values.data_type() {
         DataType::Dictionary(_, _) => {
             if let Some(dict) = values.as_any().downcast_ref::<DictionaryArray<Int8Type>>() {
-                return extract_dict_tags(dict, start, end);
+                return extract_dict_tags(dict, start, end, visit);
             }
             if let Some(dict) = values.as_any().downcast_ref::<DictionaryArray<Int16Type>>() {
-                return extract_dict_tags(dict, start, end);
+                return extract_dict_tags(dict, start, end, visit);
             }
             if let Some(dict) = values.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
-                return extract_dict_tags(dict, start, end);
+                return extract_dict_tags(dict, start, end, visit);
             }
             if let Some(dict) = values.as_any().downcast_ref::<DictionaryArray<Int64Type>>() {
-                return extract_dict_tags(dict, start, end);
+                return extract_dict_tags(dict, start, end, visit);
             }
             if let Some(dict) = values.as_any().downcast_ref::<DictionaryArray<UInt8Type>>() {
-                return extract_dict_tags(dict, start, end);
+                return extract_dict_tags(dict, start, end, visit);
             }
             if let Some(dict) = values
                 .as_any()
                 .downcast_ref::<DictionaryArray<UInt16Type>>()
             {
-                return extract_dict_tags(dict, start, end);
+                return extract_dict_tags(dict, start, end, visit);
             }
             if let Some(dict) = values
                 .as_any()
                 .downcast_ref::<DictionaryArray<UInt32Type>>()
             {
-                return extract_dict_tags(dict, start, end);
+                return extract_dict_tags(dict, start, end, visit);
             }
             if let Some(dict) = values
                 .as_any()
                 .downcast_ref::<DictionaryArray<UInt64Type>>()
             {
-                return extract_dict_tags(dict, start, end);
+                return extract_dict_tags(dict, start, end, visit);
             }
             Err(Status::invalid_argument(
                 "unsupported dictionary key type for tags List<Dictionary<*, Utf8>>",
@@ -296,42 +300,85 @@ fn extract_row_tags(list: &ListArray, row: usize) -> std::result::Result<Vec<Str
     }
 }
 
-fn normalize_and_validate_tags(
-    mut tags: Vec<String>,
-    max_tags: usize,
+#[derive(Clone)]
+enum TagCacheEntry {
+    Empty,
+    Normalized(Arc<str>),
+}
+
+#[derive(Default)]
+struct TagNormalizationCache {
+    by_raw: HashMap<String, TagCacheEntry>,
+}
+
+#[inline]
+fn is_valid_tag(tag: &str) -> bool {
+    tag.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':'))
+}
+
+fn normalize_tag_cached(
+    cache: &mut TagNormalizationCache,
+    raw: &str,
     max_tag_len: usize,
-) -> std::result::Result<Vec<String>, Status> {
-    for tag in &mut tags {
-        *tag = tag.trim().to_ascii_lowercase();
+) -> std::result::Result<Option<Arc<str>>, Status> {
+    if let Some(existing) = cache.by_raw.get(raw) {
+        return Ok(match existing {
+            TagCacheEntry::Empty => None,
+            TagCacheEntry::Normalized(tag) => Some(Arc::clone(tag)),
+        });
     }
-    tags.retain(|t| !t.is_empty());
-    tags.sort();
-    tags.dedup();
-    if tags.len() > max_tags {
+
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        cache.by_raw.insert(raw.to_string(), TagCacheEntry::Empty);
+        return Ok(None);
+    }
+    if normalized.len() > max_tag_len {
         return Err(Status::invalid_argument(format!(
-            "too many tags: limit={} actual={}",
-            max_tags,
-            tags.len()
+            "tag too long: max_tag_len={} tag='{}'",
+            max_tag_len, normalized
         )));
     }
-    for tag in &tags {
-        if tag.len() > max_tag_len {
-            return Err(Status::invalid_argument(format!(
-                "tag too long: max_tag_len={} tag='{}'",
-                max_tag_len, tag
-            )));
-        }
-        if !tag
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':'))
-        {
-            return Err(Status::invalid_argument(format!(
-                "invalid tag format: '{}'",
-                tag
-            )));
-        }
+    if !is_valid_tag(&normalized) {
+        return Err(Status::invalid_argument(format!(
+            "invalid tag format: '{}'",
+            normalized
+        )));
     }
-    Ok(tags)
+    let normalized = Arc::<str>::from(normalized);
+    cache.by_raw.insert(
+        raw.to_string(),
+        TagCacheEntry::Normalized(Arc::clone(&normalized)),
+    );
+    Ok(Some(normalized))
+}
+
+fn decode_row_tags(
+    list: &ListArray,
+    row: usize,
+    max_tags: usize,
+    max_tag_len: usize,
+    tag_cache: &mut TagNormalizationCache,
+) -> std::result::Result<Vec<String>, Status> {
+    let mut unique = Vec::<Arc<str>>::new();
+    visit_row_tags(list, row, &mut |raw| {
+        if let Some(tag) = normalize_tag_cached(tag_cache, raw, max_tag_len)? {
+            if !unique.iter().any(|existing| existing.as_ref() == tag.as_ref()) {
+                unique.push(tag);
+                if unique.len() > max_tags {
+                    return Err(Status::invalid_argument(format!(
+                        "too many tags: limit={} actual={}",
+                        max_tags,
+                        unique.len()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    })?;
+    unique.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    Ok(unique.into_iter().map(|tag| tag.to_string()).collect())
 }
 
 fn decode_entry_at_row(
@@ -339,6 +386,7 @@ fn decode_entry_at_row(
     row: usize,
     max_tags: usize,
     max_tag_len: usize,
+    tag_cache: &mut TagNormalizationCache,
 ) -> std::result::Result<(Vec<f32>, IngestMetadataV3Input, Option<String>), Status> {
     if cols.vectors.is_null(row) {
         return Err(Status::invalid_argument("vector row must not be null"));
@@ -355,12 +403,11 @@ fn decode_entry_at_row(
     let entity_id = cols.entity_id.value(row);
     let sequence_ts = cols.sequence_ts.value(row);
     let payload = cols.payload.value(row).to_vec();
-    let raw_tags = if let Some(col) = cols.tags {
-        extract_row_tags(col, row)?
+    let tags = if let Some(col) = cols.tags {
+        decode_row_tags(col, row, max_tags, max_tag_len, tag_cache)?
     } else {
         Vec::new()
     };
-    let tags = normalize_and_validate_tags(raw_tags, max_tags, max_tag_len)?;
 
     let idempotency = cols.idempotency_key.and_then(|col| {
         if col.is_null(row) {
@@ -389,8 +436,9 @@ fn extract_batch_entries(
 ) -> std::result::Result<Vec<(Vec<f32>, IngestMetadataV3Input, Option<String>)>, Status> {
     let cols = parse_flight_batch_columns(batch, dim)?;
     let mut entries = Vec::with_capacity(cols.num_rows);
+    let mut tag_cache = TagNormalizationCache::default();
     for row in 0..cols.num_rows {
-        entries.push(decode_entry_at_row(&cols, row, 64, 64)?);
+        entries.push(decode_entry_at_row(&cols, row, 64, 64, &mut tag_cache)?);
     }
 
     Ok(entries)
@@ -412,12 +460,14 @@ fn ingest_flight_batch_streaming(
     while row < cols.num_rows {
         let end = (row + FLIGHT_DECODE_CHUNK_ROWS).min(cols.num_rows);
         let decode_started = Instant::now();
+        let mut tag_cache = TagNormalizationCache::default();
         for idx in row..end {
             chunk.push(decode_entry_at_row(
                 &cols,
                 idx,
                 state.config.max_tags_per_vector,
                 state.config.max_tag_len,
+                &mut tag_cache,
             )?);
         }
         let decode_elapsed = decode_started.elapsed();

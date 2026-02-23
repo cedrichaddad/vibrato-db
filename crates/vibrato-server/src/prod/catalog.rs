@@ -2506,7 +2506,7 @@ impl SqliteCatalog {
               AND vt.vector_id = vm.vector_id
              WHERE vm.collection_id='{}' AND vm.vector_id >= {} AND vm.vector_id <= {}
              GROUP BY vm.vector_id
-             ORDER BY vector_id ASC;",
+             ORDER BY vm.vector_id ASC;",
             sql_quote(collection_id),
             start_id,
             end_id

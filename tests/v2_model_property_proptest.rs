@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use vibrato_core::metadata::VectorMetadata;
 use vibrato_core::simd::dot_product;
-use vibrato_db::prod::model::{QueryFilter, QueryRequestV2, SearchTier};
-use vibrato_db::prod::{bootstrap_data_dirs, ProductionConfig, ProductionState, SqliteCatalog};
+use vibrato_db::prod::model::{encode_payload_base64, MetadataEnvelopeV3, QueryFilter, QueryRequestV2, SearchTier};
+use vibrato_db::prod::{
+    bootstrap_data_dirs, IngestMetadataV3Input, ProductionConfig, ProductionState, SqliteCatalog,
+};
 
 const DIM: usize = 16;
 const TAG_POOL: &[&str] = &[
@@ -21,14 +22,13 @@ struct Op {
     a: u16,
     b: u16,
     c: u16,
-    d: u16,
 }
 
 #[derive(Clone, Debug)]
 struct ModelRow {
     id: usize,
     vector: Vec<f32>,
-    metadata: VectorMetadata,
+    metadata: IngestMetadataV3Input,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -42,7 +42,7 @@ impl ReferenceModel {
     fn ingest(
         &mut self,
         vector: Vec<f32>,
-        metadata: VectorMetadata,
+        metadata: IngestMetadataV3Input,
         idempotency_key: Option<String>,
     ) -> (usize, bool) {
         if let Some(key) = idempotency_key.as_ref() {
@@ -88,10 +88,10 @@ fn normalized_vector(seed: u64, nonce: u64) -> Vec<f32> {
 
 fn normalized_metadata(
     tags: Vec<String>,
-    bpm: f32,
-    source: String,
-    start_ms: u32,
-) -> VectorMetadata {
+    entity_id: u64,
+    sequence_ts: u64,
+    payload: String,
+) -> IngestMetadataV3Input {
     let mut out_tags = tags
         .into_iter()
         .map(|t| t.trim().to_ascii_lowercase())
@@ -99,16 +99,15 @@ fn normalized_metadata(
         .collect::<Vec<_>>();
     out_tags.sort();
     out_tags.dedup();
-    VectorMetadata {
-        source_file: source,
-        start_time_ms: start_ms,
-        duration_ms: 80,
-        bpm,
+    IngestMetadataV3Input {
+        entity_id,
+        sequence_ts,
         tags: out_tags,
+        payload: payload.into_bytes(),
     }
 }
 
-fn metadata_from_op(step: usize, op: &Op) -> VectorMetadata {
+fn metadata_from_op(step: usize, op: &Op) -> IngestMetadataV3Input {
     let tag_a = TAG_POOL[(op.a as usize) % TAG_POOL.len()].to_string();
     let tag_b = TAG_POOL[(op.b as usize) % TAG_POOL.len()].to_string();
     let mut tags = vec![tag_a];
@@ -117,9 +116,9 @@ fn metadata_from_op(step: usize, op: &Op) -> VectorMetadata {
     }
     normalized_metadata(
         tags,
-        70.0 + ((op.d % 160) as f32) * 0.5,
+        ((step as u64) << 16) | op.a as u64,
+        (step as u64).saturating_mul(5),
         format!("prop_{step}.wav"),
-        (step as u32).saturating_mul(5),
     )
 }
 
@@ -154,11 +153,6 @@ fn make_filter_from_op(row: &ModelRow, op: &Op) -> Option<QueryFilter> {
             ],
             ..Default::default()
         }),
-        3 => Some(QueryFilter {
-            bpm_gte: Some(row.metadata.bpm - 0.01),
-            bpm_lte: Some(row.metadata.bpm + 0.01),
-            ..Default::default()
-        }),
         _ => Some(QueryFilter {
             tags_all: vec![row
                 .metadata
@@ -166,14 +160,13 @@ fn make_filter_from_op(row: &ModelRow, op: &Op) -> Option<QueryFilter> {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "drums".to_string())],
-            bpm_gte: Some(row.metadata.bpm - 0.01),
-            bpm_lte: Some(row.metadata.bpm + 0.01),
+            tags_any: vec!["drums".to_string(), "missing-tag".to_string()],
             ..Default::default()
         }),
     }
 }
 
-fn filter_matches(metadata: &VectorMetadata, filter: Option<&QueryFilter>) -> bool {
+fn filter_matches(metadata: &IngestMetadataV3Input, filter: Option<&QueryFilter>) -> bool {
     let Some(filter) = filter else {
         return true;
     };
@@ -194,17 +187,6 @@ fn filter_matches(metadata: &VectorMetadata, filter: Option<&QueryFilter>) -> bo
         })
     {
         return false;
-    }
-
-    if let Some(min_bpm) = filter.bpm_gte {
-        if metadata.bpm < min_bpm {
-            return false;
-        }
-    }
-    if let Some(max_bpm) = filter.bpm_lte {
-        if metadata.bpm > max_bpm {
-            return false;
-        }
     }
     true
 }
@@ -232,12 +214,17 @@ fn assert_stats_total(state: &Arc<ProductionState>, expected: usize, seed: u64, 
     );
 }
 
-fn metadata_eq(left: &VectorMetadata, right: &VectorMetadata) -> bool {
-    left.source_file == right.source_file
-        && left.start_time_ms == right.start_time_ms
-        && left.duration_ms == right.duration_ms
-        && (left.bpm - right.bpm).abs() < 1e-6
-        && left.tags == right.tags
+fn metadata_eq(left: &MetadataEnvelopeV3, right: &IngestMetadataV3Input) -> bool {
+    let mut left_tags = left.tags.clone();
+    left_tags.sort();
+    left_tags.dedup();
+    let mut right_tags = right.tags.clone();
+    right_tags.sort();
+    right_tags.dedup();
+    left.entity_id == right.entity_id
+        && left.sequence_ts == right.sequence_ts
+        && left_tags == right_tags
+        && left.payload_base64 == encode_payload_base64(&right.payload)
 }
 
 fn new_state() -> Arc<ProductionState> {
@@ -268,7 +255,6 @@ fn generate_ops(seed: u64, count: usize) -> Vec<Op> {
             a: rng.gen(),
             b: rng.gen(),
             c: rng.gen(),
-            d: rng.gen(),
         });
     }
     out

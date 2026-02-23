@@ -2342,12 +2342,26 @@ impl ProductionState {
                 .resolve_tag_ids_readonly(&self.collection.id, &normalized)
                 .ok()?;
 
-            let mut any_union = BitmapSet::default();
-            for tag_id in tag_ids {
-                if let Some(bm) = self.filter_index.read(&tag_id, |_, bm| bm.clone()) {
-                    any_union.union_with(&bm);
+            let parallel_threshold = self.config.filter_parallel_min_shards.max(10);
+            let any_union = if tag_ids.len() > parallel_threshold {
+                self.query_pool.install(|| {
+                    tag_ids
+                        .par_iter()
+                        .filter_map(|tag_id| self.filter_index.read(tag_id, |_, bm| bm.clone()))
+                        .reduce(BitmapSet::default, |mut acc, bm| {
+                            acc.union_with(&bm);
+                            acc
+                        })
+                })
+            } else {
+                let mut union = BitmapSet::default();
+                for tag_id in tag_ids {
+                    if let Some(bm) = self.filter_index.read(&tag_id, |_, bm| bm.clone()) {
+                        union.union_with(&bm);
+                    }
                 }
-            }
+                union
+            };
             allow = Some(match allow {
                 Some(curr) => curr.intersect(&any_union),
                 None => any_union,

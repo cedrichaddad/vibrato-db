@@ -81,7 +81,7 @@ fn reserve_local_port() -> Option<u16> {
 
 async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibrato-db"));
-    cmd.arg("serve-v2")
+    cmd.arg("serve-v3")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--collection")
@@ -103,7 +103,7 @@ async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
 
 async fn wait_for_ready_with_child(child: &mut Child, base_url: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let ready_url = format!("{}/v2/health/ready", base_url);
+    let ready_url = format!("{}/v3/health/ready", base_url);
     for _ in 0..900 {
         if let Ok(Some(status)) = child.try_wait() {
             let mut stderr_text = String::new();
@@ -305,7 +305,7 @@ async fn flush_write_buffer(
     let mut parsed = None;
     for attempt in 0..=max_retries {
         let response = client
-            .post(format!("{}/v2/vectors/batch", base_url))
+            .post(format!("{}/v3/vectors/batch", base_url))
             .bearer_auth(token)
             .timeout(batch_timeout)
             .json(&payload)
@@ -466,16 +466,15 @@ async fn stress_test_million_ops_mixed() {
         let body = serde_json::json!({
             "vector": vec.clone(),
             "metadata": {
-                "source_file": format!("warmup_{i}.wav"),
-                "start_time_ms": i * 10,
-                "duration_ms": 80,
-                "bpm": 120.0,
-                "tags": ["stress", "warmup"]
+                "entity_id": i as u64,
+                "sequence_ts": (i * 10) as u64,
+                "tags": ["stress", "warmup"],
+                "payload_base64": ""
             },
             "idempotency_key": format!("stress-warmup-{i}")
         });
         let resp = client
-            .post(format!("{}/v2/vectors", base_url))
+            .post(format!("{}/v3/vectors", base_url))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -545,7 +544,7 @@ async fn stress_test_million_ops_mixed() {
                         "include_metadata": false
                     });
                     match client
-                        .post(format!("{}/v2/query", base_url))
+                        .post(format!("{}/v3/query", base_url))
                         .bearer_auth(&token)
                         .json(&body)
                         .send()
@@ -580,16 +579,15 @@ async fn stress_test_million_ops_mixed() {
                     }
                     local_idx += 1;
                 } else if op_roll < write_threshold {
-                    // Write path (buffered and flushed to /v2/vectors/batch).
+                    // Write path (buffered and flushed to /v3/vectors/batch).
                     let vec = normalized_vector(seed, worker_id, local_idx + 1_000_000);
                     buffered_writes.push(IngestRequest {
                         vector: vec,
                         metadata: serde_json::json!({
-                            "source_file": format!("stress_w{worker_id}_o{local_idx}.wav"),
-                            "start_time_ms": local_idx as u32,
-                            "duration_ms": 64,
-                            "bpm": 100.0 + ((local_idx % 64) as f32),
-                            "tags": ["stress", format!("worker-{worker_id}")]
+                            "entity_id": ((worker_id as u64) << 32) | (local_idx as u64),
+                            "sequence_ts": local_idx as u64,
+                            "tags": ["stress", format!("worker-{worker_id}")],
+                            "payload_base64": ""
                         }),
                         idempotency_key: Some(format!("stress-{seed}-{worker_id}-{local_idx}")),
                     });
@@ -654,9 +652,9 @@ async fn stress_test_million_ops_mixed() {
                     }
 
                     let path = if rng.gen::<u8>() % 10 < 9 {
-                        "v2/admin/compact"
+                        "v3/admin/compact"
                     } else {
-                        "v2/admin/checkpoint"
+                        "v3/admin/checkpoint"
                     };
                     let result = client
                         .post(format!("{}/{}", base_url, path))
@@ -749,7 +747,7 @@ async fn stress_test_million_ops_mixed() {
     }
 
     let ready = client
-        .get(format!("{}/v2/health/ready", base_url))
+        .get(format!("{}/v3/health/ready", base_url))
         .send()
         .await
         .expect("ready check after stress");
@@ -762,7 +760,7 @@ async fn stress_test_million_ops_mixed() {
     let mut stats_resp = None;
     for attempt in 0..10 {
         let resp = client
-            .get(format!("{}/v2/admin/stats", base_url))
+            .get(format!("{}/v3/admin/stats", base_url))
             .bearer_auth(&token)
             .send()
             .await
@@ -835,7 +833,7 @@ async fn stress_test_million_ops_mixed() {
                 "search_tier": if enable_admin_chaos { "all" } else { "active" }
             });
             let resp = client
-                .post(format!("{}/v2/query", base_url))
+                .post(format!("{}/v3/query", base_url))
                 .bearer_auth(&token)
                 .json(&body)
                 .send()

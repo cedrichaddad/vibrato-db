@@ -1,14 +1,24 @@
 use std::path::PathBuf;
 
 use tempfile::tempdir;
-use vibrato_core::metadata::VectorMetadata;
-use vibrato_db::prod::catalog::{CheckpointJobRecord, CompactionJobRecord, SegmentRecord};
+use vibrato_db::prod::catalog::{
+    CheckpointJobRecord, CompactionJobRecord, IngestMetadataV3Input, SegmentRecord,
+};
 use vibrato_db::prod::{bootstrap_data_dirs, CatalogStore, ProductionConfig, SqliteCatalog};
 
 fn test_config(data_dir: PathBuf) -> ProductionConfig {
     let mut cfg = ProductionConfig::from_data_dir(data_dir, "default".to_string(), 2);
     cfg.public_health_metrics = true;
     cfg
+}
+
+fn ingest_meta(entity_id: u64, sequence_ts: u64, payload: &str, tags: &[&str]) -> IngestMetadataV3Input {
+    IngestMetadataV3Input {
+        entity_id,
+        sequence_ts,
+        tags: tags.iter().map(|t| t.to_string()).collect(),
+        payload: payload.as_bytes().to_vec(),
+    }
 }
 
 #[test]
@@ -25,13 +35,12 @@ fn checkpoint_phase_transitions_update_segment_wal_and_job() {
     let mut lsn_start = 0u64;
     let mut lsn_end = 0u64;
     for i in 0..3usize {
-        let meta = VectorMetadata {
-            source_file: format!("sample-{}.wav", i),
-            start_time_ms: (i * 10) as u32,
-            duration_ms: 100,
-            bpm: 120.0,
-            tags: vec!["drums".to_string()],
-        };
+        let meta = ingest_meta(
+            i as u64,
+            (i * 10) as u64,
+            &format!("sample-{}.wav", i),
+            &["drums"],
+        );
         let idempotency = format!("chk-{}", i);
         let wal = catalog
             .ingest_wal(
@@ -251,13 +260,7 @@ fn pending_wal_replay_is_lsn_ordered() {
         .expect("ensure collection");
 
     for i in 0..8usize {
-        let meta = VectorMetadata {
-            source_file: format!("lsn-{}.wav", i),
-            start_time_ms: i as u32,
-            duration_ms: 100,
-            bpm: 100.0 + i as f32,
-            tags: vec!["order".to_string()],
-        };
+        let meta = ingest_meta(i as u64, i as u64, &format!("lsn-{}.wav", i), &["order"]);
         catalog
             .ingest_wal(
                 &collection.id,
@@ -292,24 +295,12 @@ fn ingest_transaction_rolls_back_on_constraint_failure() {
         .ensure_collection(&config.collection_name, config.dim)
         .expect("ensure collection");
 
-    let first = VectorMetadata {
-        source_file: "first.wav".to_string(),
-        start_time_ms: 0,
-        duration_ms: 100,
-        bpm: 120.0,
-        tags: vec!["drums".to_string()],
-    };
+    let first = ingest_meta(7, 0, "first.wav", &["drums"]);
     catalog
         .ingest_wal(&collection.id, 7, &[0.1, 0.2], &first, Some("atomic-1"))
         .expect("first ingest");
 
-    let second = VectorMetadata {
-        source_file: "second.wav".to_string(),
-        start_time_ms: 10,
-        duration_ms: 120,
-        bpm: 121.0,
-        tags: vec!["snare".to_string()],
-    };
+    let second = ingest_meta(7, 10, "second.wav", &["snare"]);
     let err = catalog
         .ingest_wal(&collection.id, 7, &[0.3, 0.4], &second, Some("atomic-2"))
         .expect_err("duplicate vector_id should fail");
@@ -323,14 +314,14 @@ fn ingest_transaction_rolls_back_on_constraint_failure() {
         .expect("pending wal");
     assert_eq!(wal.len(), 1, "failed ingest must not append WAL row");
     assert_eq!(wal[0].vector_id, 7);
-    assert_eq!(wal[0].metadata.source_file, "first.wav");
+    assert_eq!(wal[0].metadata.payload, b"first.wav".to_vec());
 
     let metadata = catalog
         .fetch_all_metadata(&collection.id)
         .expect("fetch all metadata");
     assert_eq!(metadata.len(), 1, "failed ingest must not write metadata");
     assert_eq!(metadata[0].0, 7);
-    assert_eq!(metadata[0].1.source_file, "first.wav");
+    assert_eq!(metadata[0].1.payload, b"first.wav".to_vec());
 }
 
 #[test]
@@ -345,13 +336,7 @@ fn monotonic_id_counter_is_atomic_with_wal_and_metadata() {
         .expect("ensure collection");
 
     for i in 0..3usize {
-        let meta = VectorMetadata {
-            source_file: format!("counter-{i}.wav"),
-            start_time_ms: i as u32,
-            duration_ms: 100,
-            bpm: 128.0,
-            tags: vec!["drums".to_string()],
-        };
+        let meta = ingest_meta(i as u64, i as u64, &format!("counter-{i}.wav"), &["drums"]);
         let res = catalog
             .ingest_wal_atomic(
                 &collection.id,
@@ -368,13 +353,7 @@ fn monotonic_id_counter_is_atomic_with_wal_and_metadata() {
         .ingest_wal_atomic(
             &collection.id,
             &[0.2, 0.8],
-            &VectorMetadata {
-                source_file: "dup.wav".to_string(),
-                start_time_ms: 0,
-                duration_ms: 100,
-                bpm: 128.0,
-                tags: vec!["drums".to_string()],
-            },
+            &ingest_meta(999, 0, "dup.wav", &["drums"]),
             Some("counter-key-1"),
         )
         .expect("idempotent duplicate lookup");
@@ -401,33 +380,29 @@ fn ingest_wal_batch_preserves_idempotency_and_catalog_consistency() {
         .ensure_collection(&config.collection_name, config.dim)
         .expect("ensure collection");
 
-    let entry = |source: &str, bpm: f32, tags: &[&str]| VectorMetadata {
-        source_file: source.to_string(),
-        start_time_ms: 0,
-        duration_ms: 100,
-        bpm,
-        tags: tags.iter().map(|t| t.to_string()).collect(),
+    let entry = |source: &str, sequence_ts: u64, tags: &[&str]| {
+        ingest_meta(sequence_ts, sequence_ts, source, tags)
     };
 
     let batch_one = vec![
         (
             vec![0.1, 0.9],
-            entry("a.wav", 120.0, &["Batch", "One"]),
+            entry("a.wav", 120, &["Batch", "One"]),
             Some("batch-k1".to_string()),
         ),
         (
             vec![0.2, 0.8],
-            entry("b.wav", 121.0, &["batch", "Two"]),
+            entry("b.wav", 121, &["batch", "Two"]),
             Some("batch-k2".to_string()),
         ),
         (
             vec![0.3, 0.7],
-            entry("dup.wav", 122.0, &["dup"]),
+            entry("dup.wav", 122, &["dup"]),
             Some("batch-k1".to_string()),
         ),
         (
             vec![0.4, 0.6],
-            entry("nokey.wav", 123.0, &["batch", "NoKey"]),
+            entry("nokey.wav", 123, &["batch", "NoKey"]),
             None,
         ),
     ];
@@ -447,12 +422,12 @@ fn ingest_wal_batch_preserves_idempotency_and_catalog_consistency() {
     let batch_two = vec![
         (
             vec![0.25, 0.75],
-            entry("b-overwrite.wav", 150.0, &["should_not_apply"]),
+            entry("b-overwrite.wav", 150, &["should_not_apply"]),
             Some("batch-k2".to_string()),
         ),
         (
             vec![0.5, 0.5],
-            entry("new.wav", 124.0, &["batch", "new"]),
+            entry("new.wav", 124, &["batch", "new"]),
             Some("batch-k3".to_string()),
         ),
     ];
@@ -481,7 +456,7 @@ fn ingest_wal_batch_preserves_idempotency_and_catalog_consistency() {
         .get(&r1[1].vector_id)
         .expect("metadata for idempotent row");
     assert_eq!(
-        existing.source_file, "b.wav",
+        existing.payload, b"b.wav".to_vec(),
         "duplicate idempotent ingest must not overwrite metadata"
     );
 
@@ -509,20 +484,8 @@ fn tag_dictionary_and_vector_tags_are_stable_across_restart() {
             .ensure_collection(&config.collection_name, config.dim)
             .expect("ensure collection");
 
-        let meta_a = VectorMetadata {
-            source_file: "a.wav".to_string(),
-            start_time_ms: 0,
-            duration_ms: 100,
-            bpm: 120.0,
-            tags: vec!["Drums".to_string(), "Snare".to_string()],
-        };
-        let meta_b = VectorMetadata {
-            source_file: "b.wav".to_string(),
-            start_time_ms: 10,
-            duration_ms: 100,
-            bpm: 121.0,
-            tags: vec!["drums".to_string(), "Kick".to_string()],
-        };
+        let meta_a = ingest_meta(1, 0, "a.wav", &["Drums", "Snare"]);
+        let meta_b = ingest_meta(2, 10, "b.wav", &["drums", "Kick"]);
         catalog
             .ingest_wal_atomic(&collection.id, &[0.1, 0.9], &meta_a, Some("tags-a"))
             .expect("ingest a");
