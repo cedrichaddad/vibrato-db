@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -212,6 +212,8 @@ pub struct ProductionState {
 
     pub metrics: Metrics,
     ingest_writer_tx: SyncSender<IngestWriteJob>,
+    ingest_writer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    ingest_writer_failed: AtomicBool,
     pub ingest_queue_bytes: AtomicU64,
     pub hot_vectors_bytes: AtomicU64,
     pub hnsw_graph_bytes: AtomicU64,
@@ -375,6 +377,8 @@ impl ProductionState {
             retired_segments: std::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
             ingest_writer_tx,
+            ingest_writer_handle: std::sync::Mutex::new(None),
+            ingest_writer_failed: AtomicBool::new(false),
             ingest_queue_bytes: AtomicU64::new(0),
             hot_vectors_bytes: AtomicU64::new(0),
             hnsw_graph_bytes: AtomicU64::new(0),
@@ -391,15 +395,18 @@ impl ProductionState {
             audit_rx: std::sync::Mutex::new(Some(audit_rx)),
         });
 
-        state.start_ingest_writer(ingest_writer_rx);
+        state.start_ingest_writer(ingest_writer_rx)?;
 
         Ok(state)
     }
 
-    fn start_ingest_writer(self: &Arc<Self>, ingest_writer_rx: Receiver<IngestWriteJob>) {
+    fn start_ingest_writer(
+        self: &Arc<Self>,
+        ingest_writer_rx: Receiver<IngestWriteJob>,
+    ) -> Result<()> {
         let state = Arc::clone(self);
         let writer_name = format!("vibrato-sqlite-writer-{}", state.collection.id);
-        let _ = std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(writer_name)
             .spawn(move || {
                 if state.config.audio_colocated {
@@ -417,7 +424,40 @@ impl ProductionState {
                     atomic_saturating_sub(&state.ingest_queue_bytes, job.estimated_bytes);
                     let _ = job.result_tx.send(result);
                 }
-            });
+            })
+            .context("spawning ingest writer thread")?;
+        *self
+            .ingest_writer_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+        Ok(())
+    }
+
+    fn refresh_ingest_writer_health(&self) {
+        let mut handle_slot = self
+            .ingest_writer_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let finished = handle_slot
+            .as_ref()
+            .map(std::thread::JoinHandle::is_finished)
+            .unwrap_or(false);
+        if !finished {
+            return;
+        }
+
+        if let Some(handle) = handle_slot.take() {
+            match handle.join() {
+                Ok(()) => {
+                    tracing::error!("ingest writer thread exited unexpectedly");
+                }
+                Err(_) => {
+                    tracing::error!("ingest writer thread panicked");
+                }
+            }
+            self.ingest_writer_failed.store(true, AtomicOrdering::SeqCst);
+            self.live.store(false, AtomicOrdering::SeqCst);
+        }
     }
 
     fn estimate_ingest_metadata_bytes(metadata: &IngestMetadataV3Input) -> u64 {
@@ -450,6 +490,12 @@ impl ProductionState {
         entries: Vec<(Vec<f32>, IngestMetadataV3Input, Option<String>)>,
         estimated_bytes: u64,
     ) -> Result<IngestWriteOutcome> {
+        const INGEST_WRITER_RESULT_TIMEOUT: Duration = Duration::from_secs(120);
+        self.refresh_ingest_writer_health();
+        if self.ingest_writer_failed.load(AtomicOrdering::SeqCst) {
+            return Err(anyhow!("ingest writer is unavailable"));
+        }
+
         let (result_tx, result_rx) = sync_channel(1);
         self.ingest_queue_bytes
             .fetch_add(estimated_bytes, AtomicOrdering::Relaxed);
@@ -462,9 +508,21 @@ impl ProductionState {
             atomic_saturating_sub(&self.ingest_queue_bytes, estimated_bytes);
             return Err(anyhow!("ingest writer queue is unavailable"));
         }
-        match result_rx.recv() {
+        match result_rx.recv_timeout(INGEST_WRITER_RESULT_TIMEOUT) {
             Ok(inner) => inner,
-            Err(_) => Err(anyhow!("ingest writer disconnected before sending result")),
+            Err(RecvTimeoutError::Timeout) => {
+                self.refresh_ingest_writer_health();
+                Err(anyhow!(
+                    "ingest writer timeout after {}s (queue_bytes={}, failed={})",
+                    INGEST_WRITER_RESULT_TIMEOUT.as_secs(),
+                    self.ingest_queue_bytes.load(AtomicOrdering::Relaxed),
+                    self.ingest_writer_failed.load(AtomicOrdering::SeqCst)
+                ))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.refresh_ingest_writer_health();
+                Err(anyhow!("ingest writer disconnected before sending result"))
+            }
         }
     }
 
@@ -866,10 +924,15 @@ impl ProductionState {
             .as_ref()
             .map(|bm| bm.cardinality() <= 5_000)
             .unwrap_or(false);
+        let hot_shard_ef = effective_hot_shard_ef(request.k, request.ef, self.hot_indices.len());
+        let inline_hot_scan = allow_bitmap.is_none()
+            && request.ef <= 64
+            && self.hot_indices.len() <= 16;
 
         if !matches!(request.search_tier, SearchTier::Archive) {
-            let hot_results = if selective_allow {
-                // For selective filters, per-shard work is tiny; avoid Rayon dispatch overhead.
+            let hot_results = if selective_allow || inline_hot_scan {
+                // For selective filters and low-ef hot queries, per-shard work is
+                // small enough that Rayon dispatch overhead dominates.
                 self.hot_indices
                     .iter()
                     .enumerate()
@@ -879,7 +942,7 @@ impl ProductionState {
                             &index,
                             &request.vector,
                             request.k,
-                            request.ef,
+                            hot_shard_ef,
                             allow_bitmap.as_deref(),
                             Some(FlatScanHint::HotShard {
                                 shard,
@@ -899,7 +962,7 @@ impl ProductionState {
                                 &index,
                                 &request.vector,
                                 request.k,
-                                request.ef,
+                                hot_shard_ef,
                                 allow_bitmap.as_deref(),
                                 Some(FlatScanHint::HotShard {
                                     shard,
@@ -2186,7 +2249,38 @@ impl ProductionState {
             *self.hot_indices[i].write() = hnsw;
         }
 
-        let vector_bytes = pending.iter().fold(0u64, |acc, e| {
+        // 5. Catch-up phase: replay WAL snapshot again after the swap to close
+        // the ingest window between initial snapshot and atomic publication.
+        let mut pending_catchup = self.catalog.pending_wal_after_lsn(&self.collection.id, 0)?;
+        pending_catchup.sort_by_key(|e| e.lsn);
+
+        let mut catchup_by_shard = vec![Vec::new(); self.hot_indices.len()];
+        for entry in &pending_catchup {
+            let shard = entry.vector_id & self.shard_mask;
+            if let Some(bucket) = catchup_by_shard.get_mut(shard) {
+                bucket.push(entry);
+            }
+        }
+
+        for (shard_idx, entries) in catchup_by_shard.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            if let Some(shard_vectors) = self.hot_vector_shards.get(shard_idx) {
+                let vec_store = shard_vectors.load_full();
+                for entry in &entries {
+                    vec_store.upsert(entry.vector_id, Arc::new(entry.vector.clone()));
+                }
+            }
+            if let Some(index) = self.hot_indices.get(shard_idx) {
+                let mut idx = index.write();
+                for entry in entries {
+                    idx.insert(entry.vector_id);
+                }
+            }
+        }
+
+        let vector_bytes = pending_catchup.iter().fold(0u64, |acc, e| {
             acc.saturating_add(
                 (e.vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
             )
@@ -2194,7 +2288,7 @@ impl ProductionState {
         self.hot_vectors_bytes
             .store(vector_bytes, AtomicOrdering::Relaxed);
         self.hnsw_graph_bytes.store(
-            (pending.len() as u64).saturating_mul(self.estimate_hnsw_bytes_per_vector()),
+            (pending_catchup.len() as u64).saturating_mul(self.estimate_hnsw_bytes_per_vector()),
             AtomicOrdering::Relaxed,
         );
 
@@ -2978,6 +3072,16 @@ fn merge_best(best: &mut HashMap<usize, f32>, id: usize, score: f32) {
             best.insert(id, score);
         }
     }
+}
+
+#[inline]
+fn effective_hot_shard_ef(k: usize, requested_ef: usize, shard_count: usize) -> usize {
+    let requested = requested_ef.max(k).max(1);
+    if shard_count <= 1 {
+        return requested;
+    }
+    // Multi-shard fan-out inflates total work: budget a slightly lower per-shard ef.
+    requested.div_ceil(2).max(k).max(8)
 }
 
 fn salient_anchor_offsets(query_sequence: &[Vec<f32>]) -> Vec<usize> {

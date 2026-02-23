@@ -323,11 +323,20 @@ impl HNSW {
     #[inline]
     fn get_vector_owned(&self, id: usize) -> Vec<f32> {
         let mut out = Vec::new();
+        self.copy_vector_into(id, &mut out);
+        out
+    }
+
+    /// Copy vector into a reusable scratch buffer.
+    #[inline]
+    fn copy_vector_into(&self, id: usize, out: &mut Vec<f32>) {
+        out.clear();
         self.with_vector(id, &mut |v| {
-            out.reserve(v.len());
+            if out.capacity() < v.len() {
+                out.reserve(v.len() - out.capacity());
+            }
             out.extend_from_slice(v);
         });
-        out
     }
 
     /// Compute distance between query and node (dot product for normalized vectors).
@@ -352,6 +361,11 @@ impl HNSW {
     /// # Parameters
     /// - `id`: Vector ID (index into VectorStore)
     pub fn insert(&mut self, id: usize) {
+        // Idempotent insert guard for checkpoint catch-up/replay paths.
+        if self.contains_id(id) {
+            return;
+        }
+
         let query = self.get_vector_owned(id);
         let node_layer = self.random_layer();
         self.max_node_id = self.max_node_id.max(id);
@@ -402,6 +416,7 @@ impl HNSW {
 
         for layer in (0..=start_layer).rev() {
             let m_layer = if layer == 0 { self.m0 } else { self.m };
+            let mut neighbor_vec_scratch = Vec::new();
 
             // Find candidates for this layer
             self.search_layer_into(
@@ -436,15 +451,14 @@ impl HNSW {
                         // Compute distances and select.
                         let mut neighbor_candidates: Vec<(usize, f32)> =
                             Vec::with_capacity(all_neighbors.len());
-                        self.with_vector(neighbor_id, &mut |neighbor_vec| {
-                            for &n in &all_neighbors {
-                                let mut dist = 0.0f32;
-                                self.with_vector(n, &mut |v| {
-                                    dist = -dot_product(neighbor_vec, v);
-                                });
-                                neighbor_candidates.push((n, dist));
-                            }
-                        });
+                        self.copy_vector_into(neighbor_id, &mut neighbor_vec_scratch);
+                        for &n in &all_neighbors {
+                            let mut dist = 0.0f32;
+                            self.with_vector(n, &mut |v| {
+                                dist = -dot_product(neighbor_vec_scratch.as_slice(), v);
+                            });
+                            neighbor_candidates.push((n, dist));
+                        }
 
                         let pruned = self.select_neighbors(&[], &neighbor_candidates, m_layer);
                         let pruned_ids: Vec<usize> = pruned.iter().map(|(id, _)| *id).collect();
@@ -598,6 +612,7 @@ impl HNSW {
         sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
         let mut result = Vec::with_capacity(m);
+        let mut candidate_vec_scratch = Vec::new();
 
         for &(candidate_id, candidate_dist) in &sorted {
             if result.len() >= m {
@@ -606,21 +621,21 @@ impl HNSW {
 
             // Check if candidate is closer to query than to any existing result
             let mut is_diverse = true;
-            self.with_vector(candidate_id, &mut |candidate_vec| {
-                for &(existing_id, _) in &result {
-                    let mut dist_to_existing = 0.0f32;
-                    self.with_vector(existing_id, &mut |existing_vec| {
-                        dist_to_existing = -dot_product(candidate_vec, existing_vec);
-                    });
+            self.copy_vector_into(candidate_id, &mut candidate_vec_scratch);
+            for &(existing_id, _) in &result {
+                let mut dist_to_existing = 0.0f32;
+                self.with_vector(existing_id, &mut |existing_vec| {
+                    dist_to_existing =
+                        -dot_product(candidate_vec_scratch.as_slice(), existing_vec);
+                });
 
-                    if dist_to_existing < candidate_dist {
-                        // Candidate is closer to existing neighbor than to query.
-                        // This means the existing neighbor "covers" this direction.
-                        is_diverse = false;
-                        break;
-                    }
+                if dist_to_existing < candidate_dist {
+                    // Candidate is closer to existing neighbor than to query.
+                    // This means the existing neighbor "covers" this direction.
+                    is_diverse = false;
+                    break;
                 }
-            });
+            }
 
             if is_diverse {
                 result.push((candidate_id, candidate_dist));
