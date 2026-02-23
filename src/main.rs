@@ -27,7 +27,7 @@ use tracing_subscriber::EnvFilter;
 use vibrato_db::format_v2::{VdbHeaderV2, VdbWriterV2};
 use vibrato_db::hnsw::HNSW;
 use vibrato_db::prod::{
-    bootstrap_data_dirs, create_snapshot, create_v2_router, migrate_existing_vdb_to_segment,
+    bootstrap_data_dirs, create_snapshot, create_v3_router, migrate_existing_vdb_to_segment,
     recover_state, replay_to_lsn, restore_snapshot, start_flight_server, CatalogOptions,
     CatalogStore, ProductionConfig, ProductionState, Role, SqliteCatalog, VectorMadviseMode,
 };
@@ -144,8 +144,8 @@ enum Commands {
         model_dir: PathBuf,
     },
 
-    /// Start the production v2 server (SQLite catalog + WAL + segments)
-    ServeV2 {
+    /// Start the production v3 server (SQLite catalog + WAL + segments)
+    ServeV3 {
         /// Root data directory (catalog, segments, tmp, quarantine)
         #[arg(long, default_value = "vibrato_data")]
         data_dir: PathBuf,
@@ -188,7 +188,7 @@ enum Commands {
         )]
         audio_colocated: bool,
 
-        /// If false, /v2/health/* and /v2/metrics require API auth
+        /// If false, /v3/health/* and /v3/metrics require API auth
         #[arg(
             long,
             default_value_t = true,
@@ -241,6 +241,22 @@ enum Commands {
         /// Minimum shard count before filter allow-set union parallelizes
         #[arg(long, default_value = "8")]
         filter_parallel_min_shards: usize,
+
+        /// Maximum global tag cardinality retained in registry cache/storage
+        #[arg(long, default_value = "500000")]
+        max_tag_registry_size: usize,
+
+        /// Maximum normalized tags accepted per vector
+        #[arg(long, default_value = "64")]
+        max_tags_per_vector: usize,
+
+        /// Maximum bytes/chars accepted per normalized tag
+        #[arg(long, default_value = "64")]
+        max_tag_len: usize,
+
+        /// Flight decode chunk warning threshold in milliseconds
+        #[arg(long, default_value = "20")]
+        flight_decode_warn_ms: u64,
 
         /// Vector mmap advise mode for active segment vectors: normal|random
         #[arg(long, default_value = "normal")]
@@ -584,7 +600,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Models downloaded and verified in {:?}", model_dir);
         }
 
-        Commands::ServeV2 {
+        Commands::ServeV3 {
             data_dir,
             collection,
             dim,
@@ -606,6 +622,10 @@ async fn main() -> anyhow::Result<()> {
             query_pool_threads,
             flight_decode_pool_threads,
             filter_parallel_min_shards,
+            max_tag_registry_size,
+            max_tags_per_vector,
+            max_tag_len,
+            flight_decode_warn_ms,
             vector_madvise_mode,
             flight_host,
             flight_port,
@@ -628,6 +648,10 @@ async fn main() -> anyhow::Result<()> {
             config.query_pool_threads = query_pool_threads;
             config.flight_decode_pool_threads = flight_decode_pool_threads;
             config.filter_parallel_min_shards = filter_parallel_min_shards.max(1);
+            config.max_tag_registry_size = max_tag_registry_size;
+            config.max_tags_per_vector = max_tags_per_vector.max(1);
+            config.max_tag_len = max_tag_len.max(1);
+            config.flight_decode_warn_ms = flight_decode_warn_ms.max(1);
             config.vector_madvise_mode = parse_vector_madvise_mode(&vector_madvise_mode)?;
 
             bootstrap_data_dirs(&config)?;
@@ -636,6 +660,7 @@ async fn main() -> anyhow::Result<()> {
                 CatalogOptions {
                     read_timeout_ms: config.catalog_read_timeout_ms,
                     wal_autocheckpoint_pages: config.sqlite_wal_autocheckpoint_pages,
+                    max_tag_registry_size: config.max_tag_registry_size,
                 },
             )?);
             let state = ProductionState::initialize(config.clone(), catalog.clone())?;
@@ -653,9 +678,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("{}", report.report);
 
             state.start_background_workers();
-            let router = create_v2_router(state.clone());
+            let router = create_v3_router(state.clone());
             let http_addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-            tracing::info!("Starting Vibrato v2 HTTP control plane on {}", http_addr);
+            tracing::info!("Starting Vibrato v3 HTTP control plane on {}", http_addr);
             let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
 
             if let Some(flight_port) = flight_port {

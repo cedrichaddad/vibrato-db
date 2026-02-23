@@ -21,10 +21,10 @@ use anyhow::Result;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tempfile::tempdir;
-use vibrato_core::metadata::VectorMetadata;
 use vibrato_core::simd::l2_normalized;
 use vibrato_db::prod::{
-    bootstrap_data_dirs, CatalogOptions, ProductionConfig, ProductionState, SqliteCatalog,
+    bootstrap_data_dirs, CatalogOptions, IngestMetadataV3Input, ProductionConfig, ProductionState,
+    SqliteCatalog,
 };
 use vibrato_server::prod::model::{QueryFilter, QueryRequestV2, SearchTier};
 
@@ -133,6 +133,7 @@ fn main() -> Result<()> {
         CatalogOptions {
             read_timeout_ms: config.catalog_read_timeout_ms,
             wal_autocheckpoint_pages: config.sqlite_wal_autocheckpoint_pages,
+            max_tag_registry_size: config.max_tag_registry_size,
         },
     )?);
     let state = ProductionState::initialize(config, catalog)?;
@@ -141,13 +142,11 @@ fn main() -> Result<()> {
     let mut batch = Vec::with_capacity(512);
     for i in 0..num_vectors {
         let vector = random_vector(dim, &mut ingest_rng);
-        let bpm = 90.0 + ((i % 80) as f32);
-        let metadata = VectorMetadata {
-            source_file: format!("bench_{i}.wav"),
-            start_time_ms: i as u32,
-            duration_ms: 25,
-            bpm,
+        let metadata = IngestMetadataV3Input {
+            entity_id: i as u64,
+            sequence_ts: i as u64,
             tags: vec![format!("tag_{}", i % 256), "bench".to_string()],
+            payload: Vec::new(),
         };
         batch.push((vector, metadata, Some(format!("bench-key-{i}"))));
         if batch.len() == 512 {
@@ -171,8 +170,6 @@ fn main() -> Result<()> {
         Some(QueryFilter {
             tags_any: Vec::new(),
             tags_all: vec!["tag_7".to_string()],
-            bpm_gte: None,
-            bpm_lte: None,
         }),
     );
     let filtered_combo_reqs = make_requests(
@@ -182,8 +179,6 @@ fn main() -> Result<()> {
         Some(QueryFilter {
             tags_any: vec!["bench".to_string()],
             tags_all: vec!["tag_7".to_string()],
-            bpm_gte: Some(100.0),
-            bpm_lte: Some(140.0),
         }),
     );
 

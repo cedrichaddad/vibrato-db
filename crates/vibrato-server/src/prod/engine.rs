@@ -13,24 +13,26 @@ use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use rayon::ThreadPool;
+use scc::hash_map::Entry as SccEntry;
 use scc::HashMap as SccHashMap;
 use serde_json::{json, Value};
 use vibrato_core::format_v2::{VdbHeaderV2, VdbWriterV2};
 use vibrato_core::hnsw::HNSW;
-use vibrato_core::metadata::{MetadataBuilder, VectorMetadata};
+use vibrato_core::metadata::{MetadataBuilder, VectorMetadata, VectorMetadataV3};
 use vibrato_core::pq::ProductQuantizer;
 use vibrato_core::simd::dot_product;
 use vibrato_core::store::VectorStore;
 use vibrato_core::training::{train_pq, TrainingConfig};
 
 use super::catalog::{
-    CatalogStore, CheckpointJobRecord, CollectionRecord, CompactionJobRecord, SegmentRecord,
-    SqliteCatalog, WalEntry, WalIngestResult,
+    CatalogStore, CheckpointJobRecord, CollectionRecord, CompactionJobRecord,
+    IngestMetadataV3Input, SegmentRecord, SqliteCatalog, WalEntry, WalIngestResult,
 };
-use super::filter::{BitmapSet, FilterIndex};
+use super::filter::BitmapSet;
 use super::model::{
     AuditEvent, IdentifyRequestV2, IdentifyResponseV2, IdentifyResultV2, JobResponseV2,
-    QueryRequestV2, QueryResponseV2, QueryResultV2, SearchTier, StatsResponseV2,
+    MetadataEnvelopeV3, QueryRequestV2, QueryResponseV2, QueryResultV2, SearchTier,
+    StatsResponseV2,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +58,7 @@ pub enum IngestBackpressureDecision {
 
 #[derive(Debug)]
 struct IngestWriteJob {
-    entries: Vec<(Vec<f32>, VectorMetadata, Option<String>)>,
+    entries: Vec<(Vec<f32>, IngestMetadataV3Input, Option<String>)>,
     estimated_bytes: u64,
     result_tx: SyncSender<Result<IngestWriteOutcome>>,
 }
@@ -64,7 +66,7 @@ struct IngestWriteJob {
 #[derive(Debug)]
 struct IngestWriteOutcome {
     wal_results: Vec<WalIngestResult>,
-    entries: Vec<(Vec<f32>, VectorMetadata, Option<String>)>,
+    entries: Vec<(Vec<f32>, IngestMetadataV3Input, Option<String>)>,
 }
 
 #[derive(Debug)]
@@ -133,6 +135,10 @@ pub struct ProductionConfig {
     pub flight_decode_pool_threads: usize,
     /// Minimum shard count before allow-set union parallelization is enabled.
     pub filter_parallel_min_shards: usize,
+    pub max_tag_registry_size: usize,
+    pub max_tags_per_vector: usize,
+    pub max_tag_len: usize,
+    pub flight_decode_warn_ms: u64,
     pub vector_madvise_mode: VectorMadviseMode,
     pub api_pepper: String,
 }
@@ -167,6 +173,9 @@ pub struct Metrics {
     pub query_latency_us_le_2500: AtomicU64,
     pub query_latency_us_le_5000: AtomicU64,
     pub query_latency_us_gt_5000: AtomicU64,
+    pub tag_reject_overflow_total: AtomicU64,
+    pub tag_reject_invalid_total: AtomicU64,
+    pub flight_decode_chunk_warn_total: AtomicU64,
 }
 
 pub struct SegmentHandle {
@@ -193,10 +202,10 @@ pub struct ProductionState {
     pub hot_vector_shards: Vec<ArcSwap<SccHashMap<usize, Arc<Vec<f32>>>>>,
     pub hot_indices: Vec<RwLock<HNSW>>,
     pub shard_mask: usize,
-    pub metadata_cache_shards: Vec<SccHashMap<usize, VectorMetadata>>,
+    pub metadata_cache: Arc<SccHashMap<usize, VectorMetadataV3>>,
     pub segments: ArcSwap<Vec<Arc<SegmentHandle>>>,
     pub archive_segments: ArcSwap<Vec<Arc<ArchivePqSegment>>>,
-    pub filter_index_shards: Vec<RwLock<FilterIndex>>,
+    pub filter_index: Arc<SccHashMap<u32, BitmapSet>>,
     filter_allow_cache: RwLock<HashMap<String, (u64, Arc<BitmapSet>)>>,
     filter_cache_epoch: AtomicU64,
     pub retired_segments: std::sync::Mutex<HashMap<String, Weak<SegmentHandle>>>,
@@ -254,6 +263,10 @@ impl ProductionConfig {
             query_pool_threads: 0,
             flight_decode_pool_threads: 0,
             filter_parallel_min_shards: 8,
+            max_tag_registry_size: 500_000,
+            max_tags_per_vector: 64,
+            max_tag_len: 64,
+            flight_decode_warn_ms: 20,
             vector_madvise_mode: VectorMadviseMode::Normal,
             api_pepper: std::env::var("VIBRATO_API_PEPPER")
                 .unwrap_or_else(|_| "dev-pepper".to_string()),
@@ -299,9 +312,8 @@ impl ProductionState {
                 ))
             })
             .collect::<Vec<_>>();
-        let metadata_cache_shards = (0..shard_count)
-            .map(|_| SccHashMap::new())
-            .collect::<Vec<_>>();
+        let metadata_cache = Arc::new(SccHashMap::new());
+        let filter_index = Arc::new(SccHashMap::new());
         let (audit_tx, audit_rx) = sync_channel(4096);
         let (ingest_writer_tx, ingest_writer_rx) =
             sync_channel(config.ingest_queue_capacity.max(1));
@@ -354,12 +366,10 @@ impl ProductionState {
             hot_vector_shards,
             hot_indices,
             shard_mask,
-            metadata_cache_shards,
+            metadata_cache,
             segments: ArcSwap::from_pointee(Vec::new()),
             archive_segments: ArcSwap::from_pointee(Vec::new()),
-            filter_index_shards: (0..shard_count)
-                .map(|_| RwLock::new(FilterIndex::default()))
-                .collect(),
+            filter_index,
             filter_allow_cache: RwLock::new(HashMap::new()),
             filter_cache_epoch: AtomicU64::new(1),
             retired_segments: std::sync::Mutex::new(HashMap::new()),
@@ -410,16 +420,23 @@ impl ProductionState {
             });
     }
 
-    fn estimate_metadata_bytes(metadata: &VectorMetadata) -> u64 {
-        let mut bytes = metadata.source_file.len() as u64;
+    fn estimate_ingest_metadata_bytes(metadata: &IngestMetadataV3Input) -> u64 {
+        let mut bytes = metadata.payload.len() as u64;
         bytes = bytes
-            .saturating_add(std::mem::size_of::<u32>() as u64)
-            .saturating_add(std::mem::size_of::<u16>() as u64)
-            .saturating_add(std::mem::size_of::<f32>() as u64);
+            .saturating_add(std::mem::size_of::<u64>() as u64)
+            .saturating_add(std::mem::size_of::<u64>() as u64);
         for tag in &metadata.tags {
             bytes = bytes.saturating_add(tag.len() as u64);
         }
         bytes
+    }
+
+    fn estimate_cached_metadata_bytes(metadata: &VectorMetadataV3) -> u64 {
+        let tags_bytes =
+            (metadata.tags.len() as u64).saturating_mul(std::mem::size_of::<u32>() as u64);
+        tags_bytes
+            .saturating_add(metadata.payload.len() as u64)
+            .saturating_add(std::mem::size_of::<u64>() as u64 * 2)
     }
 
     fn estimate_hnsw_bytes_per_vector(&self) -> u64 {
@@ -430,7 +447,7 @@ impl ProductionState {
 
     fn enqueue_ingest_batch(
         &self,
-        entries: Vec<(Vec<f32>, VectorMetadata, Option<String>)>,
+        entries: Vec<(Vec<f32>, IngestMetadataV3Input, Option<String>)>,
         estimated_bytes: u64,
     ) -> Result<IngestWriteOutcome> {
         let (result_tx, result_rx) = sync_channel(1);
@@ -453,11 +470,11 @@ impl ProductionState {
 
     pub fn estimate_ingest_entry_bytes(
         vector: &[f32],
-        metadata: &VectorMetadata,
+        metadata: &IngestMetadataV3Input,
         idempotency_key: Option<&str>,
     ) -> u64 {
         let vector_bytes = (vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
-        let metadata_bytes = Self::estimate_metadata_bytes(metadata);
+        let metadata_bytes = Self::estimate_ingest_metadata_bytes(metadata);
         let idempotency_bytes = idempotency_key.map(|v| v.len() as u64).unwrap_or(0);
         vector_bytes
             .saturating_add(metadata_bytes)
@@ -465,7 +482,7 @@ impl ProductionState {
     }
 
     pub fn estimate_ingest_batch_bytes(
-        entries: &[(Vec<f32>, VectorMetadata, Option<String>)],
+        entries: &[(Vec<f32>, IngestMetadataV3Input, Option<String>)],
     ) -> u64 {
         entries.iter().fold(0u64, |acc, (vector, metadata, key)| {
             acc.saturating_add(Self::estimate_ingest_entry_bytes(
@@ -611,9 +628,14 @@ impl ProductionState {
         }
     }
 
-    pub fn insert_hot_vector(&self, vector_id: usize, vector: Vec<f32>, metadata: VectorMetadata) {
+    pub fn insert_hot_vector(
+        &self,
+        vector_id: usize,
+        vector: Vec<f32>,
+        metadata: VectorMetadataV3,
+    ) {
         let vector_bytes = (vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
-        let metadata_bytes = Self::estimate_metadata_bytes(&metadata);
+        let metadata_bytes = Self::estimate_cached_metadata_bytes(&metadata);
         let shard = vector_id & self.shard_mask;
         if let Some(shard_vectors) = self.hot_vector_shards.get(shard) {
             shard_vectors.load().upsert(vector_id, Arc::new(vector));
@@ -621,11 +643,18 @@ impl ProductionState {
         if let Some(index) = self.hot_indices.get(shard) {
             index.write().insert(vector_id);
         }
-        if let Some(metadata_shard) = self.metadata_cache_shards.get(shard) {
-            metadata_shard.upsert(vector_id, metadata.clone());
-        }
-        if let Some(filter_shard) = self.filter_index_shards.get(shard) {
-            filter_shard.write().add(vector_id, &metadata);
+        self.metadata_cache.upsert(vector_id, metadata.clone());
+        for tag_id in &metadata.tags {
+            match self.filter_index.entry(*tag_id) {
+                SccEntry::Occupied(mut entry) => {
+                    entry.get_mut().insert(vector_id);
+                }
+                SccEntry::Vacant(entry) => {
+                    let mut set = BitmapSet::default();
+                    set.insert(vector_id);
+                    entry.insert_entry(set);
+                }
+            }
         }
         self.bump_filter_cache_epoch();
         self.hot_vectors_bytes
@@ -641,7 +670,7 @@ impl ProductionState {
     pub fn ingest_vector(
         &self,
         vector: &[f32],
-        metadata: &VectorMetadata,
+        metadata: &IngestMetadataV3Input,
         idempotency_key: Option<&str>,
     ) -> Result<(usize, bool)> {
         if vector.len() != self.collection.dim {
@@ -669,7 +698,7 @@ impl ProductionState {
     /// hot index updates. Returns (vector_id, created) for each entry.
     pub fn ingest_batch(
         &self,
-        entries: &[(Vec<f32>, VectorMetadata, Option<String>)],
+        entries: &[(Vec<f32>, IngestMetadataV3Input, Option<String>)],
     ) -> Result<Vec<(usize, bool)>> {
         self.ingest_batch_owned(entries.to_vec())
     }
@@ -678,7 +707,7 @@ impl ProductionState {
     /// before enqueueing to the dedicated SQLite writer lane.
     pub fn ingest_batch_owned(
         &self,
-        entries: Vec<(Vec<f32>, VectorMetadata, Option<String>)>,
+        entries: Vec<(Vec<f32>, IngestMetadataV3Input, Option<String>)>,
     ) -> Result<Vec<(usize, bool)>> {
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -722,14 +751,15 @@ impl ProductionState {
         struct CreatedShardItem {
             vector_id: usize,
             vector: Vec<f32>,
-            metadata: VectorMetadata,
+            metadata: VectorMetadataV3,
         }
 
         // 2. Group by shard for efficient lock acquisition.
         // Own vectors here so we can move them into Arc without another clone.
         let mut by_shard: HashMap<usize, Vec<CreatedShardItem>> = HashMap::new();
-        for (result, (vector, metadata, _)) in wal_results.iter().zip(entries.into_iter()) {
+        for (result, (vector, _, _)) in wal_results.iter().zip(entries.into_iter()) {
             if result.created {
+                let metadata = result.metadata.clone().unwrap_or_default();
                 let shard = result.vector_id & self.shard_mask;
                 by_shard.entry(shard).or_default().push(CreatedShardItem {
                     vector_id: result.vector_id,
@@ -769,33 +799,25 @@ impl ProductionState {
 
         // 4. Update metadata cache + filter index in one pass.
         if created_count > 0 {
-            let mut metadata_by_shard = vec![Vec::new(); self.metadata_cache_shards.len()];
             let mut metadata_bytes_delta = 0u64;
             let mut vector_bytes = 0u64;
             for (vector_id, metadata, vec_len) in metadata_updates {
-                metadata_bytes_delta =
-                    metadata_bytes_delta.saturating_add(Self::estimate_metadata_bytes(&metadata));
+                metadata_bytes_delta = metadata_bytes_delta
+                    .saturating_add(Self::estimate_cached_metadata_bytes(&metadata));
                 vector_bytes = vector_bytes.saturating_add(
                     (vec_len as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
                 );
-                let shard = vector_id & self.shard_mask;
-                if let Some(bucket) = metadata_by_shard.get_mut(shard) {
-                    bucket.push((vector_id, metadata));
-                }
-            }
-
-            for (shard, rows) in metadata_by_shard.into_iter().enumerate() {
-                if rows.is_empty() {
-                    continue;
-                }
-                if let (Some(filter_shard), Some(metadata_shard)) = (
-                    self.filter_index_shards.get(shard),
-                    self.metadata_cache_shards.get(shard),
-                ) {
-                    let mut filter_guard = filter_shard.write();
-                    for (vector_id, metadata) in rows {
-                        filter_guard.add(vector_id, &metadata);
-                        metadata_shard.upsert(vector_id, metadata);
+                self.metadata_cache.upsert(vector_id, metadata.clone());
+                for tag_id in &metadata.tags {
+                    match self.filter_index.entry(*tag_id) {
+                        SccEntry::Occupied(mut entry) => {
+                            entry.get_mut().insert(vector_id);
+                        }
+                        SccEntry::Vacant(entry) => {
+                            let mut set = BitmapSet::default();
+                            set.insert(vector_id);
+                            entry.insert_entry(set);
+                        }
                     }
                 }
             }
@@ -992,7 +1014,7 @@ impl ProductionState {
         merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
         let metadata_map = if request.include_metadata {
-            self.metadata_for_ids(&merged.iter().map(|(id, _)| *id).collect::<Vec<_>>())?
+            self.metadata_envelopes_for_ids(&merged.iter().map(|(id, _)| *id).collect::<Vec<_>>())?
         } else {
             HashMap::new()
         };
@@ -1208,7 +1230,7 @@ impl ProductionState {
         merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
         let metadata_map = if request.include_metadata {
-            self.metadata_for_ids(&merged.iter().map(|(id, _)| *id).collect::<Vec<_>>())?
+            self.metadata_envelopes_for_ids(&merged.iter().map(|(id, _)| *id).collect::<Vec<_>>())?
         } else {
             HashMap::new()
         };
@@ -1228,10 +1250,7 @@ impl ProductionState {
                     None
                 };
                 let (start_timestamp_ms, duration_ms) = if let Some(meta) = metadata.as_ref() {
-                    (
-                        meta.start_time_ms as u64,
-                        (meta.duration_ms as u64).saturating_mul(seq_len as u64),
-                    )
+                    (meta.sequence_ts, 0u64.saturating_mul(seq_len as u64))
                 } else {
                     (0, 0)
                 };
@@ -1373,6 +1392,27 @@ impl ProductionState {
             "vibrato_ingest_semantic_throttle_ms_total {}\n",
             self.metrics
                 .ingest_semantic_throttle_ms_total
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_tag_reject_overflow_total counter\n");
+        out.push_str(&format!(
+            "vibrato_tag_reject_overflow_total {}\n",
+            self.metrics
+                .tag_reject_overflow_total
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_tag_reject_invalid_total counter\n");
+        out.push_str(&format!(
+            "vibrato_tag_reject_invalid_total {}\n",
+            self.metrics
+                .tag_reject_invalid_total
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_flight_decode_chunk_warn_total counter\n");
+        out.push_str(&format!(
+            "vibrato_flight_decode_chunk_warn_total {}\n",
+            self.metrics
+                .flight_decode_chunk_warn_total
                 .load(AtomicOrdering::Relaxed)
         ));
         out.push_str("# TYPE vibrato_auth_failures_total counter\n");
@@ -2163,41 +2203,30 @@ impl ProductionState {
 
     pub fn rebuild_filter_index(&self) -> Result<()> {
         let entries = self.catalog.fetch_all_metadata(&self.collection.id)?;
-        let tag_dictionary = self.catalog.fetch_tag_dictionary(&self.collection.id)?;
         let filter_rows = self.catalog.fetch_filter_rows(&self.collection.id)?;
 
-        let mut index_shards = (0..self.filter_index_shards.len())
-            .map(|_| FilterIndex::with_dictionary(tag_dictionary.clone()))
-            .collect::<Vec<_>>();
+        self.filter_index.clear();
         for row in filter_rows {
-            let shard = row.vector_id & self.shard_mask;
-            if let Some(index) = index_shards.get_mut(shard) {
-                index.add_with_tag_ids(row.vector_id, row.bpm, &row.tag_ids);
-            }
-        }
-        let mut metadata_shards = (0..self.metadata_cache_shards.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<Vec<(usize, VectorMetadata)>>>();
-        let mut metadata_bytes = 0u64;
-        for (id, meta) in entries {
-            metadata_bytes = metadata_bytes.saturating_add(Self::estimate_metadata_bytes(&meta));
-            let shard = id & self.shard_mask;
-            if let Some(shard_map) = metadata_shards.get_mut(shard) {
-                shard_map.push((id, meta));
-            }
-        }
-        for (idx, index) in index_shards.into_iter().enumerate() {
-            if let Some(shard) = self.filter_index_shards.get(idx) {
-                *shard.write() = index;
-            }
-        }
-        for (idx, shard_data) in metadata_shards.into_iter().enumerate() {
-            if let Some(shard) = self.metadata_cache_shards.get(idx) {
-                shard.clear();
-                for (id, meta) in shard_data {
-                    shard.upsert(id, meta);
+            for tag_id in row.tag_ids {
+                match self.filter_index.entry(tag_id) {
+                    SccEntry::Occupied(mut entry) => {
+                        entry.get_mut().insert(row.vector_id);
+                    }
+                    SccEntry::Vacant(entry) => {
+                        let mut set = BitmapSet::default();
+                        set.insert(row.vector_id);
+                        entry.insert_entry(set);
+                    }
                 }
             }
+        }
+
+        self.metadata_cache.clear();
+        let mut metadata_bytes = 0u64;
+        for (id, meta) in entries {
+            metadata_bytes =
+                metadata_bytes.saturating_add(Self::estimate_cached_metadata_bytes(&meta));
+            self.metadata_cache.upsert(id, meta);
         }
         self.metadata_cache_bytes
             .store(metadata_bytes, AtomicOrdering::Relaxed);
@@ -2205,7 +2234,7 @@ impl ProductionState {
         Ok(())
     }
 
-    fn metadata_for_ids(&self, ids: &[usize]) -> Result<HashMap<usize, VectorMetadata>> {
+    fn metadata_for_ids_internal(&self, ids: &[usize]) -> Result<HashMap<usize, VectorMetadataV3>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -2213,12 +2242,9 @@ impl ProductionState {
         let mut out = HashMap::with_capacity(ids.len());
         let mut missing = Vec::new();
         for id in ids {
-            let shard = *id & self.shard_mask;
-            if let Some(cache) = self.metadata_cache_shards.get(shard) {
-                if let Some(meta) = cache.read(id, |_, meta| meta.clone()) {
-                    out.insert(*id, meta);
-                    continue;
-                }
+            if let Some(meta) = self.metadata_cache.read(id, |_, meta| meta.clone()) {
+                out.insert(*id, meta);
+                continue;
             }
             missing.push(*id);
         }
@@ -2227,10 +2253,7 @@ impl ProductionState {
             let fetched = self.catalog.fetch_metadata(&self.collection.id, &missing)?;
             if !fetched.is_empty() {
                 for (id, meta) in &fetched {
-                    let shard = *id & self.shard_mask;
-                    if let Some(cache) = self.metadata_cache_shards.get(shard) {
-                        cache.upsert(*id, meta.clone());
-                    }
+                    self.metadata_cache.upsert(*id, meta.clone());
                 }
             }
             for (id, meta) in fetched {
@@ -2241,41 +2264,97 @@ impl ProductionState {
         Ok(out)
     }
 
-    fn build_allow_set_sharded(&self, filter: &super::model::QueryFilter) -> Option<BitmapSet> {
-        let clause_weight = filter.tags_all.len()
-            + filter.tags_any.len()
-            + usize::from(filter.bpm_gte.is_some() || filter.bpm_lte.is_some());
-        let should_parallelize = self.filter_index_shards.len()
-            >= self.config.filter_parallel_min_shards
-            && clause_weight >= 2;
+    fn metadata_envelopes_for_ids(
+        &self,
+        ids: &[usize],
+    ) -> Result<HashMap<usize, MetadataEnvelopeV3>> {
+        let metadata_map = self.metadata_for_ids_internal(ids)?;
+        if metadata_map.is_empty() {
+            return Ok(HashMap::new());
+        }
 
-        if should_parallelize {
-            let shard_sets = self.query_pool.install(|| {
-                self.filter_index_shards
-                    .par_iter()
-                    .filter_map(|shard| shard.read().build_allow_set(filter))
-                    .collect::<Vec<_>>()
-            });
+        let mut tag_ids = metadata_map
+            .values()
+            .flat_map(|meta| meta.tags.iter().copied())
+            .collect::<Vec<_>>();
+        tag_ids.sort_unstable();
+        tag_ids.dedup();
+        let tag_texts = self
+            .catalog
+            .resolve_tag_texts(&self.collection.id, &tag_ids)?;
 
-            let mut iter = shard_sets.into_iter();
-            let mut allow = iter.next()?;
-            for local in iter {
-                allow.union_with(&local);
+        let mut out = HashMap::with_capacity(metadata_map.len());
+        for (id, meta) in metadata_map {
+            let tags = meta
+                .tags
+                .iter()
+                .filter_map(|tag_id| tag_texts.get(tag_id).cloned())
+                .collect::<Vec<_>>();
+            out.insert(id, MetadataEnvelopeV3::from_internal(&meta, tags));
+        }
+        Ok(out)
+    }
+
+    fn build_allow_set(&self, filter: &super::model::QueryFilter) -> Option<BitmapSet> {
+        let mut allow: Option<BitmapSet> = None;
+
+        if !filter.tags_all.is_empty() {
+            let mut normalized = filter
+                .tags_all
+                .iter()
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>();
+            normalized.sort();
+            normalized.dedup();
+
+            let tag_ids = self
+                .catalog
+                .resolve_tag_ids_readonly(&self.collection.id, &normalized)
+                .ok()?;
+            if tag_ids.len() < normalized.len() {
+                return Some(BitmapSet::default());
             }
-            Some(allow)
-        } else {
-            let mut allow: Option<BitmapSet> = None;
-            for shard in &self.filter_index_shards {
-                if let Some(local) = shard.read().build_allow_set(filter) {
-                    if let Some(existing) = allow.as_mut() {
-                        existing.union_with(&local);
-                    } else {
-                        allow = Some(local);
-                    }
+
+            for tag_id in tag_ids {
+                let bm = self
+                    .filter_index
+                    .read(&tag_id, |_, bm| bm.clone())
+                    .unwrap_or_default();
+                allow = Some(match allow {
+                    Some(curr) => curr.intersect(&bm),
+                    None => bm,
+                });
+            }
+        }
+
+        if !filter.tags_any.is_empty() {
+            let mut normalized = filter
+                .tags_any
+                .iter()
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>();
+            normalized.sort();
+            normalized.dedup();
+            let tag_ids = self
+                .catalog
+                .resolve_tag_ids_readonly(&self.collection.id, &normalized)
+                .ok()?;
+
+            let mut any_union = BitmapSet::default();
+            for tag_id in tag_ids {
+                if let Some(bm) = self.filter_index.read(&tag_id, |_, bm| bm.clone()) {
+                    any_union.union_with(&bm);
                 }
             }
-            allow
+            allow = Some(match allow {
+                Some(curr) => curr.intersect(&any_union),
+                None => any_union,
+            });
         }
+
+        allow
     }
 
     fn bump_filter_cache_epoch(&self) {
@@ -2307,14 +2386,6 @@ impl ProductionState {
         key.push_str(&tags_any.join(","));
         key.push_str("|all=");
         key.push_str(&tags_all.join(","));
-        key.push_str("|gte=");
-        if let Some(v) = filter.bpm_gte {
-            key.push_str(&format!("{v:.3}"));
-        }
-        key.push_str("|lte=");
-        if let Some(v) = filter.bpm_lte {
-            key.push_str(&format!("{v:.3}"));
-        }
         key
     }
 
@@ -2327,7 +2398,7 @@ impl ProductionState {
             }
         }
 
-        let bitmap = Arc::new(self.build_allow_set_sharded(filter)?);
+        let bitmap = Arc::new(self.build_allow_set(filter)?);
         let mut cache = self.filter_allow_cache.write();
         if cache.len() >= 512 {
             cache.clear();
@@ -2522,7 +2593,7 @@ fn write_segment(
     config: &ProductionConfig,
     dim: usize,
     vectors: &[Vec<f32>],
-    metadata: &[VectorMetadata],
+    metadata: &[VectorMetadataV3],
     graph: &HNSW,
     output_path: &std::path::Path,
 ) -> Result<()> {
@@ -2533,7 +2604,11 @@ fn write_segment(
     }
 
     let base_store = VectorStore::open(&empty_base_path)?;
-    VdbWriterV2::merge_with_metadata(&base_store, vectors, metadata, graph, output_path)?;
+    let legacy_metadata = metadata
+        .iter()
+        .map(legacy_segment_metadata)
+        .collect::<Vec<_>>();
+    VdbWriterV2::merge_with_metadata(&base_store, vectors, &legacy_metadata, graph, output_path)?;
 
     File::open(output_path)?.sync_all()?;
     sync_parent(output_path)?;
@@ -2543,7 +2618,7 @@ fn write_segment(
 fn write_archive_pq_segment(
     dim: usize,
     vectors: &[Vec<f32>],
-    metadata: &[VectorMetadata],
+    metadata: &[VectorMetadataV3],
     output_path: &std::path::Path,
 ) -> Result<()> {
     if vectors.is_empty() {
@@ -2583,12 +2658,13 @@ fn write_archive_pq_segment(
 
     let mut metadata_builder = MetadataBuilder::new();
     for item in metadata {
-        let tags: Vec<&str> = item.tags.iter().map(|s| s.as_str()).collect();
+        let legacy = legacy_segment_metadata(item);
+        let tags: Vec<&str> = legacy.tags.iter().map(|s| s.as_str()).collect();
         metadata_builder.add_entry(
-            &item.source_file,
-            item.start_time_ms,
-            item.duration_ms,
-            item.bpm,
+            &legacy.source_file,
+            legacy.start_time_ms,
+            legacy.duration_ms,
+            legacy.bpm,
             &tags,
         );
     }
@@ -2791,34 +2867,12 @@ fn build_index_from_pairs(
     hnsw
 }
 
-fn wal_to_arrays(entries: &[WalEntry]) -> (Vec<usize>, Vec<Vec<f32>>, Vec<VectorMetadata>) {
-    let mut ids = Vec::with_capacity(entries.len());
-    let mut vectors = Vec::with_capacity(entries.len());
-    let mut metadata = Vec::with_capacity(entries.len());
-    for e in entries {
-        ids.push(e.vector_id);
-        vectors.push(e.vector.clone());
-        metadata.push(e.metadata.clone());
-    }
-    (ids, vectors, metadata)
-}
-
-fn tombstone_metadata() -> VectorMetadata {
-    VectorMetadata {
-        source_file: "__vibrato_tombstone__".to_string(),
-        start_time_ms: 0,
-        duration_ms: 0,
-        bpm: 0.0,
-        tags: vec!["__vibrato_tombstone__".to_string()],
-    }
-}
-
 fn densify_id_space(
     dim: usize,
     ids: Vec<usize>,
     vectors: Vec<Vec<f32>>,
-    metadata: Vec<VectorMetadata>,
-) -> Result<(Vec<usize>, Vec<Vec<f32>>, Vec<VectorMetadata>)> {
+    metadata: Vec<VectorMetadataV3>,
+) -> Result<(Vec<usize>, Vec<Vec<f32>>, Vec<VectorMetadataV3>)> {
     if ids.len() != vectors.len() || ids.len() != metadata.len() {
         return Err(anyhow!(
             "id/vector/metadata length mismatch: ids={} vectors={} metadata={}",
@@ -2860,7 +2914,7 @@ fn densify_id_space(
         while cursor < id {
             out_ids.push(cursor);
             out_vectors.push(vec![0.0f32; dim]);
-            out_metadata.push(tombstone_metadata());
+            out_metadata.push(VectorMetadataV3::default());
             cursor = cursor.saturating_add(1);
         }
         out_ids.push(id);
@@ -2870,6 +2924,33 @@ fn densify_id_space(
     }
 
     Ok((out_ids, out_vectors, out_metadata))
+}
+
+fn wal_to_arrays(entries: &[WalEntry]) -> (Vec<usize>, Vec<Vec<f32>>, Vec<VectorMetadataV3>) {
+    let mut ids = Vec::with_capacity(entries.len());
+    let mut vectors = Vec::with_capacity(entries.len());
+    let mut metadata = Vec::with_capacity(entries.len());
+    for e in entries {
+        ids.push(e.vector_id);
+        vectors.push(e.vector.clone());
+        metadata.push(e.metadata.clone());
+    }
+    (ids, vectors, metadata)
+}
+
+fn legacy_segment_metadata(metadata: &VectorMetadataV3) -> VectorMetadata {
+    if !metadata.payload.is_empty() {
+        if let Ok(decoded) = rmp_serde::from_slice::<VectorMetadata>(&metadata.payload) {
+            return decoded;
+        }
+    }
+    VectorMetadata {
+        source_file: String::new(),
+        start_time_ms: metadata.sequence_ts.min(u32::MAX as u64) as u32,
+        duration_ms: 0,
+        bpm: 0.0,
+        tags: metadata.tags.iter().map(|id| id.to_string()).collect(),
+    }
 }
 
 fn merge_best(best: &mut HashMap<usize, f32>, id: usize, score: f32) {

@@ -5,9 +5,9 @@ use std::thread;
 use std::time::Duration;
 
 use tempfile::tempdir;
-use vibrato_core::metadata::VectorMetadata;
 use vibrato_db::prod::{
-    bootstrap_data_dirs, CatalogOptions, CatalogStore, ProductionConfig, SqliteCatalog,
+    bootstrap_data_dirs, CatalogOptions, CatalogStore, IngestMetadataV3Input, ProductionConfig,
+    SqliteCatalog,
 };
 
 fn test_config(data_dir: PathBuf) -> ProductionConfig {
@@ -29,6 +29,7 @@ fn sqlite_wal_growth_stays_bounded_under_timeout_prone_reads() {
             CatalogOptions {
                 read_timeout_ms: 500,
                 wal_autocheckpoint_pages: config.sqlite_wal_autocheckpoint_pages,
+                max_tag_registry_size: 500_000,
             },
         )
         .expect("open writer"),
@@ -39,12 +40,11 @@ fn sqlite_wal_growth_stays_bounded_under_timeout_prone_reads() {
 
     // Preload enough metadata so 1ms scans reliably timeout in read thread.
     for i in 0..5000usize {
-        let meta = VectorMetadata {
-            source_file: format!("preload-{i}.wav"),
-            start_time_ms: i as u32,
-            duration_ms: 100,
-            bpm: 120.0,
+        let meta = IngestMetadataV3Input {
+            entity_id: i as u64,
+            sequence_ts: i as u64,
             tags: vec!["drums".to_string(), "wal_guard".to_string()],
+            payload: Vec::new(),
         };
         let _ = writer
             .ingest_wal_atomic(
@@ -62,6 +62,7 @@ fn sqlite_wal_growth_stays_bounded_under_timeout_prone_reads() {
             CatalogOptions {
                 read_timeout_ms: 1,
                 wal_autocheckpoint_pages: config.sqlite_wal_autocheckpoint_pages,
+                max_tag_registry_size: 500_000,
             },
         )
         .expect("open read catalog"),
@@ -80,12 +81,11 @@ fn sqlite_wal_growth_stays_bounded_under_timeout_prone_reads() {
 
     for i in 0..15_000usize {
         let base = i as f32 / 15_000.0;
-        let meta = VectorMetadata {
-            source_file: format!("write-pressure-{i}.wav"),
-            start_time_ms: i as u32,
-            duration_ms: 80,
-            bpm: 110.0 + ((i % 50) as f32),
+        let meta = IngestMetadataV3Input {
+            entity_id: i as u64,
+            sequence_ts: i as u64,
             tags: vec!["writes".to_string(), "wal_guard".to_string()],
+            payload: Vec::new(),
         };
         let _ = writer
             .ingest_wal_atomic(

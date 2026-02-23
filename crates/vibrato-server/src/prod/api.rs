@@ -4,32 +4,34 @@ use std::time::Instant;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use tokio::time::sleep;
 
 use super::auth::{authorize, AuthError};
-use super::catalog::Role;
+use super::catalog::{IngestMetadataV3Input, Role};
 use super::engine::{IngestBackpressureDecision, ProductionState};
 use super::model::{
     ApiResponse, ErrorBody, HealthResponseV2, IdentifyRequestV2, IngestBatchRequestV2,
-    IngestBatchResponseV2, IngestRequestV2, IngestResponseV2, JobResponseV2, QueryRequestV2,
+    IngestBatchResponseV2, IngestMetadataV3, IngestRequestV2, IngestResponseV2, JobResponseV2,
+    QueryRequestV2,
 };
 use super::snapshot::create_snapshot;
 
-pub fn create_v2_router(state: Arc<ProductionState>) -> Router {
+pub fn create_v3_router(state: Arc<ProductionState>) -> Router {
     Router::new()
-        .route("/v2/vectors", post(v2_ingest))
-        .route("/v2/vectors/batch", post(v2_ingest_batch))
-        .route("/v2/query", post(v2_query))
-        .route("/v2/identify", post(v2_identify))
-        .route("/v2/health/live", get(v2_health_live))
-        .route("/v2/health/ready", get(v2_health_ready))
-        .route("/v2/admin/checkpoint", post(v2_admin_checkpoint))
-        .route("/v2/admin/compact", post(v2_admin_compact))
-        .route("/v2/admin/snapshot", post(v2_admin_snapshot))
-        .route("/v2/admin/stats", get(v2_admin_stats))
-        .route("/v2/metrics", get(v2_metrics))
+        .route("/v3/vectors", post(v2_ingest))
+        .route("/v3/vectors/batch", post(v2_ingest_batch))
+        .route("/v3/query", post(v2_query))
+        .route("/v3/identify", post(v2_identify))
+        .route("/v3/health/live", get(v2_health_live))
+        .route("/v3/health/ready", get(v2_health_ready))
+        .route("/v3/admin/checkpoint", post(v2_admin_checkpoint))
+        .route("/v3/admin/compact", post(v2_admin_compact))
+        .route("/v3/admin/snapshot", post(v2_admin_snapshot))
+        .route("/v3/admin/stats", get(v2_admin_stats))
+        .route("/v3/metrics", get(v2_metrics))
+        .route("/v2/{*path}", any(v2_deprecated))
         .with_state(state)
 }
 
@@ -53,11 +55,26 @@ async fn v2_ingest(
                 .metrics
                 .auth_failures_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return auth_error_response(&state, &request_id, "/v2/vectors", "ingest", started, e);
+            return auth_error_response(&state, &request_id, "/v3/vectors", "ingest", started, e);
         }
     };
 
-    let metadata = body.metadata.into();
+    let metadata = match ingest_metadata_to_input(&state, &body.metadata) {
+        Ok(meta) => meta,
+        Err(msg) => {
+            state
+                .metrics
+                .tag_reject_invalid_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &request_id,
+                "invalid_tag",
+                msg,
+                None,
+            );
+        }
+    };
     let idempotency_key = body.idempotency_key.clone();
     let vector = body.vector.clone();
     let incoming_bytes = ProductionState::estimate_ingest_entry_bytes(
@@ -75,7 +92,7 @@ async fn v2_ingest(
         } => {
             state.record_ingest_soft_throttle(delay);
             tracing::debug!(
-                "semantic_throttle endpoint=/v2/vectors delay_ms={} projected={} soft={} hard={}",
+                "semantic_throttle endpoint=/v3/vectors delay_ms={} projected={} soft={} hard={}",
                 delay.as_millis(),
                 projected_bytes,
                 soft_limit_bytes,
@@ -106,7 +123,7 @@ async fn v2_ingest(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/vectors",
+                "/v3/vectors",
                 "ingest",
                 StatusCode::TOO_MANY_REQUESTS.as_u16(),
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -142,7 +159,7 @@ async fn v2_ingest(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/vectors",
+                "/v3/vectors",
                 "ingest",
                 201,
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -152,12 +169,18 @@ async fn v2_ingest(
         }
         Err(e) => {
             let (status, code) = classify_ingest_error(&e);
+            if code == "tag_registry_overflow" {
+                state
+                    .metrics
+                    .tag_reject_overflow_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let resp = error_response(status, &request_id, code, e.to_string(), None);
             audit_best_effort(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/vectors",
+                "/v3/vectors",
                 "ingest",
                 status.as_u16(),
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -191,7 +214,7 @@ async fn v2_ingest_batch(
             return auth_error_response(
                 &state,
                 &request_id,
-                "/v2/vectors/batch",
+                "/v3/vectors/batch",
                 "ingest_batch",
                 started,
                 e,
@@ -208,14 +231,30 @@ async fn v2_ingest_batch(
     }
 
     // Convert to engine format
-    let entries: Vec<_> = body
+    let entries = body
         .vectors
         .into_iter()
-        .map(|req| {
-            let meta = req.metadata.into();
-            (req.vector, meta, req.idempotency_key)
+        .map(|req| -> std::result::Result<_, String> {
+            let meta = ingest_metadata_to_input(&state, &req.metadata)?;
+            Ok((req.vector, meta, req.idempotency_key))
         })
-        .collect();
+        .collect::<std::result::Result<Vec<_>, _>>();
+    let entries = match entries {
+        Ok(v) => v,
+        Err(msg) => {
+            state
+                .metrics
+                .tag_reject_invalid_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &request_id,
+                "invalid_tag",
+                msg,
+                None,
+            );
+        }
+    };
 
     let incoming_bytes = ProductionState::estimate_ingest_batch_bytes(&entries);
     match state.ingest_backpressure_decision(incoming_bytes) {
@@ -228,7 +267,7 @@ async fn v2_ingest_batch(
         } => {
             state.record_ingest_soft_throttle(delay);
             tracing::debug!(
-                "semantic_throttle endpoint=/v2/vectors/batch delay_ms={} projected={} soft={} hard={}",
+                "semantic_throttle endpoint=/v3/vectors/batch delay_ms={} projected={} soft={} hard={}",
                 delay.as_millis(),
                 projected_bytes,
                 soft_limit_bytes,
@@ -259,7 +298,7 @@ async fn v2_ingest_batch(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/vectors/batch",
+                "/v3/vectors/batch",
                 "ingest_batch",
                 StatusCode::TOO_MANY_REQUESTS.as_u16(),
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -297,7 +336,7 @@ async fn v2_ingest_batch(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/vectors/batch",
+                "/v3/vectors/batch",
                 "ingest_batch",
                 201,
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -307,12 +346,18 @@ async fn v2_ingest_batch(
         }
         Err(e) => {
             let (status, code) = classify_ingest_error(&e);
+            if code == "tag_registry_overflow" {
+                state
+                    .metrics
+                    .tag_reject_overflow_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let resp = error_response(status, &request_id, code, e.to_string(), None);
             audit_best_effort(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/vectors/batch",
+                "/v3/vectors/batch",
                 "ingest_batch",
                 status.as_u16(),
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -343,7 +388,7 @@ async fn v2_query(
                 .metrics
                 .auth_failures_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return auth_error_response(&state, &request_id, "/v2/query", "query", started, e);
+            return auth_error_response(&state, &request_id, "/v3/query", "query", started, e);
         }
     };
 
@@ -362,7 +407,7 @@ async fn v2_query(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/query",
+                "/v3/query",
                 "query",
                 200,
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -377,7 +422,7 @@ async fn v2_query(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/query",
+                "/v3/query",
                 "query",
                 status.as_u16(),
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -411,7 +456,7 @@ async fn v2_identify(
             return auth_error_response(
                 &state,
                 &request_id,
-                "/v2/identify",
+                "/v3/identify",
                 "identify",
                 started,
                 e,
@@ -434,7 +479,7 @@ async fn v2_identify(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/identify",
+                "/v3/identify",
                 "identify",
                 200,
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -449,7 +494,7 @@ async fn v2_identify(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/identify",
+                "/v3/identify",
                 "identify",
                 status.as_u16(),
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -482,7 +527,7 @@ async fn v2_admin_checkpoint(
             return auth_error_response(
                 &state,
                 &request_id,
-                "/v2/admin/checkpoint",
+                "/v3/admin/checkpoint",
                 "checkpoint",
                 started,
                 e,
@@ -504,7 +549,7 @@ async fn v2_admin_checkpoint(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/admin/checkpoint",
+                "/v3/admin/checkpoint",
                 "checkpoint",
                 200,
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -524,7 +569,7 @@ async fn v2_admin_checkpoint(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/admin/checkpoint",
+                "/v3/admin/checkpoint",
                 "checkpoint",
                 500,
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -557,7 +602,7 @@ async fn v2_admin_compact(
             return auth_error_response(
                 &state,
                 &request_id,
-                "/v2/admin/compact",
+                "/v3/admin/compact",
                 "compact",
                 started,
                 e,
@@ -579,7 +624,7 @@ async fn v2_admin_compact(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/admin/compact",
+                "/v3/admin/compact",
                 "compact",
                 200,
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -599,7 +644,7 @@ async fn v2_admin_compact(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/admin/compact",
+                "/v3/admin/compact",
                 "compact",
                 500,
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -632,7 +677,7 @@ async fn v2_admin_snapshot(
             return auth_error_response(
                 &state,
                 &request_id,
-                "/v2/admin/snapshot",
+                "/v3/admin/snapshot",
                 "snapshot",
                 started,
                 e,
@@ -662,7 +707,7 @@ async fn v2_admin_snapshot(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/admin/snapshot",
+                "/v3/admin/snapshot",
                 "snapshot",
                 200,
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -682,7 +727,7 @@ async fn v2_admin_snapshot(
                 &state,
                 &request_id,
                 auth.as_deref(),
-                "/v2/admin/snapshot",
+                "/v3/admin/snapshot",
                 "snapshot",
                 500,
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -749,7 +794,7 @@ async fn v2_health_live(State(state): State<Arc<ProductionState>>, headers: Head
             return auth_error_response(
                 &state,
                 &request_id,
-                "/v2/health/live",
+                "/v3/health/live",
                 "health_live",
                 started,
                 e,
@@ -786,7 +831,7 @@ async fn v2_health_ready(
             return auth_error_response(
                 &state,
                 &request_id,
-                "/v2/health/ready",
+                "/v3/health/ready",
                 "health_ready",
                 started,
                 e,
@@ -823,7 +868,7 @@ async fn v2_metrics(State(state): State<Arc<ProductionState>>, headers: HeaderMa
                 .metrics
                 .auth_failures_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return auth_error_response(&state, &request_id, "/v2/metrics", "metrics", started, e);
+            return auth_error_response(&state, &request_id, "/v3/metrics", "metrics", started, e);
         }
     }
     match state.render_metrics() {
@@ -844,6 +889,17 @@ async fn v2_metrics(State(state): State<Arc<ProductionState>>, headers: HeaderMa
             None,
         ),
     }
+}
+
+async fn v2_deprecated(headers: HeaderMap) -> Response {
+    let request_id = request_id(&headers);
+    error_response(
+        StatusCode::GONE,
+        &request_id,
+        "v2_deprecated",
+        "v2 API is removed; migrate to /v3 endpoints".to_string(),
+        None,
+    )
 }
 
 fn auth_error_response(
@@ -952,9 +1008,49 @@ fn error_response(
     json_response(status, request_id, &payload)
 }
 
+fn ingest_metadata_to_input(
+    state: &ProductionState,
+    metadata: &IngestMetadataV3,
+) -> std::result::Result<IngestMetadataV3Input, String> {
+    let tags = metadata.normalized_tags();
+    if tags.len() > state.config.max_tags_per_vector {
+        return Err(format!(
+            "too many tags: limit={} actual={}",
+            state.config.max_tags_per_vector,
+            tags.len()
+        ));
+    }
+    for tag in &tags {
+        if tag.len() > state.config.max_tag_len {
+            return Err(format!(
+                "tag too long: max_tag_len={} tag='{}'",
+                state.config.max_tag_len, tag
+            ));
+        }
+        if !is_valid_tag(tag) {
+            return Err(format!("invalid tag format: '{}'", tag));
+        }
+    }
+    let payload = metadata.decode_payload()?;
+    Ok(IngestMetadataV3Input {
+        entity_id: metadata.entity_id,
+        sequence_ts: metadata.sequence_ts,
+        tags,
+        payload,
+    })
+}
+
+fn is_valid_tag(tag: &str) -> bool {
+    tag.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':'))
+}
+
 fn classify_ingest_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
     let msg = err.to_string();
     let lower = msg.to_ascii_lowercase();
+    if lower.contains("tag_registry_overflow") {
+        return (StatusCode::TOO_MANY_REQUESTS, "tag_registry_overflow");
+    }
     if lower.contains("catalog_read_timeout") {
         return (StatusCode::SERVICE_UNAVAILABLE, "catalog_read_timeout");
     }

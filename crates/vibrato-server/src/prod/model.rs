@@ -1,5 +1,7 @@
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
-use vibrato_core::metadata::VectorMetadata;
+use vibrato_core::metadata::VectorMetadataV3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {
@@ -26,66 +28,74 @@ pub struct AuditEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IngestRequestV2 {
+pub struct IngestRequestV3 {
     pub vector: Vec<f32>,
     #[serde(default)]
-    pub metadata: IngestMetadata,
+    pub metadata: IngestMetadataV3,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct IngestMetadata {
+pub struct IngestMetadataV3 {
     #[serde(default)]
-    pub source_file: String,
+    pub entity_id: u64,
     #[serde(default)]
-    pub start_time_ms: u32,
-    #[serde(default)]
-    pub duration_ms: u16,
-    #[serde(default)]
-    pub bpm: f32,
+    pub sequence_ts: u64,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub payload_base64: String,
 }
 
-impl From<IngestMetadata> for VectorMetadata {
-    fn from(value: IngestMetadata) -> Self {
-        let mut tags = value.tags;
+impl IngestMetadataV3 {
+    pub fn normalized_tags(&self) -> Vec<String> {
+        let mut tags = self.tags.clone();
         for t in &mut tags {
             *t = t.trim().to_ascii_lowercase();
         }
         tags.retain(|t| !t.is_empty());
         tags.sort();
         tags.dedup();
+        tags
+    }
 
-        VectorMetadata {
-            source_file: value.source_file,
-            start_time_ms: value.start_time_ms,
-            duration_ms: value.duration_ms,
-            bpm: value.bpm,
-            tags,
+    pub fn decode_payload(&self) -> std::result::Result<Vec<u8>, String> {
+        if self.payload_base64.trim().is_empty() {
+            return Ok(Vec::new());
         }
+        BASE64_STANDARD
+            .decode(self.payload_base64.trim())
+            .map_err(|e| format!("invalid payload_base64: {e}"))
+    }
+}
+
+pub fn encode_payload_base64(payload: &[u8]) -> String {
+    if payload.is_empty() {
+        String::new()
+    } else {
+        BASE64_STANDARD.encode(payload)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IngestResponseV2 {
+pub struct IngestResponseV3 {
     pub id: usize,
     pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IngestBatchRequestV2 {
-    pub vectors: Vec<IngestRequestV2>,
+pub struct IngestBatchRequestV3 {
+    pub vectors: Vec<IngestRequestV3>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IngestBatchResponseV2 {
-    pub results: Vec<IngestResponseV2>,
+pub struct IngestBatchResponseV3 {
+    pub results: Vec<IngestResponseV3>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryRequestV2 {
+pub struct QueryRequestV3 {
     pub vector: Vec<f32>,
     #[serde(default = "default_k")]
     pub k: usize,
@@ -136,43 +146,36 @@ pub enum SearchTier {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct QueryFilter {
+pub struct QueryFilterV3 {
     #[serde(default)]
     pub tags_any: Vec<String>,
     #[serde(default)]
     pub tags_all: Vec<String>,
-    #[serde(default)]
-    pub bpm_gte: Option<f32>,
-    #[serde(default)]
-    pub bpm_lte: Option<f32>,
 }
 
-impl QueryFilter {
+impl QueryFilterV3 {
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.tags_any.is_empty()
-            && self.tags_all.is_empty()
-            && self.bpm_gte.is_none()
-            && self.bpm_lte.is_none()
+        self.tags_any.is_empty() && self.tags_all.is_empty()
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryResultV2 {
+pub struct QueryResultV3 {
     pub id: usize,
     pub score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<VectorMetadata>,
+    pub metadata: Option<MetadataEnvelopeV3>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryResponseV2 {
-    pub results: Vec<QueryResultV2>,
+pub struct QueryResponseV3 {
+    pub results: Vec<QueryResultV3>,
     pub query_time_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IdentifyRequestV2 {
+pub struct IdentifyRequestV3 {
     pub vectors: Vec<Vec<f32>>,
     #[serde(default = "default_identify_k")]
     pub k: usize,
@@ -185,19 +188,40 @@ pub struct IdentifyRequestV2 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IdentifyResultV2 {
+pub struct IdentifyResultV3 {
     pub id: usize,
     pub start_timestamp_ms: u64,
     pub duration_ms: u64,
     pub score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<VectorMetadata>,
+    pub metadata: Option<MetadataEnvelopeV3>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IdentifyResponseV2 {
-    pub results: Vec<IdentifyResultV2>,
+pub struct IdentifyResponseV3 {
+    pub results: Vec<IdentifyResultV3>,
     pub query_time_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataEnvelopeV3 {
+    pub entity_id: u64,
+    pub sequence_ts: u64,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub payload_base64: String,
+}
+
+impl MetadataEnvelopeV3 {
+    pub fn from_internal(metadata: &VectorMetadataV3, tags: Vec<String>) -> Self {
+        Self {
+            entity_id: metadata.entity_id,
+            sequence_ts: metadata.sequence_ts,
+            tags,
+            payload_base64: encode_payload_base64(&metadata.payload),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,3 +260,17 @@ pub struct HealthResponseV2 {
     pub ready: bool,
     pub report: String,
 }
+
+// Temporary compatibility aliases while internal call-sites migrate.
+pub type IngestRequestV2 = IngestRequestV3;
+pub type IngestMetadata = IngestMetadataV3;
+pub type IngestResponseV2 = IngestResponseV3;
+pub type IngestBatchRequestV2 = IngestBatchRequestV3;
+pub type IngestBatchResponseV2 = IngestBatchResponseV3;
+pub type QueryRequestV2 = QueryRequestV3;
+pub type QueryFilter = QueryFilterV3;
+pub type QueryResultV2 = QueryResultV3;
+pub type QueryResponseV2 = QueryResponseV3;
+pub type IdentifyRequestV2 = IdentifyRequestV3;
+pub type IdentifyResultV2 = IdentifyResultV3;
+pub type IdentifyResponseV2 = IdentifyResponseV3;

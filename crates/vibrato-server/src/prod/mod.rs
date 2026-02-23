@@ -8,8 +8,10 @@ pub mod model;
 pub mod recovery;
 pub mod snapshot;
 
-pub use api::create_v2_router;
-pub use catalog::{ApiKeyCreateResult, CatalogOptions, CatalogStore, Role, SqliteCatalog};
+pub use api::create_v3_router;
+pub use catalog::{
+    ApiKeyCreateResult, CatalogOptions, CatalogStore, IngestMetadataV3Input, Role, SqliteCatalog,
+};
 pub use engine::{ProductionConfig, ProductionState, VectorMadviseMode};
 pub use flight::start_flight_server;
 pub use recovery::{

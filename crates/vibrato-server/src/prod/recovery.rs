@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use vibrato_core::format_v2::VdbHeaderV2;
-use vibrato_core::metadata::{MetadataReader, VectorMetadata};
+use vibrato_core::metadata::{MetadataReader, VectorMetadata, VectorMetadataV3};
 use vibrato_core::pq::ProductQuantizer;
 use vibrato_core::store::VectorStore;
+use xxhash_rust::xxh3::xxh3_64;
 
 use super::catalog::CatalogStore;
 use super::engine::{ProductionConfig, ProductionState};
@@ -184,9 +185,10 @@ pub fn migrate_existing_vdb_to_segment(
     let metadata = load_store_metadata(&store);
 
     for (idx, item) in metadata.iter().enumerate() {
+        let v3 = legacy_metadata_to_v3(item);
         state
             .catalog
-            .upsert_metadata(&state.collection.id, idx, item)?;
+            .upsert_metadata(&state.collection.id, idx, &v3)?;
     }
 
     state
@@ -481,4 +483,19 @@ fn load_store_metadata(store: &VectorStore) -> Vec<VectorMetadata> {
     }
 
     metadata
+}
+
+fn legacy_metadata_to_v3(item: &VectorMetadata) -> VectorMetadataV3 {
+    let entity_id = if item.source_file.is_empty() {
+        0
+    } else {
+        xxh3_64(item.source_file.as_bytes())
+    };
+    let payload = rmp_serde::to_vec(item).unwrap_or_default();
+    VectorMetadataV3 {
+        entity_id,
+        sequence_ts: item.start_time_ms as u64,
+        tags: Vec::new(),
+        payload,
+    }
 }

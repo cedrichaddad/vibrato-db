@@ -4,25 +4,28 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::catalog::{parse_token, verify_token_hash, CatalogStore, IngestMetadataV3Input, Role};
+use super::engine::{IngestBackpressureDecision, ProductionState};
 use anyhow::{anyhow, Result};
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, ListArray, RecordBatch, StringArray, UInt16Array,
-    UInt32Array,
+    types::{
+        ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
+        UInt64Type, UInt8Type,
+    },
+    Array, BinaryArray, DictionaryArray, FixedSizeListArray, Float32Array, ListArray, RecordBatch,
+    StringArray, UInt64Array,
 };
+use arrow_buffer::ArrowNativeType;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
+use arrow_schema::DataType;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
-use vibrato_core::metadata::VectorMetadata;
-
-use super::catalog::{parse_token, verify_token_hash, CatalogStore, Role};
-use super::engine::{IngestBackpressureDecision, ProductionState};
-use super::model::IngestMetadata;
 
 type TonicStream<T> = Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send + 'static>>;
 const FLIGHT_DECODE_CHUNK_ROWS: usize = 2048;
@@ -88,49 +91,34 @@ fn as_string_array<'a>(
         .ok_or_else(|| Status::invalid_argument(format!("column '{name}' must be Utf8")))
 }
 
-fn as_u32_array<'a>(
+fn as_u64_array<'a>(
     batch: &'a RecordBatch,
     name: &str,
-) -> std::result::Result<Option<&'a UInt32Array>, Status> {
+) -> std::result::Result<Option<&'a UInt64Array>, Status> {
     let Some(idx) = batch.schema().index_of(name).ok() else {
         return Ok(None);
     };
     batch
         .column(idx)
         .as_any()
-        .downcast_ref::<UInt32Array>()
+        .downcast_ref::<UInt64Array>()
         .map(Some)
-        .ok_or_else(|| Status::invalid_argument(format!("column '{name}' must be UInt32")))
+        .ok_or_else(|| Status::invalid_argument(format!("column '{name}' must be UInt64")))
 }
 
-fn as_u16_array<'a>(
+fn as_binary_array<'a>(
     batch: &'a RecordBatch,
     name: &str,
-) -> std::result::Result<Option<&'a UInt16Array>, Status> {
+) -> std::result::Result<Option<&'a BinaryArray>, Status> {
     let Some(idx) = batch.schema().index_of(name).ok() else {
         return Ok(None);
     };
     batch
         .column(idx)
         .as_any()
-        .downcast_ref::<UInt16Array>()
+        .downcast_ref::<BinaryArray>()
         .map(Some)
-        .ok_or_else(|| Status::invalid_argument(format!("column '{name}' must be UInt16")))
-}
-
-fn as_f32_array<'a>(
-    batch: &'a RecordBatch,
-    name: &str,
-) -> std::result::Result<Option<&'a Float32Array>, Status> {
-    let Some(idx) = batch.schema().index_of(name).ok() else {
-        return Ok(None);
-    };
-    batch
-        .column(idx)
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .map(Some)
-        .ok_or_else(|| Status::invalid_argument(format!("column '{name}' must be Float32")))
+        .ok_or_else(|| Status::invalid_argument(format!("column '{name}' must be Binary")))
 }
 
 fn as_list_utf8_array<'a>(
@@ -153,13 +141,10 @@ struct FlightBatchColumns<'a> {
     num_rows: usize,
     vectors: &'a FixedSizeListArray,
     vector_values: &'a [f32],
-    source_file: Option<&'a StringArray>,
-    start_time_ms: Option<&'a UInt32Array>,
-    duration_ms: Option<&'a UInt16Array>,
-    bpm: Option<&'a Float32Array>,
+    entity_id: &'a UInt64Array,
+    sequence_ts: &'a UInt64Array,
+    payload: &'a BinaryArray,
     tags: Option<&'a ListArray>,
-    tag_values: Option<&'a StringArray>,
-    metadata_json: Option<&'a StringArray>,
     idempotency_key: Option<&'a StringArray>,
 }
 
@@ -203,39 +188,158 @@ fn parse_flight_batch_columns<'a>(
         })?;
 
     let tags = as_list_utf8_array(batch, "tags")?;
-    let tag_values = if let Some(col) = tags {
-        Some(
-            col.values()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    Status::invalid_argument("tags column must be List<Utf8> for Flight ingest")
-                })?,
-        )
-    } else {
-        None
-    };
+    let entity_id = as_u64_array(batch, "entity_id")?
+        .ok_or_else(|| Status::invalid_argument("missing required 'entity_id' column"))?;
+    let sequence_ts = as_u64_array(batch, "sequence_ts")?
+        .ok_or_else(|| Status::invalid_argument("missing required 'sequence_ts' column"))?;
+    let payload = as_binary_array(batch, "payload")?
+        .ok_or_else(|| Status::invalid_argument("missing required 'payload' column"))?;
 
     Ok(FlightBatchColumns {
         dim,
         num_rows: batch.num_rows(),
         vectors,
         vector_values: vector_values.values(),
-        source_file: as_string_array(batch, "source_file")?,
-        start_time_ms: as_u32_array(batch, "start_time_ms")?,
-        duration_ms: as_u16_array(batch, "duration_ms")?,
-        bpm: as_f32_array(batch, "bpm")?,
+        entity_id,
+        sequence_ts,
+        payload,
         tags,
-        tag_values,
-        metadata_json: as_string_array(batch, "metadata_json")?,
         idempotency_key: as_string_array(batch, "idempotency_key")?,
     })
+}
+
+fn extract_dict_tags<K: ArrowDictionaryKeyType>(
+    dict: &DictionaryArray<K>,
+    start: usize,
+    end: usize,
+) -> std::result::Result<Vec<String>, Status> {
+    let values = dict
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| Status::invalid_argument("tags dictionary values must be Utf8"))?;
+    let keys = dict.keys();
+    let mut out = Vec::with_capacity(end.saturating_sub(start));
+    for idx in start..end {
+        if keys.is_null(idx) {
+            continue;
+        }
+        let value_idx = keys.value(idx).as_usize();
+        if value_idx >= values.len() || values.is_null(value_idx) {
+            continue;
+        }
+        out.push(values.value(value_idx).to_string());
+    }
+    Ok(out)
+}
+
+fn extract_row_tags(list: &ListArray, row: usize) -> std::result::Result<Vec<String>, Status> {
+    if list.is_null(row) {
+        return Ok(Vec::new());
+    }
+    let offsets = list.value_offsets();
+    let start = offsets[row] as usize;
+    let end = offsets[row + 1] as usize;
+    let values = list.values();
+    if let Some(strings) = values.as_any().downcast_ref::<StringArray>() {
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        for idx in start..end {
+            if !strings.is_null(idx) {
+                out.push(strings.value(idx).to_string());
+            }
+        }
+        return Ok(out);
+    }
+
+    match values.data_type() {
+        DataType::Dictionary(_, _) => {
+            if let Some(dict) = values.as_any().downcast_ref::<DictionaryArray<Int8Type>>() {
+                return extract_dict_tags(dict, start, end);
+            }
+            if let Some(dict) = values.as_any().downcast_ref::<DictionaryArray<Int16Type>>() {
+                return extract_dict_tags(dict, start, end);
+            }
+            if let Some(dict) = values.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+                return extract_dict_tags(dict, start, end);
+            }
+            if let Some(dict) = values.as_any().downcast_ref::<DictionaryArray<Int64Type>>() {
+                return extract_dict_tags(dict, start, end);
+            }
+            if let Some(dict) = values.as_any().downcast_ref::<DictionaryArray<UInt8Type>>() {
+                return extract_dict_tags(dict, start, end);
+            }
+            if let Some(dict) = values
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt16Type>>()
+            {
+                return extract_dict_tags(dict, start, end);
+            }
+            if let Some(dict) = values
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+            {
+                return extract_dict_tags(dict, start, end);
+            }
+            if let Some(dict) = values
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt64Type>>()
+            {
+                return extract_dict_tags(dict, start, end);
+            }
+            Err(Status::invalid_argument(
+                "unsupported dictionary key type for tags List<Dictionary<*, Utf8>>",
+            ))
+        }
+        _ => Err(Status::invalid_argument(
+            "tags column must be List<Utf8> or List<Dictionary<*, Utf8>>",
+        )),
+    }
+}
+
+fn normalize_and_validate_tags(
+    mut tags: Vec<String>,
+    max_tags: usize,
+    max_tag_len: usize,
+) -> std::result::Result<Vec<String>, Status> {
+    for tag in &mut tags {
+        *tag = tag.trim().to_ascii_lowercase();
+    }
+    tags.retain(|t| !t.is_empty());
+    tags.sort();
+    tags.dedup();
+    if tags.len() > max_tags {
+        return Err(Status::invalid_argument(format!(
+            "too many tags: limit={} actual={}",
+            max_tags,
+            tags.len()
+        )));
+    }
+    for tag in &tags {
+        if tag.len() > max_tag_len {
+            return Err(Status::invalid_argument(format!(
+                "tag too long: max_tag_len={} tag='{}'",
+                max_tag_len, tag
+            )));
+        }
+        if !tag
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':'))
+        {
+            return Err(Status::invalid_argument(format!(
+                "invalid tag format: '{}'",
+                tag
+            )));
+        }
+    }
+    Ok(tags)
 }
 
 fn decode_entry_at_row(
     cols: &FlightBatchColumns<'_>,
     row: usize,
-) -> std::result::Result<(Vec<f32>, VectorMetadata, Option<String>), Status> {
+    max_tags: usize,
+    max_tag_len: usize,
+) -> std::result::Result<(Vec<f32>, IngestMetadataV3Input, Option<String>), Status> {
     if cols.vectors.is_null(row) {
         return Err(Status::invalid_argument("vector row must not be null"));
     }
@@ -243,52 +347,20 @@ fn decode_entry_at_row(
     let start = row * cols.dim;
     let vector = cols.vector_values[start..start + cols.dim].to_vec();
 
-    let mut metadata = if let Some(col) = cols.metadata_json {
-        if !col.is_null(row) {
-            serde_json::from_str::<IngestMetadata>(col.value(row)).map_err(|e| {
-                Status::invalid_argument(format!("invalid metadata_json at row {row}: {e}"))
-            })?
-        } else {
-            IngestMetadata::default()
-        }
+    if cols.entity_id.is_null(row) || cols.sequence_ts.is_null(row) || cols.payload.is_null(row) {
+        return Err(Status::invalid_argument(
+            "entity_id, sequence_ts, and payload must be non-null",
+        ));
+    }
+    let entity_id = cols.entity_id.value(row);
+    let sequence_ts = cols.sequence_ts.value(row);
+    let payload = cols.payload.value(row).to_vec();
+    let raw_tags = if let Some(col) = cols.tags {
+        extract_row_tags(col, row)?
     } else {
-        IngestMetadata::default()
+        Vec::new()
     };
-
-    if let Some(col) = cols.source_file {
-        if !col.is_null(row) {
-            metadata.source_file = col.value(row).to_string();
-        }
-    }
-    if let Some(col) = cols.start_time_ms {
-        if !col.is_null(row) {
-            metadata.start_time_ms = col.value(row);
-        }
-    }
-    if let Some(col) = cols.duration_ms {
-        if !col.is_null(row) {
-            metadata.duration_ms = col.value(row);
-        }
-    }
-    if let Some(col) = cols.bpm {
-        if !col.is_null(row) {
-            metadata.bpm = col.value(row);
-        }
-    }
-    if let (Some(col), Some(tag_values)) = (cols.tags, cols.tag_values) {
-        if !col.is_null(row) {
-            let offsets = col.value_offsets();
-            let start = offsets[row] as usize;
-            let end = offsets[row + 1] as usize;
-            let mut parsed = Vec::with_capacity(end.saturating_sub(start));
-            for i in start..end {
-                if !tag_values.is_null(i) {
-                    parsed.push(tag_values.value(i).to_string());
-                }
-            }
-            metadata.tags = parsed;
-        }
-    }
+    let tags = normalize_and_validate_tags(raw_tags, max_tags, max_tag_len)?;
 
     let idempotency = cols.idempotency_key.and_then(|col| {
         if col.is_null(row) {
@@ -298,18 +370,27 @@ fn decode_entry_at_row(
         }
     });
 
-    Ok((vector, metadata.into(), idempotency))
+    Ok((
+        vector,
+        IngestMetadataV3Input {
+            entity_id,
+            sequence_ts,
+            tags,
+            payload,
+        },
+        idempotency,
+    ))
 }
 
 #[cfg(test)]
 fn extract_batch_entries(
     batch: &RecordBatch,
     dim: usize,
-) -> std::result::Result<Vec<(Vec<f32>, VectorMetadata, Option<String>)>, Status> {
+) -> std::result::Result<Vec<(Vec<f32>, IngestMetadataV3Input, Option<String>)>, Status> {
     let cols = parse_flight_batch_columns(batch, dim)?;
     let mut entries = Vec::with_capacity(cols.num_rows);
     for row in 0..cols.num_rows {
-        entries.push(decode_entry_at_row(&cols, row)?);
+        entries.push(decode_entry_at_row(&cols, row, 64, 64)?);
     }
 
     Ok(entries)
@@ -332,9 +413,28 @@ fn ingest_flight_batch_streaming(
         let end = (row + FLIGHT_DECODE_CHUNK_ROWS).min(cols.num_rows);
         let decode_started = Instant::now();
         for idx in row..end {
-            chunk.push(decode_entry_at_row(&cols, idx)?);
+            chunk.push(decode_entry_at_row(
+                &cols,
+                idx,
+                state.config.max_tags_per_vector,
+                state.config.max_tag_len,
+            )?);
         }
-        decode_us = decode_us.saturating_add(elapsed_micros_u64(decode_started.elapsed()));
+        let decode_elapsed = decode_started.elapsed();
+        decode_us = decode_us.saturating_add(elapsed_micros_u64(decode_elapsed));
+        if decode_elapsed.as_millis() as u64 > state.config.flight_decode_warn_ms {
+            state
+                .metrics
+                .flight_decode_chunk_warn_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::warn!(
+                "flight_decode_chunk_slow ms={} rows={} threshold_ms={}",
+                decode_elapsed.as_millis(),
+                end.saturating_sub(row),
+                state.config.flight_decode_warn_ms
+            );
+        }
+        std::thread::yield_now();
 
         let commit_started = Instant::now();
         let mut batch_results = state
@@ -387,6 +487,9 @@ fn map_ingest_error(err: anyhow::Error) -> Status {
     let msg = err.to_string();
     if msg.contains("dimension mismatch") {
         return Status::invalid_argument(msg);
+    }
+    if msg.contains("tag_registry_overflow") {
+        return Status::resource_exhausted(msg);
     }
     if msg.contains("resource exhausted") {
         return Status::resource_exhausted(msg);
@@ -494,7 +597,26 @@ impl FlightService for VibratoFlightService {
                 .fetch_sub(incoming_bytes, AtomicOrdering::Relaxed);
 
             let ingest_result = ingest_result
-                .map_err(|_| Status::internal("flight ingest worker dropped before returning"))??;
+                .map_err(|_| Status::internal("flight ingest worker dropped before returning"))?;
+            let ingest_result = match ingest_result {
+                Ok(v) => v,
+                Err(status) => {
+                    if status.code() == tonic::Code::InvalidArgument {
+                        self.state
+                            .metrics
+                            .tag_reject_invalid_total
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    } else if status.code() == tonic::Code::ResourceExhausted
+                        && status.message().contains("tag_registry_overflow")
+                    {
+                        self.state
+                            .metrics
+                            .tag_reject_overflow_total
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    return Err(status);
+                }
+            };
             accepted += ingest_result.results.len();
             created += ingest_result
                 .results
@@ -568,8 +690,9 @@ impl FlightService for VibratoFlightService {
 mod tests {
     use std::sync::Arc;
 
+    use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::types::Float32Type;
-    use arrow_array::{FixedSizeListArray, RecordBatch, StringArray};
+    use arrow_array::{BinaryArray, FixedSizeListArray, RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{estimate_batch_ingest_bytes, extract_batch_entries};
@@ -582,12 +705,15 @@ mod tests {
             ],
             4,
         );
-        let metadata_json = StringArray::from(vec![
-            Some(
-                r#"{"source_file":"a.wav","start_time_ms":10,"duration_ms":5,"bpm":120.0,"tags":["x","y"]}"#,
-            ),
-            None,
-        ]);
+        let entity_id = UInt64Array::from(vec![Some(42), Some(99)]);
+        let sequence_ts = UInt64Array::from(vec![Some(10), Some(20)]);
+        let payload = BinaryArray::from(vec![Some(b"abc".as_slice()), Some(&[][..])]);
+        let mut tags_builder = ListBuilder::new(StringBuilder::new());
+        tags_builder.values().append_value("x");
+        tags_builder.values().append_value("y");
+        tags_builder.append(true);
+        tags_builder.append(false);
+        let tags = tags_builder.finish();
         let idempotency_key = StringArray::from(vec![Some("k1"), None]);
 
         let schema = Arc::new(Schema::new(vec![
@@ -596,7 +722,14 @@ mod tests {
                 DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
                 false,
             ),
-            Field::new("metadata_json", DataType::Utf8, true),
+            Field::new("entity_id", DataType::UInt64, true),
+            Field::new("sequence_ts", DataType::UInt64, true),
+            Field::new("payload", DataType::Binary, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
             Field::new("idempotency_key", DataType::Utf8, true),
         ]));
 
@@ -604,7 +737,10 @@ mod tests {
             schema,
             vec![
                 Arc::new(vectors),
-                Arc::new(metadata_json),
+                Arc::new(entity_id),
+                Arc::new(sequence_ts),
+                Arc::new(payload),
+                Arc::new(tags),
                 Arc::new(idempotency_key),
             ],
         )
@@ -617,10 +753,9 @@ mod tests {
         let entries = extract_batch_entries(&batch, 4).expect("extract");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, vec![1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(entries[0].1.source_file, "a.wav");
-        assert_eq!(entries[0].1.start_time_ms, 10);
-        assert_eq!(entries[0].1.duration_ms, 5);
-        assert_eq!(entries[0].1.bpm, 120.0);
+        assert_eq!(entries[0].1.entity_id, 42);
+        assert_eq!(entries[0].1.sequence_ts, 10);
+        assert_eq!(entries[0].1.payload, b"abc".to_vec());
         assert_eq!(entries[0].1.tags, vec!["x".to_string(), "y".to_string()]);
         assert_eq!(entries[0].2.as_deref(), Some("k1"));
         assert_eq!(entries[1].2, None);

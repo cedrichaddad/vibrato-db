@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use tempfile::tempdir;
-use vibrato_core::metadata::VectorMetadata;
 use vibrato_db::prod::{
-    bootstrap_data_dirs, CatalogOptions, CatalogStore, ProductionConfig, SqliteCatalog,
+    bootstrap_data_dirs, CatalogOptions, CatalogStore, IngestMetadataV3Input, ProductionConfig,
+    SqliteCatalog,
 };
 
 fn test_config(data_dir: PathBuf) -> ProductionConfig {
@@ -24,12 +24,11 @@ fn catalog_read_timeout_bounds_slow_metadata_scan() {
         .expect("ensure collection");
 
     for i in 0..20_000usize {
-        let meta = VectorMetadata {
-            source_file: format!("timeout-{i}.wav"),
-            start_time_ms: i as u32,
-            duration_ms: 100,
-            bpm: 120.0,
+        let meta = IngestMetadataV3Input {
+            entity_id: i as u64,
+            sequence_ts: i as u64,
             tags: vec!["drums".to_string()],
+            payload: Vec::new(),
         };
         let _ = catalog
             .ingest_wal_atomic(
@@ -46,6 +45,7 @@ fn catalog_read_timeout_bounds_slow_metadata_scan() {
         CatalogOptions {
             read_timeout_ms: 1,
             wal_autocheckpoint_pages: 1000,
+            max_tag_registry_size: 500_000,
         },
     )
     .expect("open catalog with tight timeout");
