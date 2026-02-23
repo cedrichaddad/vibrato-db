@@ -478,7 +478,8 @@ fn ingest_flight_batch_streaming(
         }
         let decode_elapsed = decode_started.elapsed();
         decode_us = decode_us.saturating_add(elapsed_micros_u64(decode_elapsed));
-        if decode_elapsed.as_millis() as u64 > state.config.flight_decode_warn_ms {
+        let decode_slow = decode_elapsed.as_millis() as u64 > state.config.flight_decode_warn_ms;
+        if decode_slow {
             state
                 .metrics
                 .flight_decode_chunk_warn_total
@@ -489,8 +490,8 @@ fn ingest_flight_batch_streaming(
                 end.saturating_sub(row),
                 state.config.flight_decode_warn_ms
             );
+            std::thread::yield_now();
         }
-        std::thread::yield_now();
 
         let commit_started = Instant::now();
         let mut batch_results = state

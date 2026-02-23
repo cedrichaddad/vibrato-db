@@ -200,7 +200,7 @@ pub struct ProductionState {
     pub ready: AtomicBool,
     pub recovery_report: RwLock<String>,
 
-    pub hot_vector_shards: Vec<ArcSwap<SccHashMap<usize, Arc<Vec<f32>>>>>,
+    pub hot_vectors: Arc<SccHashMap<usize, Arc<Vec<f32>>>>,
     pub hot_indices: Vec<RwLock<HNSW>>,
     pub shard_mask: usize,
     pub metadata_cache: Arc<SccHashMap<usize, VectorMetadataV3>>,
@@ -210,7 +210,6 @@ pub struct ProductionState {
     filter_allow_cache: Arc<SccHashMap<String, (u64, Arc<BitmapSet>)>>,
     filter_cache_epoch: AtomicU64,
     pub retired_segments: std::sync::Mutex<HashMap<String, Weak<SegmentHandle>>>,
-    hot_swap_barrier: RwLock<()>,
 
     pub metrics: Metrics,
     ingest_writer_tx: SyncSender<IngestWriteJob>,
@@ -303,13 +302,10 @@ impl ProductionState {
 
         let shard_count = next_power_of_two_at_least_one(config.hot_index_shards);
         let shard_mask = shard_count - 1;
-        let hot_vector_shards = (0..shard_count)
-            .map(|_| ArcSwap::new(Arc::new(SccHashMap::new())))
-            .collect::<Vec<_>>();
-        let hot_indices = hot_vector_shards
-            .iter()
-            .map(|shard_vectors| {
-                let accessor = make_hot_accessor(shard_vectors.load_full(), config.dim);
+        let hot_vectors = Arc::new(SccHashMap::new());
+        let hot_indices = (0..shard_count)
+            .map(|_| {
+                let accessor = make_hot_accessor(hot_vectors.clone(), config.dim);
                 RwLock::new(HNSW::new_with_accessor(
                     config.hnsw_m,
                     config.hnsw_ef_construction,
@@ -370,7 +366,7 @@ impl ProductionState {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
             recovery_report: RwLock::new("initializing".to_string()),
-            hot_vector_shards,
+            hot_vectors,
             hot_indices,
             shard_mask,
             metadata_cache,
@@ -380,7 +376,6 @@ impl ProductionState {
             filter_allow_cache,
             filter_cache_epoch: AtomicU64::new(1),
             retired_segments: std::sync::Mutex::new(HashMap::new()),
-            hot_swap_barrier: RwLock::new(()),
             metrics: Metrics::default(),
             ingest_writer_tx,
             ingest_writer_handle: std::sync::Mutex::new(None),
@@ -725,18 +720,12 @@ impl ProductionState {
         let vector_bytes = (vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
         let metadata_bytes = Self::estimate_cached_metadata_bytes(&metadata);
         let shard = vector_id & self.shard_mask;
-        let _swap_guard = self.hot_swap_barrier.read();
-        let shard_vectors = self
-            .hot_vector_shards
-            .get(shard)
-            .unwrap_or_else(|| panic!("data integrity fault: missing hot vector shard {}", shard));
+        self.hot_vectors.upsert(vector_id, Arc::new(vector));
         let index = self
             .hot_indices
             .get(shard)
             .unwrap_or_else(|| panic!("data integrity fault: missing hot index shard {}", shard));
-        let vec_store = shard_vectors.load_full();
         let mut idx_guard = index.write();
-        vec_store.upsert(vector_id, Arc::new(vector));
         idx_guard.insert(vector_id);
         self.metadata_cache.upsert(vector_id, metadata.clone());
         for tag_id in &metadata.tags {
@@ -872,28 +861,33 @@ impl ProductionState {
             }
         }
 
-        // 3. Insert into hot index shards in parallel — one lock acquisition per shard.
-        // Consumes shard buckets to move vector buffers directly into Arc.
-        by_shard.into_par_iter().for_each(|(shard, items)| {
-            // Hot shard publication is synchronized with checkpoint rebuild swaps:
-            // read barrier prevents map/index pairing inversion during swap.
-            let _swap_guard = self.hot_swap_barrier.read();
-            let shard_vectors = self.hot_vector_shards.get(shard).unwrap_or_else(|| {
-                panic!("data integrity fault: missing hot vector shard {}", shard)
-            });
+        let apply_shard_items = |shard: usize, items: Vec<CreatedShardItem>| {
             let index = self.hot_indices.get(shard).unwrap_or_else(|| {
                 panic!("data integrity fault: missing hot index shard {}", shard)
             });
 
             // Preserve visibility invariant for concurrent readers:
             // vector store is populated before IDs become discoverable in HNSW.
-            let vec_store = shard_vectors.load_full();
             let mut idx_guard = index.write();
             for item in items {
-                vec_store.upsert(item.vector_id, Arc::new(item.vector));
+                self.hot_vectors
+                    .upsert(item.vector_id, Arc::new(item.vector));
                 idx_guard.insert(item.vector_id);
             }
-        });
+        };
+
+        // 3. Insert into hot index shards.
+        // For small batches, avoid Rayon dispatch overhead.
+        let parallel_ingest_threshold = self.hot_indices.len().saturating_mul(64).max(256);
+        if created_count >= parallel_ingest_threshold {
+            by_shard
+                .into_par_iter()
+                .for_each(|(shard, items)| apply_shard_items(shard, items));
+        } else {
+            for (shard, items) in by_shard {
+                apply_shard_items(shard, items);
+            }
+        }
 
         // 4. Update metadata cache + filter index in one pass.
         if created_count > 0 {
@@ -1177,25 +1171,18 @@ impl ProductionState {
 
         if !matches!(request.search_tier, SearchTier::Archive) {
             let hot_snapshot = {
-                let total_hot = self
-                    .hot_vector_shards
-                    .iter()
-                    .map(|shard| shard.load().len())
-                    .sum::<usize>();
+                let total_hot = self.hot_vectors.len();
                 if total_hot == 0 {
                     None
                 } else {
                     let mut min_id = usize::MAX;
                     let mut max_id = 0usize;
                     let mut ids = HashSet::with_capacity(total_hot);
-                    for shard in &self.hot_vector_shards {
-                        let map = shard.load_full();
-                        for_each_hot_id(&map, |id| {
-                            min_id = min_id.min(id);
-                            max_id = max_id.max(id);
-                            ids.insert(id);
-                        });
-                    }
+                    for_each_hot_id(self.hot_vectors.as_ref(), |id| {
+                        min_id = min_id.min(id);
+                        max_id = max_id.max(id);
+                        ids.insert(id);
+                    });
                     Some((min_id, max_id, Arc::new(ids)))
                 }
             };
@@ -1383,11 +1370,7 @@ impl ProductionState {
             .catalog
             .list_segments_by_state(&self.collection.id, &["failed"])?
             .len();
-        let hot_vectors = self
-            .hot_vector_shards
-            .iter()
-            .map(|shard| shard.load().len())
-            .sum();
+        let hot_vectors = self.hot_vectors.len();
         let wal_pending = self.catalog.count_wal_pending(&self.collection.id)?;
         let total_vectors = self.catalog.total_vectors(&self.collection.id)?;
         let checkpoint_jobs_inflight = self
@@ -1868,6 +1851,9 @@ impl ProductionState {
             });
 
             self.rebuild_hot_from_pending()?;
+            for entry in &pending {
+                let _ = self.hot_vectors.remove(&entry.vector_id);
+            }
 
             self.metrics
                 .checkpoint_total
@@ -2240,82 +2226,62 @@ impl ProductionState {
         // Enforce LSN order even if upstream query ordering changes.
         pending.sort_by_key(|e| e.lsn);
 
-        // 1. Create shadow shards.
-        let mut new_shards = Vec::with_capacity(self.hot_vector_shards.len());
-        for _ in 0..self.hot_vector_shards.len() {
-            new_shards.push(Arc::new(SccHashMap::new()));
+        // 1. Ensure global hot vector map contains all pending WAL vectors.
+        for entry in &pending {
+            self.hot_vectors
+                .upsert(entry.vector_id, Arc::new(entry.vector.clone()));
         }
 
-        // 2. Populate shadow shards
-        // This is done without touching active shards.
-        for (shard_idx, shard_vectors) in new_shards.iter().enumerate() {
-            for e in &pending {
-                if (e.vector_id & self.shard_mask) == shard_idx {
-                    shard_vectors.upsert(e.vector_id, Arc::new(e.vector.clone()));
-                }
+        // 2. Group pending IDs by shard for deterministic index rebuild.
+        let mut pending_ids_by_shard = vec![Vec::new(); self.hot_indices.len()];
+        for entry in &pending {
+            let shard = entry.vector_id & self.shard_mask;
+            if let Some(bucket) = pending_ids_by_shard.get_mut(shard) {
+                bucket.push(entry.vector_id);
             }
         }
 
-        // 3. Build shadow HNSW indices
-        // HNSW is built against the SHADOW shards
+        // 3. Build shadow HNSW indices against the global hot vector map.
         let mut new_indices = Vec::with_capacity(self.hot_indices.len());
-        for (shard_idx, shard_vectors) in new_shards.iter().enumerate() {
+        for ids in &pending_ids_by_shard {
             let mut hnsw = HNSW::new_with_accessor(
                 self.config.hnsw_m,
                 self.config.hnsw_ef_construction,
-                make_hot_accessor(shard_vectors.clone(), self.collection.dim),
+                make_hot_accessor(self.hot_vectors.clone(), self.collection.dim),
             );
-            // Populate HNSW from pending
-            for e in &pending {
-                if (e.vector_id & self.shard_mask) == shard_idx {
-                    hnsw.insert(e.vector_id);
-                }
+            for vector_id in ids {
+                hnsw.insert(*vector_id);
             }
             new_indices.push(hnsw);
         }
 
-        // 4. Atomic swap under write barrier.
-        // Prevents ingest threads from seeing mixed generations where vectors are written
-        // to old shards while IDs are inserted into new indices (or vice versa).
-        {
-            let _swap_guard = self.hot_swap_barrier.write();
-            // We swap vector shards first, then indices.
-            // New ingests are blocked by the barrier while this transition happens.
-            for (i, shard) in new_shards.into_iter().enumerate() {
-                self.hot_vector_shards[i].store(shard);
-            }
-            for (i, hnsw) in new_indices.into_iter().enumerate() {
-                *self.hot_indices[i].write() = hnsw;
-            }
+        // 4. Atomic index swap (vector map is global and never swapped).
+        for (i, hnsw) in new_indices.into_iter().enumerate() {
+            *self.hot_indices[i].write() = hnsw;
         }
 
-        // 5. Catch-up phase: replay WAL snapshot again after the swap to close
-        // the ingest window between initial snapshot and atomic publication.
+        // 5. Catch-up phase: replay WAL snapshot again after index swap.
         let mut pending_catchup = self.catalog.pending_wal_after_lsn(&self.collection.id, 0)?;
         pending_catchup.sort_by_key(|e| e.lsn);
 
-        let mut catchup_by_shard = vec![Vec::new(); self.hot_indices.len()];
+        let mut catchup_ids_by_shard = vec![Vec::new(); self.hot_indices.len()];
         for entry in &pending_catchup {
+            self.hot_vectors
+                .upsert(entry.vector_id, Arc::new(entry.vector.clone()));
             let shard = entry.vector_id & self.shard_mask;
-            if let Some(bucket) = catchup_by_shard.get_mut(shard) {
-                bucket.push(entry);
+            if let Some(bucket) = catchup_ids_by_shard.get_mut(shard) {
+                bucket.push(entry.vector_id);
             }
         }
 
-        for (shard_idx, entries) in catchup_by_shard.into_iter().enumerate() {
-            if entries.is_empty() {
+        for (shard_idx, ids) in catchup_ids_by_shard.into_iter().enumerate() {
+            if ids.is_empty() {
                 continue;
-            }
-            if let Some(shard_vectors) = self.hot_vector_shards.get(shard_idx) {
-                let vec_store = shard_vectors.load_full();
-                for entry in &entries {
-                    vec_store.upsert(entry.vector_id, Arc::new(entry.vector.clone()));
-                }
             }
             if let Some(index) = self.hot_indices.get(shard_idx) {
                 let mut idx = index.write();
-                for entry in entries {
-                    idx.insert(entry.vector_id);
+                for vector_id in ids {
+                    idx.insert(vector_id);
                 }
             }
         }
@@ -3638,12 +3604,12 @@ fn audit_worker_loop(state: Arc<ProductionState>, rx: Receiver<AuditEvent>) {
 }
 
 fn make_hot_accessor(
-    hot_vector_shard: Arc<SccHashMap<usize, Arc<Vec<f32>>>>,
+    hot_vectors: Arc<SccHashMap<usize, Arc<Vec<f32>>>>,
     dim: usize,
 ) -> impl Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static {
     let expected_dim = dim;
     move |id, sink| {
-        let found = hot_vector_shard
+        let found = hot_vectors
             .read(&id, |_, v| {
                 sink(v.as_slice());
             })
