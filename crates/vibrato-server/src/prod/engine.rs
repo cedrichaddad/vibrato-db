@@ -840,12 +840,18 @@ impl ProductionState {
         });
 
         let mut best: HashMap<usize, f32> = HashMap::new();
+        let selective_allow = allow_bitmap
+            .as_ref()
+            .map(|bm| bm.cardinality() <= 5_000)
+            .unwrap_or(false);
 
         if !matches!(request.search_tier, SearchTier::Archive) {
-            let hot_results = self.query_pool.install(|| {
+            let hot_results = if selective_allow {
+                // For selective filters, per-shard work is tiny; avoid Rayon dispatch overhead.
                 self.hot_indices
-                    .par_iter()
-                    .map(|shard_index| {
+                    .iter()
+                    .enumerate()
+                    .map(|(shard, shard_index)| {
                         let index = shard_index.read();
                         search_index_with_dynamic_fallback(
                             &index,
@@ -853,10 +859,35 @@ impl ProductionState {
                             request.k,
                             request.ef,
                             allow_bitmap.as_deref(),
+                            Some(FlatScanHint::HotShard {
+                                shard,
+                                shard_mask: self.shard_mask,
+                            }),
                         )
                     })
                     .collect::<Vec<_>>()
-            });
+            } else {
+                self.query_pool.install(|| {
+                    self.hot_indices
+                        .par_iter()
+                        .enumerate()
+                        .map(|(shard, shard_index)| {
+                            let index = shard_index.read();
+                            search_index_with_dynamic_fallback(
+                                &index,
+                                &request.vector,
+                                request.k,
+                                request.ef,
+                                allow_bitmap.as_deref(),
+                                Some(FlatScanHint::HotShard {
+                                    shard,
+                                    shard_mask: self.shard_mask,
+                                }),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            };
             for results in hot_results {
                 for (id, score) in results {
                     merge_best(&mut best, id, score);
@@ -883,6 +914,7 @@ impl ProductionState {
                         request.k,
                         request.ef,
                         allow_bitmap.as_deref(),
+                        None,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -3111,6 +3143,7 @@ fn search_index_with_dynamic_fallback(
     k: usize,
     ef: usize,
     allow_set: Option<&BitmapSet>,
+    flat_scan_hint: Option<FlatScanHint>,
 ) -> Vec<(usize, f32)> {
     if allow_set.is_none() {
         return index.search(query, k, ef);
@@ -3137,7 +3170,7 @@ fn search_index_with_dynamic_fallback(
             && cardinality.saturating_mul(100)
                 <= graph_nodes.saturating_mul(FLAT_SCAN_SELECTIVITY_PERCENT));
     if selective {
-        return flat_scan_index_with_allow_set(index, query, k, allow);
+        return flat_scan_index_with_allow_set(index, query, k, allow, flat_scan_hint);
     }
 
     // Stage A (strict): evaluate only allowed IDs.
@@ -3200,6 +3233,7 @@ fn flat_scan_index_with_allow_set(
     query: &[f32],
     k: usize,
     allow: &BitmapSet,
+    flat_scan_hint: Option<FlatScanHint>,
 ) -> Vec<(usize, f32)> {
     if k == 0 {
         return Vec::new();
@@ -3233,6 +3267,11 @@ fn flat_scan_index_with_allow_set(
 
     let mut heap = std::collections::BinaryHeap::with_capacity(k + 1);
     for id in allow.iter_ids() {
+        if let Some(FlatScanHint::HotShard { shard, shard_mask }) = flat_scan_hint {
+            if (id & shard_mask) != shard {
+                continue;
+            }
+        }
         let Some(score) = index.score_for_id(query, id) else {
             continue;
         };
@@ -3252,6 +3291,11 @@ fn flat_scan_index_with_allow_set(
     }
     out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
     out
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FlatScanHint {
+    HotShard { shard: usize, shard_mask: usize },
 }
 
 fn checkpoint_loop(state: Arc<ProductionState>) {
@@ -3332,10 +3376,12 @@ fn make_hot_accessor(
 ) -> impl Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static {
     let zero_fallback = Arc::new(vec![0.0f32; dim]);
     move |id, sink| {
-        let maybe_vec = hot_vector_shard.read(&id, |_, v| Arc::clone(v));
-        if let Some(v) = maybe_vec {
-            sink(v.as_slice());
-        } else {
+        let found = hot_vector_shard
+            .read(&id, |_, v| {
+                sink(v.as_slice());
+            })
+            .is_some();
+        if !found {
             sink(zero_fallback.as_slice());
         }
     }
@@ -3574,7 +3620,8 @@ mod tests {
         allow_set.grow(total);
         allow_set.insert(target_id);
 
-        let results = search_index_with_dynamic_fallback(&index, &query, 10, 1, Some(&allow_set));
+        let results =
+            search_index_with_dynamic_fallback(&index, &query, 10, 1, Some(&allow_set), None);
         assert!(!results.is_empty(), "expected at least one filtered hit");
         assert!(
             results.iter().all(|(id, _)| allow_set.contains(*id)),
