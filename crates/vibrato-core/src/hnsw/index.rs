@@ -13,15 +13,17 @@
 //! **Search**: Start at entry point, greedy descent to layer 0, then beam search
 //! on layer 0 with ef candidates.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::node::Node;
-use super::visited::VisitedGuard;
+use super::visited::{VisitedGuard, VisitedSet};
 use crate::simd::dot_product;
 
 /// Candidate for search (min-heap)
@@ -85,6 +87,84 @@ impl PartialOrd for SearchResult {
     }
 }
 
+/// Reusable heap buffers for `search_layer` to avoid per-call allocations.
+struct SearchScratch {
+    candidates: BinaryHeap<Candidate>,
+    results: BinaryHeap<SearchResult>,
+}
+
+impl SearchScratch {
+    #[inline]
+    fn new(initial_ef: usize) -> Self {
+        let ef = initial_ef.max(1);
+        Self {
+            candidates: BinaryHeap::with_capacity(ef),
+            results: BinaryHeap::with_capacity(ef + 1),
+        }
+    }
+
+    #[inline]
+    fn prepare(&mut self, ef: usize) {
+        let ef = ef.max(1);
+        self.candidates.clear();
+        self.results.clear();
+
+        if self.candidates.capacity() < ef {
+            self.candidates.reserve(ef - self.candidates.capacity());
+        }
+        if self.results.capacity() < ef + 1 {
+            self.results.reserve((ef + 1) - self.results.capacity());
+        }
+    }
+}
+
+struct QueryScratch {
+    search: SearchScratch,
+    layer_candidates: Vec<(usize, f32)>,
+}
+
+impl QueryScratch {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            search: SearchScratch::new(32),
+            layer_candidates: Vec::with_capacity(128),
+        }
+    }
+}
+
+struct InsertScratch {
+    query: Vec<f32>,
+    search: SearchScratch,
+    layer_candidates: Vec<(usize, f32)>,
+    reverse_edges: Vec<(usize, usize, usize)>,
+    prune_ops: Vec<(usize, usize, Vec<usize>)>,
+    neighbor_vec: Vec<f32>,
+    all_neighbors: Vec<usize>,
+    neighbor_candidates: Vec<(usize, f32)>,
+}
+
+impl InsertScratch {
+    #[inline]
+    fn new(initial_ef: usize) -> Self {
+        Self {
+            query: Vec::with_capacity(64),
+            search: SearchScratch::new(initial_ef.max(1)),
+            layer_candidates: Vec::with_capacity(256),
+            reverse_edges: Vec::with_capacity(256),
+            prune_ops: Vec::with_capacity(128),
+            neighbor_vec: Vec::with_capacity(64),
+            all_neighbors: Vec::with_capacity(64),
+            neighbor_candidates: Vec::with_capacity(64),
+        }
+    }
+}
+
+thread_local! {
+    static QUERY_SCRATCH: RefCell<QueryScratch> = RefCell::new(QueryScratch::new());
+    static INSERT_SCRATCH: RefCell<InsertScratch> = RefCell::new(InsertScratch::new(64));
+}
+
 /// HNSW Index
 ///
 /// A hierarchical graph structure for approximate nearest neighbor search.
@@ -93,7 +173,10 @@ pub struct HNSW {
     pub nodes: Vec<Node>,
 
     /// Map from node ID to index in nodes vector (O(1) lookup)
-    id_to_index: HashMap<usize, usize>,
+    id_to_index: FxHashMap<usize, usize>,
+
+    /// Highest node ID currently present in the graph.
+    max_node_id: usize,
 
     /// Entry point node ID (node on the highest layer)
     pub entry_point: Option<usize>,
@@ -124,6 +207,7 @@ pub struct HNSW {
 ///
 /// Callback style avoids allocating/cloning vectors on the hot search path.
 type VectorAccessor = Box<dyn Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync>;
+type VectorAccessorRef<'a> = &'a (dyn Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync);
 
 impl HNSW {
     /// Create a new HNSW index
@@ -175,7 +259,8 @@ impl HNSW {
     {
         Self {
             nodes: Vec::new(),
-            id_to_index: HashMap::new(),
+            id_to_index: FxHashMap::default(),
+            max_node_id: 0,
             entry_point: None,
             max_layer: 0,
             m,
@@ -202,15 +287,17 @@ impl HNSW {
         F: Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static,
     {
         // Build id_to_index map from existing nodes
-        let id_to_index: HashMap<usize, usize> = nodes
+        let id_to_index: FxHashMap<usize, usize> = nodes
             .iter()
             .enumerate()
             .map(|(idx, node)| (node.id, idx))
             .collect();
+        let max_node_id = nodes.iter().map(|n| n.id).max().unwrap_or(0);
 
         Self {
             nodes,
             id_to_index,
+            max_node_id,
             entry_point,
             max_layer,
             m,
@@ -234,34 +321,87 @@ impl HNSW {
         self.id_to_index.get(&id).map(|&idx| &self.nodes[idx])
     }
 
-    /// Get vector for a node
     #[inline]
-    fn with_vector(&self, id: usize, sink: &mut dyn FnMut(&[f32])) {
-        (self.vectors)(id, sink);
+    fn with_vector_from(
+        &self,
+        id: usize,
+        accessor: Option<VectorAccessorRef<'_>>,
+        sink: &mut dyn FnMut(&[f32]),
+    ) {
+        if let Some(accessor) = accessor {
+            accessor(id, sink);
+        } else {
+            (self.vectors)(id, sink);
+        }
     }
 
-    /// Get an owned vector copy.
-    ///
-    /// This is used only where a long-lived query buffer is required (e.g. insert).
+    /// Returns true if `id` is present in the graph.
     #[inline]
-    fn get_vector_owned(&self, id: usize) -> Vec<f32> {
-        let mut out = Vec::new();
-        self.with_vector(id, &mut |v| {
-            out.reserve(v.len());
+    pub fn contains_id(&self, id: usize) -> bool {
+        self.id_to_index.contains_key(&id)
+    }
+
+    /// Score a node ID against a query vector if that node exists.
+    #[inline]
+    pub fn score_for_id(&self, query: &[f32], id: usize) -> Option<f32> {
+        self.score_for_id_with_optional_accessor(query, id, None)
+    }
+
+    #[inline]
+    pub fn score_for_id_with_accessor(
+        &self,
+        query: &[f32],
+        id: usize,
+        accessor: VectorAccessorRef<'_>,
+    ) -> Option<f32> {
+        self.score_for_id_with_optional_accessor(query, id, Some(accessor))
+    }
+
+    #[inline]
+    fn score_for_id_with_optional_accessor(
+        &self,
+        query: &[f32],
+        id: usize,
+        accessor: Option<VectorAccessorRef<'_>>,
+    ) -> Option<f32> {
+        if !self.contains_id(id) {
+            return None;
+        }
+        let mut score = 0.0f32;
+        self.with_vector_from(id, accessor, &mut |node_vec| {
+            score = dot_product(query, node_vec);
+        });
+        Some(score)
+    }
+
+    #[inline]
+    fn copy_vector_into_with_optional_accessor(
+        &self,
+        id: usize,
+        out: &mut Vec<f32>,
+        accessor: Option<VectorAccessorRef<'_>>,
+    ) {
+        out.clear();
+        self.with_vector_from(id, accessor, &mut |v| {
+            if out.capacity() < v.len() {
+                out.reserve(v.len() - out.capacity());
+            }
             out.extend_from_slice(v);
         });
-        out
     }
 
-    /// Compute distance between query and node (dot product for normalized vectors)
-    /// Returns negative dot product so smaller = more similar
+    /// Compute distance between query and node (dot product for normalized vectors).
+    /// Returns negative similarity so smaller = more similar, without extra subtraction.
     #[inline]
-    fn distance(&self, query: &[f32], node_id: usize) -> f32 {
+    fn distance_with_optional_accessor(
+        &self,
+        query: &[f32],
+        node_id: usize,
+        accessor: Option<VectorAccessorRef<'_>>,
+    ) -> f32 {
         let mut dist = 0.0f32;
-        self.with_vector(node_id, &mut |node_vec| {
-            // For normalized vectors, higher dot product = more similar.
-            // We return 1 - dot_product to convert to a distance metric.
-            dist = 1.0 - dot_product(query, node_vec);
+        self.with_vector_from(node_id, accessor, &mut |node_vec| {
+            dist = -dot_product(query, node_vec);
         });
         dist
     }
@@ -277,150 +417,221 @@ impl HNSW {
     /// # Parameters
     /// - `id`: Vector ID (index into VectorStore)
     pub fn insert(&mut self, id: usize) {
-        let query = self.get_vector_owned(id);
-        let node_layer = self.random_layer();
+        self.insert_with_optional_accessor(id, None);
+    }
 
-        // Create node
-        let mut node = Node::new(id, node_layer);
+    pub fn insert_with_accessor(&mut self, id: usize, accessor: VectorAccessorRef<'_>) {
+        self.insert_with_optional_accessor(id, Some(accessor));
+    }
 
-        // First node becomes entry point
-        if self.entry_point.is_none() {
-            self.entry_point = Some(id);
-            self.max_layer = node_layer;
-            self.id_to_index.insert(id, 0); // First node always at index 0
-            self.nodes.push(node);
+    fn insert_with_optional_accessor(
+        &mut self,
+        id: usize,
+        accessor: Option<VectorAccessorRef<'_>>,
+    ) {
+        // Idempotent insert guard for checkpoint catch-up/replay paths.
+        if self.contains_id(id) {
             return;
         }
 
-        let entry_point = self.entry_point.unwrap();
-        let mut current_node = entry_point;
+        INSERT_SCRATCH.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let InsertScratch {
+                query,
+                search,
+                layer_candidates,
+                reverse_edges,
+                prune_ops,
+                neighbor_vec,
+                all_neighbors,
+                neighbor_candidates,
+            } = &mut *slot;
 
-        // Phase 1: Zoom in from top layer to node_layer + 1
-        // Greedy search, single best neighbor per layer
-        for layer in (node_layer + 1..=self.max_layer).rev() {
-            let nearest = self.search_layer(&query, &[current_node], 1, layer);
-            if let Some((nearest_id, _)) = nearest.first() {
-                current_node = *nearest_id;
+            self.copy_vector_into_with_optional_accessor(id, query, accessor);
+            layer_candidates.clear();
+            reverse_edges.clear();
+            prune_ops.clear();
+            all_neighbors.clear();
+            neighbor_candidates.clear();
+
+            let node_layer = self.random_layer();
+            self.max_node_id = self.max_node_id.max(id);
+
+            // Create node
+            let mut node = Node::new(id, node_layer);
+
+            // First node becomes entry point
+            if self.entry_point.is_none() {
+                self.entry_point = Some(id);
+                self.max_layer = node_layer;
+                self.id_to_index.insert(id, 0); // First node always at index 0
+                self.nodes.push(node);
+                return;
             }
-        }
 
-        // Phase 2: Insert at layers from min(node_layer, max_layer) down to 0
-        // We collect all the updates needed, then apply them
-        let start_layer = node_layer.min(self.max_layer);
+            let entry_point = self.entry_point.unwrap();
+            let mut current_node = entry_point;
+            let mut visited = VisitedGuard::new(self.max_node_id);
 
-        // Collect updates to apply: (node_index, layer, neighbor_id_to_add)
-        let mut reverse_edges: Vec<(usize, usize, usize)> = Vec::new();
-        // Collect pruning operations: (node_index, layer, new_neighbors)
-        let mut prune_ops: Vec<(usize, usize, Vec<usize>)> = Vec::new();
-
-        for layer in (0..=start_layer).rev() {
-            let m_layer = if layer == 0 { self.m0 } else { self.m };
-
-            // Find candidates for this layer
-            let candidates =
-                self.search_layer(&query, &[current_node], self.ef_construction, layer);
-
-            // Select neighbors using the heuristic
-            let neighbors = self.select_neighbors(&query, &candidates, m_layer);
-
-            // Add forward edges to new node
-            for &(neighbor_id, _) in &neighbors {
-                node.add_neighbor(layer, neighbor_id);
-
-                // Find the node index for this neighbor using O(1) HashMap
-                if let Some(node_idx) = self.get_node_index(neighbor_id) {
-                    reverse_edges.push((node_idx, layer, id));
-
-                    // Check if pruning will be needed
-                    let current_neighbors = self.nodes[node_idx].neighbors(layer);
-                    if current_neighbors.len() >= m_layer {
-                        // Will need pruning after adding new edge
-                        let mut all_neighbors: Vec<usize> = current_neighbors.to_vec();
-                        all_neighbors.push(id);
-
-                        // Compute distances and select.
-                        let mut neighbor_candidates: Vec<(usize, f32)> =
-                            Vec::with_capacity(all_neighbors.len());
-                        self.with_vector(neighbor_id, &mut |neighbor_vec| {
-                            for &n in &all_neighbors {
-                                let mut dist = 0.0f32;
-                                self.with_vector(n, &mut |v| {
-                                    dist = 1.0 - dot_product(neighbor_vec, v);
-                                });
-                                neighbor_candidates.push((n, dist));
-                            }
-                        });
-
-                        let pruned = self.select_neighbors(&[], &neighbor_candidates, m_layer);
-                        let pruned_ids: Vec<usize> = pruned.iter().map(|(id, _)| *id).collect();
-                        prune_ops.push((node_idx, layer, pruned_ids));
-                    }
+            // Phase 1: Zoom in from top layer to node_layer + 1
+            // Greedy search, single best neighbor per layer
+            for layer in (node_layer + 1..=self.max_layer).rev() {
+                self.search_layer_into_with_accessor(
+                    query.as_slice(),
+                    &[current_node],
+                    1,
+                    layer,
+                    &mut visited,
+                    search,
+                    layer_candidates,
+                    accessor,
+                );
+                if let Some((nearest_id, _)) = layer_candidates.first() {
+                    current_node = *nearest_id;
                 }
             }
 
-            // Use first candidate as entry for next layer
-            if let Some((first_id, _)) = candidates.first() {
-                current_node = *first_id;
+            // Phase 2: Insert at layers from min(node_layer, max_layer) down to 0
+            // We collect all the updates needed, then apply them.
+            let start_layer = node_layer.min(self.max_layer);
+
+            for layer in (0..=start_layer).rev() {
+                let m_layer = if layer == 0 { self.m0 } else { self.m };
+
+                // Find candidates for this layer.
+                self.search_layer_into_with_accessor(
+                    query.as_slice(),
+                    &[current_node],
+                    self.ef_construction,
+                    layer,
+                    &mut visited,
+                    search,
+                    layer_candidates,
+                    accessor,
+                );
+
+                // Select neighbors using the heuristic.
+                let neighbors = self.select_neighbors_with_accessor(
+                    query.as_slice(),
+                    layer_candidates,
+                    m_layer,
+                    accessor,
+                );
+
+                // Add forward edges to new node.
+                for &(neighbor_id, _) in &neighbors {
+                    // `select_neighbors` returns unique IDs, so this is duplicate-safe.
+                    node.add_neighbor_unchecked(layer, neighbor_id);
+
+                    // Find the node index for this neighbor using O(1) HashMap.
+                    if let Some(node_idx) = self.get_node_index(neighbor_id) {
+                        reverse_edges.push((node_idx, layer, id));
+
+                        // Check if pruning will be needed.
+                        let current_neighbors = self.nodes[node_idx].neighbors(layer);
+                        if current_neighbors.len() >= m_layer {
+                            // Will need pruning after adding new edge.
+                            all_neighbors.clear();
+                            all_neighbors.extend_from_slice(current_neighbors);
+                            all_neighbors.push(id);
+
+                            // Compute distances and select.
+                            neighbor_candidates.clear();
+                            if neighbor_candidates.capacity() < all_neighbors.len() {
+                                neighbor_candidates
+                                    .reserve(all_neighbors.len() - neighbor_candidates.capacity());
+                            }
+                            self.copy_vector_into_with_optional_accessor(
+                                neighbor_id,
+                                neighbor_vec,
+                                accessor,
+                            );
+                            for &n in all_neighbors.iter() {
+                                let mut dist = 0.0f32;
+                                self.with_vector_from(n, accessor, &mut |v| {
+                                    dist = -dot_product(neighbor_vec.as_slice(), v);
+                                });
+                                neighbor_candidates.push((n, dist));
+                            }
+
+                            let pruned = self.select_neighbors_with_accessor(
+                                &[],
+                                neighbor_candidates,
+                                m_layer,
+                                accessor,
+                            );
+                            let pruned_ids: Vec<usize> = pruned.iter().map(|(id, _)| *id).collect();
+                            prune_ops.push((node_idx, layer, pruned_ids));
+                        }
+                    }
+                }
+
+                // Use first candidate as entry for next layer.
+                if let Some((first_id, _)) = layer_candidates.first() {
+                    current_node = *first_id;
+                }
             }
-        }
 
-        // Apply reverse edges (avoiding those that will be overwritten by pruning)
-        let prune_targets: std::collections::HashSet<(usize, usize)> = prune_ops
-            .iter()
-            .map(|(idx, layer, _)| (*idx, *layer))
-            .collect();
+            // Apply reverse edges (avoiding those that will be overwritten by pruning).
+            let prune_targets: FxHashSet<(usize, usize)> = prune_ops
+                .iter()
+                .map(|(idx, layer, _)| (*idx, *layer))
+                .collect();
 
-        for (node_idx, layer, neighbor_id) in reverse_edges {
-            if !prune_targets.contains(&(node_idx, layer)) {
-                self.nodes[node_idx].add_neighbor(layer, neighbor_id);
+            for &(node_idx, layer, neighbor_id) in reverse_edges.iter() {
+                if !prune_targets.contains(&(node_idx, layer)) {
+                    // New node ID was not present before this insert, so edge is unique.
+                    self.nodes[node_idx].add_neighbor_unchecked(layer, neighbor_id);
+                }
             }
-        }
 
-        // Apply pruning operations
-        for (node_idx, layer, new_neighbors) in prune_ops {
-            if let Some(layer_neighbors) = self.nodes[node_idx].neighbors_mut(layer) {
-                layer_neighbors.clear();
-                layer_neighbors.extend(new_neighbors);
+            // Apply pruning operations.
+            for (node_idx, layer, new_neighbors) in prune_ops.iter() {
+                if let Some(layer_neighbors) = self.nodes[*node_idx].neighbors_mut(*layer) {
+                    layer_neighbors.clear();
+                    layer_neighbors.extend(new_neighbors.iter().copied());
+                }
             }
-        }
 
-        // Update entry point if new node has higher layer
-        if node_layer > self.max_layer {
-            self.max_layer = node_layer;
-            self.entry_point = Some(id);
-        }
+            // Update entry point if new node has higher layer.
+            if node_layer > self.max_layer {
+                self.max_layer = node_layer;
+                self.entry_point = Some(id);
+            }
 
-        // Add to id_to_index map before pushing
-        let node_idx = self.nodes.len();
-        self.id_to_index.insert(id, node_idx);
-        self.nodes.push(node);
+            // Add to id_to_index map before pushing.
+            let node_idx = self.nodes.len();
+            self.id_to_index.insert(id, node_idx);
+            self.nodes.push(node);
+        });
     }
 
     /// Search for nearest neighbors on a single layer
     ///
     /// Greedy beam search with `ef` candidates.
-    fn search_layer(
+    fn search_layer_into_with_accessor<V: VisitedSet>(
         &self,
         query: &[f32],
         entry_points: &[usize],
         ef: usize,
         layer: usize,
-    ) -> Vec<(usize, f32)> {
-        let mut visited = VisitedGuard::new(self.nodes.len().max(1024));
-
-        // Candidates to explore (min-heap by distance)
-        // Pre-allocate for performance
-        let mut candidates: BinaryHeap<Candidate> = BinaryHeap::with_capacity(ef);
-
-        // Found neighbors (max-heap to track worst)
-        let mut results: BinaryHeap<SearchResult> = BinaryHeap::with_capacity(ef + 1);
+        visited: &mut V,
+        scratch: &mut SearchScratch,
+        out: &mut Vec<(usize, f32)>,
+        accessor: Option<VectorAccessorRef<'_>>,
+    ) {
+        let ef = ef.max(1);
+        visited.clear();
+        scratch.prepare(ef);
+        let candidates = &mut scratch.candidates;
+        let results = &mut scratch.results;
         let mut worst_distance = f32::INFINITY;
 
         // Initialize with entry points
         for &ep in entry_points {
             if !visited.is_visited(ep) {
                 visited.visit(ep);
-                let dist = self.distance(query, ep);
+                let dist = self.distance_with_optional_accessor(query, ep, accessor);
                 candidates.push(Candidate {
                     id: ep,
                     distance: dist,
@@ -452,7 +663,7 @@ impl HNSW {
                     }
                     visited.visit(neighbor_id);
 
-                    let dist = self.distance(query, neighbor_id);
+                    let dist = self.distance_with_optional_accessor(query, neighbor_id, accessor);
 
                     // Add to candidates if promising
                     let dominated = results.len() >= ef && dist > worst_distance;
@@ -477,21 +688,22 @@ impl HNSW {
             }
         }
 
-        // Convert to sorted vec
-        let mut result_vec: Vec<_> = results.into_iter().map(|r| (r.id, r.distance)).collect();
-        result_vec.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        result_vec
+        // Convert to sorted vec while keeping heap allocations for reuse.
+        out.clear();
+        out.extend(results.iter().map(|r| (r.id, r.distance)));
+        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     }
 
     /// Select neighbors using diversity-preserving heuristic
     ///
     /// Instead of just picking the closest M neighbors, we ensure diversity:
     /// A candidate is added only if it's closer to query than to any selected neighbor.
-    fn select_neighbors(
+    fn select_neighbors_with_accessor(
         &self,
         _query: &[f32],
         candidates: &[(usize, f32)],
         m: usize,
+        accessor: Option<VectorAccessorRef<'_>>,
     ) -> Vec<(usize, f32)> {
         if candidates.is_empty() {
             return Vec::new();
@@ -502,6 +714,7 @@ impl HNSW {
         sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
         let mut result = Vec::with_capacity(m);
+        let mut candidate_vec_scratch = Vec::new();
 
         for &(candidate_id, candidate_dist) in &sorted {
             if result.len() >= m {
@@ -510,21 +723,24 @@ impl HNSW {
 
             // Check if candidate is closer to query than to any existing result
             let mut is_diverse = true;
-            self.with_vector(candidate_id, &mut |candidate_vec| {
-                for &(existing_id, _) in &result {
-                    let mut dist_to_existing = 0.0f32;
-                    self.with_vector(existing_id, &mut |existing_vec| {
-                        dist_to_existing = 1.0 - dot_product(candidate_vec, existing_vec);
-                    });
+            self.copy_vector_into_with_optional_accessor(
+                candidate_id,
+                &mut candidate_vec_scratch,
+                accessor,
+            );
+            for &(existing_id, _) in &result {
+                let mut dist_to_existing = 0.0f32;
+                self.with_vector_from(existing_id, accessor, &mut |existing_vec| {
+                    dist_to_existing = -dot_product(candidate_vec_scratch.as_slice(), existing_vec);
+                });
 
-                    if dist_to_existing < candidate_dist {
-                        // Candidate is closer to existing neighbor than to query.
-                        // This means the existing neighbor "covers" this direction.
-                        is_diverse = false;
-                        break;
-                    }
+                if dist_to_existing < candidate_dist {
+                    // Candidate is closer to existing neighbor than to query.
+                    // This means the existing neighbor "covers" this direction.
+                    is_diverse = false;
+                    break;
                 }
-            });
+            }
 
             if is_diverse {
                 result.push((candidate_id, candidate_dist));
@@ -556,30 +772,76 @@ impl HNSW {
     /// # Returns
     /// Vector of (id, score) pairs, sorted by score descending
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(usize, f32)> {
+        self.search_with_optional_accessor(query, k, ef, None)
+    }
+
+    pub fn search_with_accessor(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accessor: VectorAccessorRef<'_>,
+    ) -> Vec<(usize, f32)> {
+        self.search_with_optional_accessor(query, k, ef, Some(accessor))
+    }
+
+    fn search_with_optional_accessor(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accessor: Option<VectorAccessorRef<'_>>,
+    ) -> Vec<(usize, f32)> {
         if self.entry_point.is_none() {
             return Vec::new();
         }
 
-        let entry_point = self.entry_point.unwrap();
-        let mut current_node = entry_point;
+        QUERY_SCRATCH.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let QueryScratch {
+                search,
+                layer_candidates,
+            } = &mut *slot;
+            let entry_point = self.entry_point.unwrap();
+            let mut current_node = entry_point;
+            let mut visited = VisitedGuard::new(self.max_node_id);
 
-        // Phase 1: Greedy descent from top layer to layer 1
-        for layer in (1..=self.max_layer).rev() {
-            let nearest = self.search_layer(query, &[current_node], 1, layer);
-            if let Some((nearest_id, _)) = nearest.first() {
-                current_node = *nearest_id;
+            // Phase 1: Greedy descent from top layer to layer 1
+            for layer in (1..=self.max_layer).rev() {
+                self.search_layer_into_with_accessor(
+                    query,
+                    &[current_node],
+                    1,
+                    layer,
+                    &mut visited,
+                    search,
+                    layer_candidates,
+                    accessor,
+                );
+                if let Some((nearest_id, _)) = layer_candidates.first() {
+                    current_node = *nearest_id;
+                }
             }
-        }
 
-        // Phase 2: Beam search on layer 0
-        let candidates = self.search_layer(query, &[current_node], ef.max(k), 0);
+            // Phase 2: Beam search on layer 0
+            self.search_layer_into_with_accessor(
+                query,
+                &[current_node],
+                ef.max(k),
+                0,
+                &mut visited,
+                search,
+                layer_candidates,
+                accessor,
+            );
 
-        // Return top k, convert distance to similarity score
-        candidates
-            .into_iter()
-            .take(k)
-            .map(|(id, dist)| (id, 1.0 - dist)) // Convert back to similarity
-            .collect()
+            // Return top k, convert distance to similarity score
+            layer_candidates
+                .iter()
+                .take(k)
+                .map(|(id, dist)| (*id, -*dist))
+                .collect()
+        })
     }
 
     /// Search with metadata predicate filter (hybrid search)
@@ -610,32 +872,89 @@ impl HNSW {
     where
         P: Fn(usize) -> bool,
     {
+        self.search_filtered_with_optional_accessor(query, k, ef, predicate, None)
+    }
+
+    pub fn search_filtered_with_accessor<P>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        predicate: P,
+        accessor: VectorAccessorRef<'_>,
+    ) -> Vec<(usize, f32)>
+    where
+        P: Fn(usize) -> bool,
+    {
+        self.search_filtered_with_optional_accessor(query, k, ef, predicate, Some(accessor))
+    }
+
+    fn search_filtered_with_optional_accessor<P>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        predicate: P,
+        accessor: Option<VectorAccessorRef<'_>>,
+    ) -> Vec<(usize, f32)>
+    where
+        P: Fn(usize) -> bool,
+    {
         if self.entry_point.is_none() {
             return Vec::new();
         }
 
-        let entry_point = self.entry_point.unwrap();
-        let mut current_node = entry_point;
+        let candidates = QUERY_SCRATCH.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let QueryScratch {
+                search,
+                layer_candidates,
+            } = &mut *slot;
+            let entry_point = self.entry_point.unwrap();
+            let mut current_node = entry_point;
+            let mut visited = VisitedGuard::new(self.max_node_id);
 
-        // Phase 1: Greedy descent (unfiltered — we don't filter hub nodes)
-        for layer in (1..=self.max_layer).rev() {
-            let nearest = self.search_layer(query, &[current_node], 1, layer);
-            if let Some((nearest_id, _)) = nearest.first() {
-                current_node = *nearest_id;
+            // Phase 1: Greedy descent (unfiltered — we don't filter hub nodes)
+            for layer in (1..=self.max_layer).rev() {
+                self.search_layer_into_with_accessor(
+                    query,
+                    &[current_node],
+                    1,
+                    layer,
+                    &mut visited,
+                    search,
+                    layer_candidates,
+                    accessor,
+                );
+                if let Some((nearest_id, _)) = layer_candidates.first() {
+                    current_node = *nearest_id;
+                }
             }
-        }
 
-        // Phase 2: Over-fetch beam search on layer 0
-        // We fetch ef*2 candidates because many will be filtered out
-        let over_fetch = (ef * 2).max(k * 4);
-        let candidates = self.search_layer(query, &[current_node], over_fetch, 0);
+            // Phase 2: Over-fetch beam search on layer 0
+            // We fetch ef*2 candidates because many will be filtered out
+            let over_fetch = (ef * 2).max(k * 4);
+            self.search_layer_into_with_accessor(
+                query,
+                &[current_node],
+                over_fetch,
+                0,
+                &mut visited,
+                search,
+                layer_candidates,
+                accessor,
+            );
 
-        // Apply predicate filter and return top k
+            layer_candidates.clone()
+        });
+
+        // Apply predicate filter outside the scratch borrow scope so predicate
+        // closures may safely perform re-entrant searches.
         candidates
             .into_iter()
             .filter(|(id, _)| predicate(*id))
             .take(k)
-            .map(|(id, dist)| (id, 1.0 - dist))
+            .map(|(id, dist)| (id, -dist))
             .collect()
     }
 
@@ -676,7 +995,32 @@ impl HNSW {
         ef: usize,
         total_vectors: usize,
     ) -> Vec<(usize, f32)> {
-        self.search_subsequence_with_predicate(query_sequence, k, ef, total_vectors, |_| true)
+        self.search_subsequence_with_predicate_and_optional_accessor(
+            query_sequence,
+            k,
+            ef,
+            total_vectors,
+            |_| true,
+            None,
+        )
+    }
+
+    pub fn search_subsequence_with_accessor(
+        &self,
+        query_sequence: &[Vec<f32>],
+        k: usize,
+        ef: usize,
+        total_vectors: usize,
+        accessor: VectorAccessorRef<'_>,
+    ) -> Vec<(usize, f32)> {
+        self.search_subsequence_with_predicate_and_optional_accessor(
+            query_sequence,
+            k,
+            ef,
+            total_vectors,
+            |_| true,
+            Some(accessor),
+        )
     }
 
     /// Sub-sequence search with explicit validity predicate.
@@ -688,7 +1032,51 @@ impl HNSW {
         k: usize,
         ef: usize,
         total_vectors: usize,
+        is_valid_id: F,
+    ) -> Vec<(usize, f32)>
+    where
+        F: FnMut(usize) -> bool,
+    {
+        self.search_subsequence_with_predicate_and_optional_accessor(
+            query_sequence,
+            k,
+            ef,
+            total_vectors,
+            is_valid_id,
+            None,
+        )
+    }
+
+    pub fn search_subsequence_with_predicate_and_accessor<F>(
+        &self,
+        query_sequence: &[Vec<f32>],
+        k: usize,
+        ef: usize,
+        total_vectors: usize,
+        is_valid_id: F,
+        accessor: VectorAccessorRef<'_>,
+    ) -> Vec<(usize, f32)>
+    where
+        F: FnMut(usize) -> bool,
+    {
+        self.search_subsequence_with_predicate_and_optional_accessor(
+            query_sequence,
+            k,
+            ef,
+            total_vectors,
+            is_valid_id,
+            Some(accessor),
+        )
+    }
+
+    fn search_subsequence_with_predicate_and_optional_accessor<F>(
+        &self,
+        query_sequence: &[Vec<f32>],
+        k: usize,
+        ef: usize,
+        total_vectors: usize,
         mut is_valid_id: F,
+        accessor: Option<VectorAccessorRef<'_>>,
     ) -> Vec<(usize, f32)>
     where
         F: FnMut(usize) -> bool,
@@ -735,12 +1123,13 @@ impl HNSW {
             anchor_offsets.push(salience.first().map(|(i, _)| *i).unwrap_or(0));
         }
 
-        let mut best_by_start: HashMap<usize, f32> = HashMap::new();
+        let mut best_by_start: FxHashMap<usize, f32> = FxHashMap::default();
         let anchor_overfetch = (k.saturating_mul(6)).max(32);
 
         for salient_offset in anchor_offsets {
             let salient_query = &query_sequence[salient_offset];
-            let anchor_candidates = self.search(salient_query, anchor_overfetch, ef);
+            let anchor_candidates =
+                self.search_with_optional_accessor(salient_query, anchor_overfetch, ef, accessor);
 
             for (anchor_id, _anchor_score) in &anchor_candidates {
                 let start_id = if *anchor_id >= salient_offset {
@@ -761,7 +1150,7 @@ impl HNSW {
                         valid = false;
                         break;
                     }
-                    self.with_vector(vec_id, &mut |stored_vec| {
+                    self.with_vector_from(vec_id, accessor, &mut |stored_vec| {
                         total_sim += dot_product(query_vec, stored_vec);
                     });
                 }

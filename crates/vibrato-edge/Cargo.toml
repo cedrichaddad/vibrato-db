@@ -1,0 +1,12 @@
+[package]
+name = "vibrato-edge"
+version = "0.2.0"
+edition = "2021"
+description = "C-ABI edge embedding for vibrato-core"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vibrato-core = { path = "../vibrato-core" }

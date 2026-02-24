@@ -203,6 +203,20 @@ pub struct VectorMetadata {
     pub tags: Vec<String>,
 }
 
+/// V3 metadata layout for universal engine integrations.
+///
+/// This is intentionally schema-stable and binary-friendly:
+/// - `entity_id` and `sequence_ts` are fixed-width scalars
+/// - `tags` are monotonic registry IDs
+/// - `payload` is opaque binary data for vertical-specific extensions
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VectorMetadataV3 {
+    pub entity_id: u64,
+    pub sequence_ts: u64,
+    pub tags: Vec<u32>,
+    pub payload: Vec<u8>,
+}
+
 impl VectorMetadata {
     #[inline]
     pub fn is_empty(&self) -> bool {

@@ -27,15 +27,31 @@ use tracing_subscriber::EnvFilter;
 use vibrato_db::format_v2::{VdbHeaderV2, VdbWriterV2};
 use vibrato_db::hnsw::HNSW;
 use vibrato_db::prod::{
-    bootstrap_data_dirs, create_snapshot, create_v2_router, migrate_existing_vdb_to_segment,
-    recover_state, replay_to_lsn, restore_snapshot, CatalogOptions, CatalogStore, ProductionConfig,
-    ProductionState, Role, SqliteCatalog, VectorMadviseMode,
+    bootstrap_data_dirs, create_snapshot, create_v3_router, migrate_existing_vdb_to_segment,
+    recover_state, replay_to_lsn, restore_snapshot, start_flight_server, CatalogOptions,
+    CatalogStore, ProductionConfig, ProductionState, Role, SqliteCatalog, VectorMadviseMode,
 };
 use vibrato_db::server::{
     load_store_metadata, serve, AppState, SearchRequest, SearchResponse, SharedStore,
 };
 use vibrato_db::store::VectorStore;
 use vibrato_neural::inference::InferenceEngine;
+
+fn require_api_pepper_for_release() {
+    #[cfg(not(debug_assertions))]
+    {
+        let pepper_present = std::env::var("VIBRATO_API_PEPPER")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if !pepper_present {
+            let message =
+                "FATAL: VIBRATO_API_PEPPER environment variable is required for production startup.";
+            tracing::error!("{}", message);
+            eprintln!("{}", message);
+            std::process::exit(1);
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "vibrato-db")]
@@ -144,8 +160,8 @@ enum Commands {
         model_dir: PathBuf,
     },
 
-    /// Start the production v2 server (SQLite catalog + WAL + segments)
-    ServeV2 {
+    /// Start the production v3 server (SQLite catalog + WAL + segments)
+    ServeV3 {
         /// Root data directory (catalog, segments, tmp, quarantine)
         #[arg(long, default_value = "vibrato_data")]
         data_dir: PathBuf,
@@ -188,7 +204,7 @@ enum Commands {
         )]
         audio_colocated: bool,
 
-        /// If false, /v2/health/* and /v2/metrics require API auth
+        /// If false, /v3/health/* and /v3/metrics require API auth
         #[arg(
             long,
             default_value_t = true,
@@ -222,9 +238,53 @@ enum Commands {
         #[arg(long, default_value = "8")]
         hot_index_shards: usize,
 
+        /// Bounded queue capacity for dedicated SQLite ingest writer jobs
+        #[arg(long, default_value = "1024")]
+        ingest_queue_capacity: usize,
+
+        /// Deterministic in-process memory budget for backpressure decisions
+        #[arg(long, default_value = "8589934592")]
+        memory_budget_bytes: u64,
+
+        /// Query rayon pool threads (0 = auto)
+        #[arg(long, default_value = "0")]
+        query_pool_threads: usize,
+
+        /// Flight decode rayon pool threads (0 = auto)
+        #[arg(long, default_value = "0")]
+        flight_decode_pool_threads: usize,
+
+        /// Minimum shard count before filter allow-set union parallelizes
+        #[arg(long, default_value = "8")]
+        filter_parallel_min_shards: usize,
+
+        /// Maximum per-collection tag cardinality retained in registry cache/storage
+        #[arg(long, default_value = "500000")]
+        max_tag_registry_size: usize,
+
+        /// Maximum normalized tags accepted per vector
+        #[arg(long, default_value = "64")]
+        max_tags_per_vector: usize,
+
+        /// Maximum bytes/chars accepted per normalized tag
+        #[arg(long, default_value = "64")]
+        max_tag_len: usize,
+
+        /// Flight decode chunk warning threshold in milliseconds
+        #[arg(long, default_value = "20")]
+        flight_decode_warn_ms: u64,
+
         /// Vector mmap advise mode for active segment vectors: normal|random
         #[arg(long, default_value = "normal")]
         vector_madvise_mode: String,
+
+        /// Arrow Flight gRPC host (used when --flight-port is provided)
+        #[arg(long, default_value = "0.0.0.0")]
+        flight_host: String,
+
+        /// Optional Arrow Flight gRPC port for high-throughput ingest data plane
+        #[arg(long)]
+        flight_port: Option<u16>,
 
         /// Bootstrap first admin API key if no keys exist in catalog
         #[arg(long, default_value_t = false)]
@@ -556,7 +616,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Models downloaded and verified in {:?}", model_dir);
         }
 
-        Commands::ServeV2 {
+        Commands::ServeV3 {
             data_dir,
             collection,
             dim,
@@ -573,9 +633,22 @@ async fn main() -> anyhow::Result<()> {
             quarantine_max_bytes,
             background_io_mb_per_sec,
             hot_index_shards,
+            ingest_queue_capacity,
+            memory_budget_bytes,
+            query_pool_threads,
+            flight_decode_pool_threads,
+            filter_parallel_min_shards,
+            max_tag_registry_size,
+            max_tags_per_vector,
+            max_tag_len,
+            flight_decode_warn_ms,
             vector_madvise_mode,
+            flight_host,
+            flight_port,
             bootstrap_admin_key,
         } => {
+            require_api_pepper_for_release();
+
             let mut config = ProductionConfig::from_data_dir(data_dir, collection, dim);
             config.checkpoint_interval = std::time::Duration::from_secs(checkpoint_interval_secs);
             config.compaction_interval = std::time::Duration::from_secs(compaction_interval_secs);
@@ -588,6 +661,15 @@ async fn main() -> anyhow::Result<()> {
             config.quarantine_max_bytes = quarantine_max_bytes;
             config.background_io_mb_per_sec = background_io_mb_per_sec;
             config.hot_index_shards = hot_index_shards;
+            config.ingest_queue_capacity = ingest_queue_capacity.max(1);
+            config.memory_budget_bytes = memory_budget_bytes;
+            config.query_pool_threads = query_pool_threads;
+            config.flight_decode_pool_threads = flight_decode_pool_threads;
+            config.filter_parallel_min_shards = filter_parallel_min_shards.max(1);
+            config.max_tag_registry_size = max_tag_registry_size;
+            config.max_tags_per_vector = max_tags_per_vector.max(1);
+            config.max_tag_len = max_tag_len.max(1);
+            config.flight_decode_warn_ms = flight_decode_warn_ms.max(1);
             config.vector_madvise_mode = parse_vector_madvise_mode(&vector_madvise_mode)?;
 
             bootstrap_data_dirs(&config)?;
@@ -596,6 +678,7 @@ async fn main() -> anyhow::Result<()> {
                 CatalogOptions {
                     read_timeout_ms: config.catalog_read_timeout_ms,
                     wal_autocheckpoint_pages: config.sqlite_wal_autocheckpoint_pages,
+                    max_tag_registry_size: config.max_tag_registry_size,
                 },
             )?);
             let state = ProductionState::initialize(config.clone(), catalog.clone())?;
@@ -613,12 +696,28 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("{}", report.report);
 
             state.start_background_workers();
+            let router = create_v3_router(state.clone());
+            let http_addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+            tracing::info!("Starting Vibrato v3 HTTP control plane on {}", http_addr);
+            let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
 
-            let router = create_v2_router(state);
-            let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-            tracing::info!("Starting Vibrato v2 server on {}", addr);
-            let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, router).await?;
+            if let Some(flight_port) = flight_port {
+                let flight_addr: SocketAddr = format!("{}:{}", flight_host, flight_port).parse()?;
+                tracing::info!(
+                    "Starting Vibrato Arrow Flight ingest data plane on {}",
+                    flight_addr
+                );
+                tokio::select! {
+                    http_res = axum::serve(http_listener, router) => {
+                        http_res?;
+                    }
+                    flight_res = start_flight_server(state, flight_addr) => {
+                        flight_res?;
+                    }
+                }
+            } else {
+                axum::serve(http_listener, router).await?;
+            }
         }
 
         Commands::KeyCreate {
@@ -626,6 +725,7 @@ async fn main() -> anyhow::Result<()> {
             name,
             roles,
         } => {
+            require_api_pepper_for_release();
             let config = ProductionConfig::from_data_dir(data_dir, "default".to_string(), 128);
             bootstrap_data_dirs(&config)?;
             let catalog = SqliteCatalog::open(&config.catalog_path())?;

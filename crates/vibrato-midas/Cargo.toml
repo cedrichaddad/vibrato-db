@@ -1,0 +1,9 @@
+[package]
+name = "vibrato-midas"
+version = "0.2.0"
+edition = "2021"
+description = "Time-series search primitives for quantitative workloads"
+license = "MIT"
+
+[dependencies]
+thiserror = "1.0"

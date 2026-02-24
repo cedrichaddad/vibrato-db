@@ -4,6 +4,7 @@ set -euo pipefail
 IMAGE_TAG="${IMAGE_TAG:-vibrato-db:smoke}"
 PORT="${PORT:-18080}"
 CONTAINER_NAME="${CONTAINER_NAME:-vibrato-smoke}"
+VIBRATO_API_PEPPER="${VIBRATO_API_PEPPER:-smoke-pepper}"
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 
@@ -33,10 +34,11 @@ echo "[smoke] starting container ${CONTAINER_NAME}"
 docker run -d \
   --name "${CONTAINER_NAME}" \
   --user "${HOST_UID}:${HOST_GID}" \
+  -e "VIBRATO_API_PEPPER=${VIBRATO_API_PEPPER}" \
   -p "${PORT}:8080" \
   -v "${tmp_root}/data:/var/lib/vibrato" \
   "${IMAGE_TAG}" \
-  serve-v2 \
+  serve-v3 \
     --data-dir /var/lib/vibrato \
     --collection default \
     --dim 16 \
@@ -54,7 +56,7 @@ for _ in $(seq 1 60); do
     exit 1
   fi
 
-  status="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/v2/health/live" || true)"
+  status="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/v3/health/live" || true)"
   if [[ "${status}" == "200" || "${status}" == "401" ]]; then
     break
   fi
@@ -75,28 +77,28 @@ echo "[smoke] waiting for authenticated readiness"
 for _ in $(seq 1 60); do
   status="$(curl -s -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer ${token}" \
-    "http://127.0.0.1:${PORT}/v2/health/ready" || true)"
+    "http://127.0.0.1:${PORT}/v3/health/ready" || true)"
   if [[ "${status}" == "200" ]]; then
     break
   fi
   sleep 1
 done
 
-curl -fsS -H "Authorization: Bearer ${token}" "http://127.0.0.1:${PORT}/v2/health/live" >/dev/null
-curl -fsS -H "Authorization: Bearer ${token}" "http://127.0.0.1:${PORT}/v2/health/ready" >/dev/null
-curl -fsS -H "Authorization: Bearer ${token}" "http://127.0.0.1:${PORT}/v2/metrics" >/dev/null
+curl -fsS -H "Authorization: Bearer ${token}" "http://127.0.0.1:${PORT}/v3/health/live" >/dev/null
+curl -fsS -H "Authorization: Bearer ${token}" "http://127.0.0.1:${PORT}/v3/health/ready" >/dev/null
+curl -fsS -H "Authorization: Bearer ${token}" "http://127.0.0.1:${PORT}/v3/metrics" >/dev/null
 
 echo "[smoke] ingest + query roundtrip"
-curl -fsS -X POST "http://127.0.0.1:${PORT}/v2/vectors" \
+curl -fsS -X POST "http://127.0.0.1:${PORT}/v3/vectors" \
   -H "Authorization: Bearer ${token}" \
   -H "Content-Type: application/json" \
   -d '{
     "vector": [1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],
-    "metadata": {"source_file":"smoke.wav","start_time_ms":0,"duration_ms":100,"bpm":120.0,"tags":["smoke"]},
+    "metadata": {"entity_id":1,"sequence_ts":1,"tags":["smoke"],"payload_base64":""},
     "idempotency_key":"smoke-1"
   }' >/dev/null
 
-query_out="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/v2/query" \
+query_out="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/v3/query" \
   -H "Authorization: Bearer ${token}" \
   -H "Content-Type: application/json" \
   -d '{"vector":[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"k":1,"ef":20,"include_metadata":true}' \

@@ -50,6 +50,16 @@ impl Node {
         }
     }
 
+    /// Add a neighbor without duplicate checks.
+    ///
+    /// Caller must guarantee `neighbor_id` does not already exist in the layer.
+    #[inline(always)]
+    pub fn add_neighbor_unchecked(&mut self, layer: usize, neighbor_id: usize) {
+        if let Some(neighbors) = self.layers.get_mut(layer) {
+            neighbors.push(neighbor_id);
+        }
+    }
+
     /// Remove a neighbor at a specific layer
     pub fn remove_neighbor(&mut self, layer: usize, neighbor_id: usize) {
         if let Some(neighbors) = self.layers.get_mut(layer) {

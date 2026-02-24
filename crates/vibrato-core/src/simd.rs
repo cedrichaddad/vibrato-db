@@ -30,24 +30,47 @@ unsafe fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
 
     let n = a.len();
-    let chunks = n / 4;
+    let chunks16 = n / 16;
+    let chunks4 = (n % 16) / 4;
     let remainder = n % 4;
 
-    let mut acc = vdupq_n_f32(0.0);
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
 
     let a_ptr = a.as_ptr();
     let b_ptr = b.as_ptr();
 
-    for i in 0..chunks {
-        let va = vld1q_f32(a_ptr.add(i * 4));
-        let vb = vld1q_f32(b_ptr.add(i * 4));
-        acc = vfmaq_f32(acc, va, vb); // acc += va * vb
+    for i in 0..chunks16 {
+        let base = i * 16;
+        let va0 = vld1q_f32(a_ptr.add(base));
+        let vb0 = vld1q_f32(b_ptr.add(base));
+        let va1 = vld1q_f32(a_ptr.add(base + 4));
+        let vb1 = vld1q_f32(b_ptr.add(base + 4));
+        let va2 = vld1q_f32(a_ptr.add(base + 8));
+        let vb2 = vld1q_f32(b_ptr.add(base + 8));
+        let va3 = vld1q_f32(a_ptr.add(base + 12));
+        let vb3 = vld1q_f32(b_ptr.add(base + 12));
+        acc0 = vfmaq_f32(acc0, va0, vb0);
+        acc1 = vfmaq_f32(acc1, va1, vb1);
+        acc2 = vfmaq_f32(acc2, va2, vb2);
+        acc3 = vfmaq_f32(acc3, va3, vb3);
     }
 
-    let mut sum = vaddvq_f32(acc); // horizontal add
+    let mut acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+    let tail16 = chunks16 * 16;
+    for i in 0..chunks4 {
+        let base = tail16 + i * 4;
+        let va = vld1q_f32(a_ptr.add(base));
+        let vb = vld1q_f32(b_ptr.add(base));
+        acc = vfmaq_f32(acc, va, vb);
+    }
+
+    let mut sum = vaddvq_f32(acc);
 
     // Handle remainder
-    let tail_start = chunks * 4;
+    let tail_start = tail16 + chunks4 * 4;
     for i in 0..remainder {
         sum += a[tail_start + i] * b[tail_start + i];
     }
@@ -62,24 +85,55 @@ unsafe fn l2_distance_squared_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
 
     let n = a.len();
-    let chunks = n / 4;
+    let chunks16 = n / 16;
+    let chunks4 = (n % 16) / 4;
     let remainder = n % 4;
 
-    let mut acc = vdupq_n_f32(0.0);
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
 
     let a_ptr = a.as_ptr();
     let b_ptr = b.as_ptr();
 
-    for i in 0..chunks {
-        let va = vld1q_f32(a_ptr.add(i * 4));
-        let vb = vld1q_f32(b_ptr.add(i * 4));
+    for i in 0..chunks16 {
+        let base = i * 16;
+
+        let va0 = vld1q_f32(a_ptr.add(base));
+        let vb0 = vld1q_f32(b_ptr.add(base));
+        let d0 = vsubq_f32(va0, vb0);
+        acc0 = vfmaq_f32(acc0, d0, d0);
+
+        let va1 = vld1q_f32(a_ptr.add(base + 4));
+        let vb1 = vld1q_f32(b_ptr.add(base + 4));
+        let d1 = vsubq_f32(va1, vb1);
+        acc1 = vfmaq_f32(acc1, d1, d1);
+
+        let va2 = vld1q_f32(a_ptr.add(base + 8));
+        let vb2 = vld1q_f32(b_ptr.add(base + 8));
+        let d2 = vsubq_f32(va2, vb2);
+        acc2 = vfmaq_f32(acc2, d2, d2);
+
+        let va3 = vld1q_f32(a_ptr.add(base + 12));
+        let vb3 = vld1q_f32(b_ptr.add(base + 12));
+        let d3 = vsubq_f32(va3, vb3);
+        acc3 = vfmaq_f32(acc3, d3, d3);
+    }
+
+    let mut acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+    let tail16 = chunks16 * 16;
+    for i in 0..chunks4 {
+        let base = tail16 + i * 4;
+        let va = vld1q_f32(a_ptr.add(base));
+        let vb = vld1q_f32(b_ptr.add(base));
         let diff = vsubq_f32(va, vb);
-        acc = vfmaq_f32(acc, diff, diff); // acc += diff * diff
+        acc = vfmaq_f32(acc, diff, diff);
     }
 
     let mut sum = vaddvq_f32(acc);
 
-    let tail_start = chunks * 4;
+    let tail_start = tail16 + chunks4 * 4;
     for i in 0..remainder {
         let d = a[tail_start + i] - b[tail_start + i];
         sum += d * d;
@@ -273,7 +327,13 @@ fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
 
 #[inline(always)]
 fn l2_distance_squared_scalar(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum()
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
 }
 
 // ============================================================================
