@@ -253,6 +253,8 @@ pub struct ProductionState {
     pub admin_ops_lock: std::sync::Mutex<()>,
     pub checkpoint_lock: std::sync::Mutex<()>,
     pub compaction_lock: std::sync::Mutex<()>,
+    last_checkpoint_started_unix: AtomicU64,
+    last_compaction_started_unix: AtomicU64,
     background_cancel: CancellationToken,
     pub background_pool: std::sync::Mutex<Option<Arc<ThreadPool>>>,
     background_io_throttle: Option<Arc<BackgroundIoThrottle>>,
@@ -414,6 +416,8 @@ impl ProductionState {
             admin_ops_lock: std::sync::Mutex::new(()),
             checkpoint_lock: std::sync::Mutex::new(()),
             compaction_lock: std::sync::Mutex::new(()),
+            last_checkpoint_started_unix: AtomicU64::new(0),
+            last_compaction_started_unix: AtomicU64::new(0),
             background_cancel,
             background_pool: std::sync::Mutex::new(None),
             background_io_throttle,
@@ -752,6 +756,21 @@ impl ProductionState {
             .unwrap_or_else(|| panic!("data integrity fault: missing hot shard {}", shard));
         let mut shard_guard = shard_lock.write();
         let HotShard { vectors, index } = &mut *shard_guard;
+        if vectors.contains_key(&vector_id) {
+            // Duplicate replay/race path: avoid duplicate graph work, but heal
+            // potential map/index skew if the ID was present in vectors only.
+            if !index.contains_id(vector_id) {
+                let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+                    let vector = vectors.get(&id).unwrap_or_else(|| {
+                        panic!("data integrity fault: hot shard missing id={id} shard={shard}")
+                    });
+                    sink(vector.as_slice());
+                };
+                index.insert_with_accessor(vector_id, &accessor);
+            }
+            return;
+        }
+
         vectors.insert(vector_id, Arc::new(vector));
         let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
             let vector = vectors.get(&id).unwrap_or_else(|| {
@@ -902,6 +921,22 @@ impl ProductionState {
             for item in items {
                 let mut shard_guard = shard_lock.write();
                 let HotShard { vectors, index } = &mut *shard_guard;
+                if vectors.contains_key(&item.vector_id) {
+                    // Replay/idempotency overlap: skip full insert, but keep
+                    // graph consistent if this ID was missing from HNSW.
+                    if !index.contains_id(item.vector_id) {
+                        let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+                            let vector = vectors.get(&id).unwrap_or_else(|| {
+                                panic!(
+                                    "data integrity fault: hot shard missing id={id} shard={shard}"
+                                )
+                            });
+                            sink(vector.as_slice());
+                        };
+                        index.insert_with_accessor(item.vector_id, &accessor);
+                    }
+                    continue;
+                }
                 vectors.insert(item.vector_id, Arc::new(item.vector));
                 let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
                     let vector = vectors.get(&id).unwrap_or_else(|| {
@@ -1779,6 +1814,8 @@ impl ProductionState {
     }
 
     pub fn checkpoint_once(&self) -> Result<JobResponseV2> {
+        const ADMIN_CHECKPOINT_COOLDOWN_SECS: u64 = 30;
+
         let _admin_guard = self
             .admin_ops_lock
             .lock()
@@ -1798,6 +1835,22 @@ impl ProductionState {
                 details: Some(json!({"reason": "no_pending_wal"})),
             });
         }
+        let now = current_unix_ts();
+        let last = self
+            .last_checkpoint_started_unix
+            .load(AtomicOrdering::Relaxed);
+        if last > 0 && now.saturating_sub(last) < ADMIN_CHECKPOINT_COOLDOWN_SECS {
+            return Ok(JobResponseV2 {
+                job_id,
+                state: "idle".to_string(),
+                details: Some(json!({
+                    "reason": "checkpoint_cooldown",
+                    "cooldown_secs": ADMIN_CHECKPOINT_COOLDOWN_SECS,
+                })),
+            });
+        }
+        self.last_checkpoint_started_unix
+            .store(now, AtomicOrdering::Relaxed);
 
         let start_lsn = pending.first().map(|e| e.lsn).unwrap_or(0);
         let end_lsn = pending.last().map(|e| e.lsn).unwrap_or(start_lsn);
@@ -1962,6 +2015,9 @@ impl ProductionState {
     }
 
     pub fn compact_once(&self) -> Result<JobResponseV2> {
+        const ADMIN_COMPACTION_COOLDOWN_SECS: u64 = 30;
+        const COMPACTION_SKIP_WAL_PENDING_THRESHOLD: usize = 4_096;
+
         let _admin_guard = self
             .admin_ops_lock
             .lock()
@@ -1971,6 +2027,34 @@ impl ProductionState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let job_id = make_id("cmp");
+        let wal_pending = self.catalog.count_wal_pending(&self.collection.id)?;
+        if wal_pending >= COMPACTION_SKIP_WAL_PENDING_THRESHOLD {
+            return Ok(JobResponseV2 {
+                job_id,
+                state: "idle".to_string(),
+                details: Some(json!({
+                    "reason": "wal_backlog",
+                    "wal_pending": wal_pending,
+                    "threshold": COMPACTION_SKIP_WAL_PENDING_THRESHOLD,
+                })),
+            });
+        }
+        let now = current_unix_ts();
+        let last = self
+            .last_compaction_started_unix
+            .load(AtomicOrdering::Relaxed);
+        if last > 0 && now.saturating_sub(last) < ADMIN_COMPACTION_COOLDOWN_SECS {
+            return Ok(JobResponseV2 {
+                job_id,
+                state: "idle".to_string(),
+                details: Some(json!({
+                    "reason": "compaction_cooldown",
+                    "cooldown_secs": ADMIN_COMPACTION_COOLDOWN_SECS,
+                })),
+            });
+        }
+        self.last_compaction_started_unix
+            .store(now, AtomicOrdering::Relaxed);
 
         let snapshot = self.segments.load_full();
         let l0 = snapshot
@@ -2069,7 +2153,8 @@ impl ProductionState {
                 .map(|seg| seg.record.row_count)
                 .sum::<usize>();
             // Collect all (id, vector) pairs; later segments win on overlap (newest-wins).
-            let mut merged: HashMap<usize, Vec<f32>> = HashMap::with_capacity(total_rows);
+            let mut merged: FastIdMap<Vec<f32>> = FastIdMap::default();
+            merged.reserve(total_rows);
             let mut read_bytes_budget = 0u64;
             for seg in &ordered_segments {
                 for offset in 0..seg.record.row_count {
@@ -2307,34 +2392,32 @@ impl ProductionState {
         }
 
         // 1. Build shadow shard map/index pairs in parallel.
-        let shadow_shards: Vec<HotShard> = self.query_pool.install(|| {
-            pending_by_shard
-                .into_par_iter()
-                .map(|entries| {
-                    let mut vectors: FastIdMap<Arc<Vec<f32>>> = FastIdMap::default();
-                    vectors.reserve(entries.len());
-                    for entry in entries {
-                        vectors.insert(entry.vector_id, Arc::new(entry.vector));
-                    }
+        let shadow_shards: Vec<HotShard> = pending_by_shard
+            .into_par_iter()
+            .map(|entries| {
+                let mut vectors: FastIdMap<Arc<Vec<f32>>> = FastIdMap::default();
+                vectors.reserve(entries.len());
+                for entry in entries {
+                    vectors.insert(entry.vector_id, Arc::new(entry.vector));
+                }
 
-                    let mut index =
-                        make_empty_hot_hnsw(self.config.hnsw_m, self.config.hnsw_ef_construction);
-                    let mut ids = vectors.keys().copied().collect::<Vec<_>>();
-                    ids.sort_unstable();
-                    for vector_id in ids {
-                        let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                            let vector = vectors.get(&id).unwrap_or_else(|| {
-                                panic!("data integrity fault: rebuilding hot shard missing id={id}")
-                            });
-                            sink(vector.as_slice());
-                        };
-                        index.insert_with_accessor(vector_id, &accessor);
-                    }
+                let mut index =
+                    make_empty_hot_hnsw(self.config.hnsw_m, self.config.hnsw_ef_construction);
+                let mut ids = vectors.keys().copied().collect::<Vec<_>>();
+                ids.sort_unstable();
+                for vector_id in ids {
+                    let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+                        let vector = vectors.get(&id).unwrap_or_else(|| {
+                            panic!("data integrity fault: rebuilding hot shard missing id={id}")
+                        });
+                        sink(vector.as_slice());
+                    };
+                    index.insert_with_accessor(vector_id, &accessor);
+                }
 
-                    HotShard { vectors, index }
-                })
-                .collect()
-        });
+                HotShard { vectors, index }
+            })
+            .collect();
 
         // 2. Atomic shard swap (vectors+index move together per shard).
         for (idx, shadow) in shadow_shards.into_iter().enumerate() {
@@ -2370,6 +2453,20 @@ impl ProductionState {
             for entry in entries {
                 let mut shard_guard = shard_lock.write();
                 let HotShard { vectors, index } = &mut *shard_guard;
+                if vectors.contains_key(&entry.vector_id) {
+                    if !index.contains_id(entry.vector_id) {
+                        let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
+                            let vector = vectors.get(&id).unwrap_or_else(|| {
+                                panic!(
+                                    "data integrity fault: catch-up hot shard missing id={id} shard={shard_idx}"
+                                )
+                            });
+                            sink(vector.as_slice());
+                        };
+                        index.insert_with_accessor(entry.vector_id, &accessor);
+                    }
+                    continue;
+                }
                 vectors.insert(entry.vector_id, Arc::new(entry.vector));
                 let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
                     let vector = vectors.get(&id).unwrap_or_else(|| {
@@ -3067,7 +3164,8 @@ fn build_index_from_pairs(
     ids: &[usize],
     vectors: &[Vec<f32>],
 ) -> HNSW {
-    let mut map = HashMap::with_capacity(ids.len());
+    let mut map: FastIdMap<Vec<f32>> = FastIdMap::default();
+    map.reserve(ids.len());
     for (id, vec) in ids.iter().zip(vectors.iter()) {
         map.insert(*id, vec.clone());
     }

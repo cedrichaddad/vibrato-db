@@ -2768,44 +2768,28 @@ impl SqliteCatalog {
             return Ok(HashMap::new());
         }
 
-        // Temp-table probe avoids dynamic IN(...) SQL generation and keeps
-        // lookup cost stable as key cardinality increases.
-        conn.exec(
-            "CREATE TEMP TABLE IF NOT EXISTS _vibrato_idempotency_probe(
-               idempotency_key TEXT PRIMARY KEY
-             ) WITHOUT ROWID;",
-        )?;
-
-        let mut clear_stmt = PreparedStmt::new(conn, "DELETE FROM _vibrato_idempotency_probe;")?;
-        clear_stmt.step_done()?;
-
-        let mut insert_stmt = PreparedStmt::new(
-            conn,
-            "INSERT OR IGNORE INTO _vibrato_idempotency_probe(idempotency_key)
-             VALUES (?1);",
-        )?;
-        for key in keys {
-            insert_stmt.reset()?;
-            insert_stmt.bind_text(1, key)?;
-            insert_stmt.step_done()?;
-        }
-
-        let mut lookup_stmt = PreparedStmt::new(
-            conn,
-            "SELECT p.idempotency_key, w.vector_id
-             FROM _vibrato_idempotency_probe p
-             JOIN wal_entries w
-               ON w.idempotency_key = p.idempotency_key
-             WHERE w.collection_id = ?1;",
-        )?;
-        lookup_stmt.bind_text(1, collection_id)?;
-
         let mut out = HashMap::with_capacity(keys.len());
-        while lookup_stmt.step_row()? {
-            out.insert(
-                lookup_stmt.column_text(0),
-                lookup_stmt.column_i64(1).max(0) as usize,
+        // Keep parameter count below SQLite bind limits with safe chunking.
+        const LOOKUP_CHUNK_SIZE: usize = 500;
+        for chunk in keys.chunks(LOOKUP_CHUNK_SIZE) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT idempotency_key, vector_id
+                 FROM wal_entries
+                 WHERE collection_id = ?1
+                   AND idempotency_key IN ({placeholders});"
             );
+            let mut lookup_stmt = PreparedStmt::new(conn, &sql)?;
+            lookup_stmt.bind_text(1, collection_id)?;
+            for (i, key) in chunk.iter().enumerate() {
+                lookup_stmt.bind_text((i + 2) as c_int, key)?;
+            }
+            while lookup_stmt.step_row()? {
+                out.insert(
+                    lookup_stmt.column_text(0),
+                    lookup_stmt.column_i64(1).max(0) as usize,
+                );
+            }
         }
 
         Ok(out)
