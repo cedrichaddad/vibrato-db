@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
@@ -18,7 +19,10 @@ use super::model::{
 };
 use super::snapshot::create_snapshot;
 
+const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn create_v3_router(state: Arc<ProductionState>) -> Router {
+    let connection_state = state.clone();
     Router::new()
         .route("/v3/vectors", post(v2_ingest))
         .route("/v3/vectors/batch", post(v2_ingest_batch))
@@ -32,7 +36,23 @@ pub fn create_v3_router(state: Arc<ProductionState>) -> Router {
         .route("/v3/admin/stats", get(v2_admin_stats))
         .route("/v3/metrics", get(v2_metrics))
         .route("/v2/*path", any(v2_deprecated))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            connection_state,
+            track_active_connections,
+        ))
         .with_state(state)
+}
+
+async fn track_active_connections(
+    State(state): State<Arc<ProductionState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    state.connection_opened();
+    let response = next.run(request).await;
+    state.connection_closed();
+    response
 }
 
 async fn v2_ingest(

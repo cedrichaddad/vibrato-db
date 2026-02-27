@@ -10,3 +10,4 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 vibrato-core = { path = "../vibrato-core" }
+libc = "0.2"

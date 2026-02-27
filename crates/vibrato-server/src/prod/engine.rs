@@ -195,17 +195,18 @@ pub struct Metrics {
     pub ingest_backpressure_hard_total: AtomicU64,
     pub ingest_semantic_throttle_ms_total: AtomicU64,
     pub query_latency_count: AtomicU64,
-    pub query_latency_us_sum: AtomicU64,
-    pub query_latency_us_le_10: AtomicU64,
-    pub query_latency_us_le_25: AtomicU64,
-    pub query_latency_us_le_50: AtomicU64,
-    pub query_latency_us_le_100: AtomicU64,
-    pub query_latency_us_le_250: AtomicU64,
-    pub query_latency_us_le_500: AtomicU64,
-    pub query_latency_us_le_1000: AtomicU64,
-    pub query_latency_us_le_2500: AtomicU64,
-    pub query_latency_us_le_5000: AtomicU64,
-    pub query_latency_us_gt_5000: AtomicU64,
+    pub query_latency_seconds_sum: AtomicU64,
+    pub query_latency_seconds_le_10us: AtomicU64,
+    pub query_latency_seconds_le_25us: AtomicU64,
+    pub query_latency_seconds_le_50us: AtomicU64,
+    pub query_latency_seconds_le_100us: AtomicU64,
+    pub query_latency_seconds_le_500us: AtomicU64,
+    pub query_latency_seconds_le_1000us: AtomicU64,
+    pub metadata_cache_hits_total: AtomicU64,
+    pub metadata_cache_misses_total: AtomicU64,
+    pub filter_allow_cache_hits_total: AtomicU64,
+    pub filter_allow_cache_misses_total: AtomicU64,
+    pub active_connections: AtomicU64,
     pub tag_reject_overflow_total: AtomicU64,
     pub tag_reject_invalid_total: AtomicU64,
     pub flight_decode_chunk_warn_total: AtomicU64,
@@ -709,49 +710,48 @@ impl ProductionState {
             .query_latency_count
             .fetch_add(1, AtomicOrdering::Relaxed);
         bucket
-            .query_latency_us_sum
+            .query_latency_seconds_sum
             .fetch_add(us, AtomicOrdering::Relaxed);
         if us <= 10 {
             bucket
-                .query_latency_us_le_10
+                .query_latency_seconds_le_10us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         } else if us <= 25 {
             bucket
-                .query_latency_us_le_25
+                .query_latency_seconds_le_25us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         } else if us <= 50 {
             bucket
-                .query_latency_us_le_50
+                .query_latency_seconds_le_50us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         } else if us <= 100 {
             bucket
-                .query_latency_us_le_100
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        } else if us <= 250 {
-            bucket
-                .query_latency_us_le_250
+                .query_latency_seconds_le_100us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         } else if us <= 500 {
             bucket
-                .query_latency_us_le_500
+                .query_latency_seconds_le_500us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         } else if us <= 1_000 {
             bucket
-                .query_latency_us_le_1000
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        } else if us <= 2_500 {
-            bucket
-                .query_latency_us_le_2500
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        } else if us <= 5_000 {
-            bucket
-                .query_latency_us_le_5000
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        } else {
-            bucket
-                .query_latency_us_gt_5000
+                .query_latency_seconds_le_1000us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         }
+    }
+
+    pub fn connection_opened(&self) {
+        self.metrics
+            .active_connections
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    pub fn connection_closed(&self) {
+        let _ = self
+            .metrics
+            .active_connections
+            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
     }
 
     pub fn audit_event_best_effort(
@@ -1658,100 +1658,126 @@ impl ProductionState {
 
         let b10 = self
             .metrics
-            .query_latency_us_le_10
+            .query_latency_seconds_le_10us
             .load(AtomicOrdering::Relaxed);
         let b25 = b10
             + self
                 .metrics
-                .query_latency_us_le_25
+                .query_latency_seconds_le_25us
                 .load(AtomicOrdering::Relaxed);
         let b50 = b25
             + self
                 .metrics
-                .query_latency_us_le_50
+                .query_latency_seconds_le_50us
                 .load(AtomicOrdering::Relaxed);
         let b100 = b50
             + self
                 .metrics
-                .query_latency_us_le_100
+                .query_latency_seconds_le_100us
                 .load(AtomicOrdering::Relaxed);
-        let b250 = b100
+        let b500 = b100
             + self
                 .metrics
-                .query_latency_us_le_250
-                .load(AtomicOrdering::Relaxed);
-        let b500 = b250
-            + self
-                .metrics
-                .query_latency_us_le_500
+                .query_latency_seconds_le_500us
                 .load(AtomicOrdering::Relaxed);
         let b1000 = b500
             + self
                 .metrics
-                .query_latency_us_le_1000
-                .load(AtomicOrdering::Relaxed);
-        let b2500 = b1000
-            + self
-                .metrics
-                .query_latency_us_le_2500
-                .load(AtomicOrdering::Relaxed);
-        let b5000 = b2500
-            + self
-                .metrics
-                .query_latency_us_le_5000
+                .query_latency_seconds_le_1000us
                 .load(AtomicOrdering::Relaxed);
         let h_count = self
             .metrics
             .query_latency_count
             .load(AtomicOrdering::Relaxed);
-        let h_sum = self
+        let h_sum_us = self
             .metrics
-            .query_latency_us_sum
+            .query_latency_seconds_sum
             .load(AtomicOrdering::Relaxed);
+        let h_sum_seconds = h_sum_us as f64 / 1_000_000.0;
 
-        out.push_str("# TYPE vibrato_query_latency_us histogram\n");
+        out.push_str("# TYPE vibrato_query_latency_seconds histogram\n");
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"10\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.00001\"}} {}\n",
             b10
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"25\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.000025\"}} {}\n",
             b25
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"50\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.00005\"}} {}\n",
             b50
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"100\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.0001\"}} {}\n",
             b100
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"250\"}} {}\n",
-            b250
-        ));
-        out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"500\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.0005\"}} {}\n",
             b500
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"1000\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.001\"}} {}\n",
             b1000
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"2500\"}} {}\n",
-            b2500
-        ));
-        out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"5000\"}} {}\n",
-            b5000
-        ));
-        out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"+Inf\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"+Inf\"}} {}\n",
             h_count
         ));
-        out.push_str(&format!("vibrato_query_latency_us_sum {}\n", h_sum));
-        out.push_str(&format!("vibrato_query_latency_us_count {}\n", h_count));
+        out.push_str(&format!(
+            "vibrato_query_latency_seconds_sum {}\n",
+            h_sum_seconds
+        ));
+        out.push_str(&format!("vibrato_query_latency_seconds_count {}\n", h_count));
+
+        let metadata_hits = self
+            .metrics
+            .metadata_cache_hits_total
+            .load(AtomicOrdering::Relaxed);
+        let metadata_misses = self
+            .metrics
+            .metadata_cache_misses_total
+            .load(AtomicOrdering::Relaxed);
+        let filter_hits = self
+            .metrics
+            .filter_allow_cache_hits_total
+            .load(AtomicOrdering::Relaxed);
+        let filter_misses = self
+            .metrics
+            .filter_allow_cache_misses_total
+            .load(AtomicOrdering::Relaxed);
+        let cache_hits = metadata_hits.saturating_add(filter_hits);
+        let cache_misses = metadata_misses.saturating_add(filter_misses);
+        let cache_total = cache_hits.saturating_add(cache_misses);
+        let cache_hit_ratio = if cache_total == 0 {
+            1.0
+        } else {
+            cache_hits as f64 / cache_total as f64
+        };
+        out.push_str("# TYPE vibrato_cache_hit_ratio gauge\n");
+        out.push_str(&format!("vibrato_cache_hit_ratio {}\n", cache_hit_ratio));
+        out.push_str("# TYPE vibrato_metadata_cache_hits_total counter\n");
+        out.push_str(&format!("vibrato_metadata_cache_hits_total {}\n", metadata_hits));
+        out.push_str("# TYPE vibrato_metadata_cache_misses_total counter\n");
+        out.push_str(&format!(
+            "vibrato_metadata_cache_misses_total {}\n",
+            metadata_misses
+        ));
+        out.push_str("# TYPE vibrato_filter_allow_cache_hits_total counter\n");
+        out.push_str(&format!(
+            "vibrato_filter_allow_cache_hits_total {}\n",
+            filter_hits
+        ));
+        out.push_str("# TYPE vibrato_filter_allow_cache_misses_total counter\n");
+        out.push_str(&format!(
+            "vibrato_filter_allow_cache_misses_total {}\n",
+            filter_misses
+        ));
+        out.push_str("# TYPE vibrato_active_connections gauge\n");
+        out.push_str(&format!(
+            "vibrato_active_connections {}\n",
+            self.metrics.active_connections.load(AtomicOrdering::Relaxed)
+        ));
 
         out.push_str("# TYPE vibrato_active_segments gauge\n");
         out.push_str(&format!(
@@ -1772,6 +1798,8 @@ impl ProductionState {
         out.push_str(&format!("vibrato_hot_vectors {}\n", stats.hot_vectors));
         out.push_str("# TYPE vibrato_wal_pending gauge\n");
         out.push_str(&format!("vibrato_wal_pending {}\n", stats.wal_pending));
+        out.push_str("# TYPE vibrato_wal_pending_rows gauge\n");
+        out.push_str(&format!("vibrato_wal_pending_rows {}\n", stats.wal_pending));
         out.push_str("# TYPE vibrato_total_vectors gauge\n");
         out.push_str(&format!("vibrato_total_vectors {}\n", stats.total_vectors));
         out.push_str("# TYPE vibrato_checkpoint_jobs_inflight gauge\n");
@@ -1823,6 +1851,11 @@ impl ProductionState {
         out.push_str(&format!(
             "vibrato_memory_budget_bytes {}\n",
             stats.memory_budget_bytes
+        ));
+        out.push_str("# TYPE vibrato_ingest_ops_total counter\n");
+        out.push_str(&format!(
+            "vibrato_ingest_ops_total {}\n",
+            self.metrics.ingest_total.load(AtomicOrdering::Relaxed)
         ));
 
         Ok(out)
@@ -2577,9 +2610,15 @@ impl ProductionState {
         let mut missing = Vec::new();
         for id in ids {
             if let Some(meta) = self.metadata_cache.read(id, |_, meta| meta.clone()) {
+                self.metrics
+                    .metadata_cache_hits_total
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 out.insert(*id, meta);
                 continue;
             }
+            self.metrics
+                .metadata_cache_misses_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
             missing.push(*id);
         }
 
@@ -2751,8 +2790,14 @@ impl ProductionState {
             })
             .flatten()
         {
+            self.metrics
+                .filter_allow_cache_hits_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
             return Some(hit);
         }
+        self.metrics
+            .filter_allow_cache_misses_total
+            .fetch_add(1, AtomicOrdering::Relaxed);
 
         let bitmap = Arc::new(self.build_allow_set(filter)?);
         if self.filter_allow_cache.len() >= 512 {

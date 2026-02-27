@@ -30,11 +30,32 @@ use tonic::{Request, Response, Status};
 
 type TonicStream<T> = Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send + 'static>>;
 const FLIGHT_DECODE_CHUNK_ROWS: usize = 2048;
+const FLIGHT_MAX_DECODING_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+const FLIGHT_MAX_ENCODING_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+struct ConnectionGaugeGuard {
+    state: Arc<ProductionState>,
+}
+
+impl ConnectionGaugeGuard {
+    fn new(state: Arc<ProductionState>) -> Self {
+        state.connection_opened();
+        Self { state }
+    }
+}
+
+impl Drop for ConnectionGaugeGuard {
+    fn drop(&mut self) {
+        self.state.connection_closed();
+    }
+}
 
 pub async fn start_flight_server(state: Arc<ProductionState>, addr: SocketAddr) -> Result<()> {
-    let service = VibratoFlightService { state };
+    let service = FlightServiceServer::new(VibratoFlightService { state })
+        .max_decoding_message_size(FLIGHT_MAX_DECODING_MESSAGE_BYTES)
+        .max_encoding_message_size(FLIGHT_MAX_ENCODING_MESSAGE_BYTES);
     tonic::transport::Server::builder()
-        .add_service(FlightServiceServer::new(service))
+        .add_service(service)
         .serve(addr)
         .await
         .map_err(|e| anyhow!("arrow flight server failed on {addr}: {e}"))
@@ -610,6 +631,7 @@ impl FlightService for VibratoFlightService {
         &self,
         request: Request<tonic::Streaming<FlightData>>,
     ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
+        let _connection_guard = ConnectionGaugeGuard::new(self.state.clone());
         let api_key_id = authorize_flight_ingest(&self.state, request.metadata())?;
 
         let mut batch_stream =

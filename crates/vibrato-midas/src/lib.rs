@@ -2,8 +2,30 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::cell::RefCell;
 
 use thiserror::Error;
+
+#[derive(Default)]
+struct DtwWorkspace {
+    prev: Vec<f32>,
+    curr: Vec<f32>,
+}
+
+impl DtwWorkspace {
+    fn ensure_len(&mut self, len: usize) {
+        if self.prev.len() < len {
+            self.prev.resize(len, f32::INFINITY);
+        }
+        if self.curr.len() < len {
+            self.curr.resize(len, f32::INFINITY);
+        }
+    }
+}
+
+thread_local! {
+    static DTW_WORKSPACE: RefCell<DtwWorkspace> = RefCell::new(DtwWorkspace::default());
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MidasError {
@@ -79,36 +101,41 @@ pub fn constrained_dtw_distance(
         return Ok(f32::INFINITY);
     }
 
-    let mut prev = vec![f32::INFINITY; m + 1];
-    let mut curr = vec![f32::INFINITY; m + 1];
-    prev[0] = 0.0;
+    DTW_WORKSPACE.with(|workspace_cell| {
+        let mut workspace = workspace_cell.borrow_mut();
+        workspace.ensure_len(m + 1);
+        let DtwWorkspace { prev, curr } = &mut *workspace;
+        prev[..=m].fill(f32::INFINITY);
+        curr[..=m].fill(f32::INFINITY);
+        prev[0] = 0.0;
 
-    for i in 1..=n {
-        let j_start = i.saturating_sub(w).max(1);
-        let j_end = (i + w).min(m);
+        for i in 1..=n {
+            let j_start = i.saturating_sub(w).max(1);
+            let j_end = (i + w).min(m);
 
-        curr.fill(f32::INFINITY);
-        let mut row_min = f32::INFINITY;
-        let qv = query[i - 1];
-        for j in j_start..=j_end {
-            let cv = candidate[j - 1];
-            let cost = sq_l2(qv, cv);
-            let best_prev = prev[j].min(curr[j - 1]).min(prev[j - 1]);
-            let v = cost + best_prev;
-            curr[j] = v;
-            row_min = row_min.min(v);
-        }
-
-        if let Some(threshold) = early_abandon_at {
-            if row_min > threshold {
-                return Ok(f32::INFINITY);
+            curr[..=m].fill(f32::INFINITY);
+            let mut row_min = f32::INFINITY;
+            let qv = query[i - 1];
+            for j in j_start..=j_end {
+                let cv = candidate[j - 1];
+                let cost = sq_l2(qv, cv);
+                let best_prev = prev[j].min(curr[j - 1]).min(prev[j - 1]);
+                let v = cost + best_prev;
+                curr[j] = v;
+                row_min = row_min.min(v);
             }
+
+            if let Some(threshold) = early_abandon_at {
+                if row_min > threshold {
+                    return Ok(f32::INFINITY);
+                }
+            }
+
+            std::mem::swap(prev, curr);
         }
 
-        std::mem::swap(&mut prev, &mut curr);
-    }
-
-    Ok(prev[m])
+        Ok(prev[m])
+    })
 }
 
 /// Search a query against multiple candidate sequences and return top-k nearest matches.

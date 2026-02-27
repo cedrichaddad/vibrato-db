@@ -19,6 +19,28 @@ fn checked_len(a: usize, b: usize) -> Option<usize> {
     a.checked_mul(b)
 }
 
+/// Best-effort MADV_RANDOM hint for mmap-backed regions.
+///
+/// Returns `0` on success and also on unsupported platforms/errors (soft-fail by design).
+#[no_mangle]
+pub extern "C" fn vibrato_edge_advise_random(ptr: *const u8, len: usize) -> i32 {
+    if ptr.is_null() || len == 0 {
+        return 0;
+    }
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::madvise(ptr.cast_mut().cast(), len, libc::MADV_RANDOM) };
+        if rc != 0 {
+            return 0;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (ptr, len);
+    }
+    0
+}
+
 /// Build an in-memory HNSW index from a contiguous row-major vector matrix.
 ///
 /// Returns null on invalid arguments or internal failure.

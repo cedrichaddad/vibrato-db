@@ -4882,6 +4882,7 @@ dependencies = [
 name = "vibrato-edge"
 version = "0.2.0"
 dependencies = [
+ "libc",
  "vibrato-core",
 ]
 
