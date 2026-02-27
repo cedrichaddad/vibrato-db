@@ -1,6 +1,6 @@
 use crossbeam_channel::{Receiver, Sender};
 use directories::ProjectDirs;
-use rtrb::Consumer;
+use rtrb::{Consumer, Producer};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
@@ -14,11 +14,13 @@ use vibrato_core::store::VectorStore;
 use vibrato_neural::inference::InferenceEngine;
 
 use crate::commands::{GuiCommand, SearchResult, WorkerResponse};
+use crate::dsp_state::DspState;
 
 pub struct VibratoWorker {
     receiver: Receiver<GuiCommand>,
     sender: Sender<WorkerResponse>,
     audio_consumer: Consumer<f32>,
+    dsp_state_producer: Producer<DspState>,
     engine: Option<InferenceEngine>,
     searcher: Option<(Arc<VectorStore>, HNSW)>,
     metadata: HashMap<usize, PathBuf>,
@@ -29,11 +31,13 @@ impl VibratoWorker {
         rx: Receiver<GuiCommand>,
         tx: Sender<WorkerResponse>,
         audio_consumer: Consumer<f32>,
+        dsp_state_producer: Producer<DspState>,
     ) -> Self {
         Self {
             receiver: rx,
             sender: tx,
             audio_consumer,
+            dsp_state_producer,
             engine: None,
             searcher: None,
             metadata: HashMap::new(),
@@ -242,7 +246,7 @@ impl VibratoWorker {
         self.sender.send(WorkerResponse::Progress(progress)).ok();
     }
 
-    async fn handle_text_search(&self, text: String) {
+    async fn handle_text_search(&mut self, text: String) {
         if let (Some(engine), Some((_store, hnsw))) = (&self.engine, &self.searcher) {
             self.report_status("Embedding text...");
             match engine.embed_text(&text).await {
@@ -262,9 +266,16 @@ impl VibratoWorker {
                         })
                         .collect();
 
+                    let best_state = mapped_results
+                        .first()
+                        .map(|best| DspState::from_score(best.score));
                     self.sender
                         .send(WorkerResponse::SearchResults(mapped_results))
                         .ok();
+                    if let Some(state) = best_state {
+                        // Non-blocking push to audio thread. If full, keep previous DSP state.
+                        let _ = self.dsp_state_producer.push(state);
+                    }
                     self.report_status("Ready");
                 }
                 Err(e) => {
@@ -291,9 +302,10 @@ mod tests {
         let (gui_tx, worker_rx) = crossbeam_channel::unbounded();
         let (worker_tx, gui_rx) = crossbeam_channel::unbounded();
         let (producer, consumer) = RingBuffer::new(1024);
+        let (dsp_prod, _dsp_cons) = RingBuffer::new(64);
         drop(producer); // No audio in this test.
 
-        let worker = VibratoWorker::new(worker_rx, worker_tx, consumer);
+        let worker = VibratoWorker::new(worker_rx, worker_tx, consumer, dsp_prod);
         worker.spawn();
 
         // Worker should emit at least one status/progress message during boot.

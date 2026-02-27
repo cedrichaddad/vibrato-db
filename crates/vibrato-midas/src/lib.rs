@@ -1,8 +1,8 @@
 //! `vibrato-midas`: constrained DTW primitives for quantitative time-series search.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::cell::RefCell;
 
 use thiserror::Error;
 

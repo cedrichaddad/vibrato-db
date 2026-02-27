@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::PyAny;
 
 use vibrato_core::hnsw::HNSW;
 use vibrato_core::store::VectorStore;
@@ -68,26 +69,46 @@ impl VibratoIndex {
     pub fn search(
         &self,
         py: Python<'_>,
-        query: Vec<f32>,
+        query: &Bound<'_, PyAny>,
         k: usize,
         ef: usize,
     ) -> PyResult<Vec<(usize, f32)>> {
-        // Validate dimensions
-        if query.len() != self.store.dim {
+        // Keep the query object alive for the full duration of search to prevent
+        // Python GC from reclaiming exporter-owned memory while Rust is reading it.
+        let _query_owner: Py<PyAny> = query.clone().unbind();
+        let query_buf = PyBuffer::<f32>::get(query)?;
+
+        if query_buf.dimensions() != 1 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "query must be a 1D float32 buffer (e.g. numpy.ndarray)",
+            ));
+        }
+        if !query_buf.is_c_contiguous() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "query buffer must be C-contiguous",
+            ));
+        }
+
+        let query_len = query_buf.item_count();
+        if query_len != self.store.dim {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "Dimension mismatch: expected {}, got {}",
-                self.store.dim,
-                query.len()
+                self.store.dim, query_len
             )));
         }
 
+        let query_ptr = query_buf.buf_ptr() as *const f32;
         let index = self.index.clone();
-        let query_clone = query; // Move into thread
 
-        // Release GIL for potentially long-running search
+        // Release GIL for potentially long-running search.
+        // SAFETY:
+        // - `query_ptr` points to a C-contiguous float32 exporter buffer.
+        // - `query_buf` and `_query_owner` are kept alive across this call scope.
+        // - We only read `query_len` elements.
         let results = py.allow_threads(move || {
+            let query_slice = unsafe { std::slice::from_raw_parts(query_ptr, query_len) };
             let index_guard = index.read();
-            index_guard.search(&query_clone, k, ef)
+            index_guard.search(query_slice, k, ef)
         });
 
         Ok(results)

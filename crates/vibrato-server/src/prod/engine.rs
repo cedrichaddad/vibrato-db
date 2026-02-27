@@ -746,12 +746,11 @@ impl ProductionState {
     }
 
     pub fn connection_closed(&self) {
-        let _ = self
-            .metrics
-            .active_connections
-            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |current| {
-                Some(current.saturating_sub(1))
-            });
+        let _ = self.metrics.active_connections.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
     }
 
     pub fn audit_event_best_effort(
@@ -1728,7 +1727,10 @@ impl ProductionState {
             "vibrato_query_latency_seconds_sum {}\n",
             h_sum_seconds
         ));
-        out.push_str(&format!("vibrato_query_latency_seconds_count {}\n", h_count));
+        out.push_str(&format!(
+            "vibrato_query_latency_seconds_count {}\n",
+            h_count
+        ));
 
         let metadata_hits = self
             .metrics
@@ -1757,7 +1759,10 @@ impl ProductionState {
         out.push_str("# TYPE vibrato_cache_hit_ratio gauge\n");
         out.push_str(&format!("vibrato_cache_hit_ratio {}\n", cache_hit_ratio));
         out.push_str("# TYPE vibrato_metadata_cache_hits_total counter\n");
-        out.push_str(&format!("vibrato_metadata_cache_hits_total {}\n", metadata_hits));
+        out.push_str(&format!(
+            "vibrato_metadata_cache_hits_total {}\n",
+            metadata_hits
+        ));
         out.push_str("# TYPE vibrato_metadata_cache_misses_total counter\n");
         out.push_str(&format!(
             "vibrato_metadata_cache_misses_total {}\n",
@@ -1776,7 +1781,9 @@ impl ProductionState {
         out.push_str("# TYPE vibrato_active_connections gauge\n");
         out.push_str(&format!(
             "vibrato_active_connections {}\n",
-            self.metrics.active_connections.load(AtomicOrdering::Relaxed)
+            self.metrics
+                .active_connections
+                .load(AtomicOrdering::Relaxed)
         ));
 
         out.push_str("# TYPE vibrato_active_segments gauge\n");

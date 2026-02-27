@@ -4883,6 +4883,7 @@ name = "vibrato-edge"
 version = "0.2.0"
 dependencies = [
  "libc",
+ "tempfile",
  "vibrato-core",
 ]
 
@@ -4892,6 +4893,7 @@ version = "0.2.0"
 dependencies = [
  "parking_lot",
  "pyo3",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
  "vibrato-core",

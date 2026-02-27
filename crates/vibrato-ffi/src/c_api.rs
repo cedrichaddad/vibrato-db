@@ -10,11 +10,18 @@
 
 use std::ffi::{c_char, CStr, CString};
 use std::path::Path;
+use std::slice;
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+use vibrato_core::hnsw::HNSW;
+use vibrato_core::simd::l2_normalized;
+use vibrato_core::store::VectorStore;
 
 /// Opaque handle to a Vibrato database
 pub struct VibratoHandle {
-    // Will hold the actual engine when wired up
-    _path: String,
+    store: Arc<VectorStore>,
+    index: RwLock<HNSW>,
 }
 
 // Thread-local last error message
@@ -26,6 +33,11 @@ fn set_last_error(msg: &str) {
     LAST_ERROR.with(|e| {
         *e.borrow_mut() = CString::new(msg).ok();
     });
+}
+
+#[inline]
+fn checked_len(a: usize, b: usize) -> Option<usize> {
+    a.checked_mul(b)
 }
 
 /// Open a Vibrato database
@@ -57,8 +69,28 @@ pub unsafe extern "C" fn vibrato_open(path: *const c_char) -> *mut VibratoHandle
             return std::ptr::null_mut();
         }
 
+        let store = match VectorStore::open(path_str) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                set_last_error(&format!("Failed to open vector store: {}", e));
+                return std::ptr::null_mut();
+            }
+        };
+
+        let store_for_hnsw = store.clone();
+        let mut hnsw = HNSW::new_with_accessor_and_seed(
+            16,
+            100,
+            move |id, sink| sink(store_for_hnsw.get(id)),
+            42,
+        );
+        for id in 0..store.count {
+            hnsw.insert(id);
+        }
+
         let handle = Box::new(VibratoHandle {
-            _path: path_str.to_string(),
+            store,
+            index: RwLock::new(hnsw),
         });
 
         Box::into_raw(handle)
@@ -76,13 +108,13 @@ pub unsafe extern "C" fn vibrato_open(path: *const c_char) -> *mut VibratoHandle
 /// or NULL (in which case this is a no-op).
 #[no_mangle]
 pub unsafe extern "C" fn vibrato_close(handle: *mut VibratoHandle) {
-    let _ = std::panic::catch_unwind(|| {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !handle.is_null() {
             unsafe {
                 drop(Box::from_raw(handle));
             }
         }
-    });
+    }));
 }
 
 /// Get the last error message
@@ -102,9 +134,95 @@ pub extern "C" fn vibrato_last_error() -> *const c_char {
     })
 }
 
+/// Search the index.
+///
+/// Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// - `handle` must be a valid pointer returned by `vibrato_open`.
+/// - `query_ptr` must point to `dim` contiguous `f32`s.
+/// - `out_ids_ptr` and `out_scores_ptr` must each point to writable buffers of at least `k`.
+#[no_mangle]
+pub unsafe extern "C" fn vibrato_search(
+    handle: *mut VibratoHandle,
+    query_ptr: *const f32,
+    dim: usize,
+    k: usize,
+    ef: usize,
+    out_ids_ptr: *mut usize,
+    out_scores_ptr: *mut f32,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if handle.is_null() {
+            set_last_error("Handle is null");
+            return -1;
+        }
+        if query_ptr.is_null() {
+            set_last_error("Query pointer is null");
+            return -1;
+        }
+        if out_ids_ptr.is_null() || out_scores_ptr.is_null() {
+            set_last_error("Output pointers must not be null");
+            return -1;
+        }
+        if k == 0 {
+            return 0;
+        }
+
+        let handle = unsafe { &mut *handle };
+        if dim != handle.store.dim {
+            set_last_error(&format!(
+                "Dimension mismatch: expected {}, got {}",
+                handle.store.dim, dim
+            ));
+            return -1;
+        }
+
+        let Some(_out_len) = checked_len(k, 1) else {
+            set_last_error("Output buffer length overflow");
+            return -1;
+        };
+
+        let query = unsafe { slice::from_raw_parts(query_ptr, dim) };
+        let out_ids = unsafe { slice::from_raw_parts_mut(out_ids_ptr, k) };
+        let out_scores = unsafe { slice::from_raw_parts_mut(out_scores_ptr, k) };
+
+        let normalized = l2_normalized(query);
+        let results = handle.index.read().search(&normalized, k, ef.max(k));
+        let mut i = 0usize;
+        for (id, score) in &results {
+            if i >= k {
+                break;
+            }
+            out_ids[i] = *id;
+            out_scores[i] = *score;
+            i += 1;
+        }
+        while i < k {
+            out_ids[i] = usize::MAX;
+            out_scores[i] = f32::NEG_INFINITY;
+            i += 1;
+        }
+        0
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("Panic in vibrato_search");
+        -1
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vibrato_core::format::VdbWriter;
+
+    fn create_test_vdb(path: &std::path::Path) {
+        let mut writer = VdbWriter::new(path, 4).expect("vdb writer");
+        writer.write_vector(&[1.0, 0.0, 0.0, 0.0]).unwrap();
+        writer.write_vector(&[0.0, 1.0, 0.0, 0.0]).unwrap();
+        writer.write_vector(&[0.0, 0.0, 1.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+    }
 
     #[test]
     fn test_open_null_path() {
@@ -129,11 +247,44 @@ mod tests {
 
     #[test]
     fn test_open_close_roundtrip() {
-        let dir = std::env::temp_dir();
-        let path = CString::new(dir.to_str().unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let vdb_path = dir.path().join("test.vdb");
+        create_test_vdb(&vdb_path);
+        let path = CString::new(vdb_path.to_str().unwrap()).unwrap();
         let handle = unsafe { vibrato_open(path.as_ptr()) };
-        // temp dir exists, so handle should be non-null
         assert!(!handle.is_null());
+        unsafe {
+            vibrato_close(handle);
+        }
+    }
+
+    #[test]
+    fn test_search_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let vdb_path = dir.path().join("search_test.vdb");
+        create_test_vdb(&vdb_path);
+        let path = CString::new(vdb_path.to_str().unwrap()).unwrap();
+        let handle = unsafe { vibrato_open(path.as_ptr()) };
+        assert!(!handle.is_null());
+
+        let query = [1.0f32, 0.0, 0.0, 0.0];
+        let mut out_ids = [usize::MAX; 2];
+        let mut out_scores = [f32::NEG_INFINITY; 2];
+        let rc = unsafe {
+            vibrato_search(
+                handle,
+                query.as_ptr(),
+                query.len(),
+                2,
+                32,
+                out_ids.as_mut_ptr(),
+                out_scores.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(out_ids[0], 0);
+        assert!(out_scores[0].is_finite());
+
         unsafe {
             vibrato_close(handle);
         }

@@ -244,8 +244,7 @@ fn stress_test_million_ops_direct_engine_raw() {
                             &query_bank,
                             &counters,
                             &mut rng,
-                        )
-                        {
+                        ) {
                             record_failure(&first_error, &stop, msg);
                             break;
                         }
@@ -292,8 +291,7 @@ fn stress_test_million_ops_direct_engine_raw() {
                         &query_bank,
                         &counters,
                         &mut rng,
-                    )
-                    {
+                    ) {
                         record_failure(&first_error, &stop, msg);
                     }
                 }
