@@ -3464,7 +3464,7 @@ fn salient_anchor_offsets(query_sequence: &[Vec<f32>]) -> Vec<usize> {
         .iter()
         .enumerate()
         .map(|(i, v)| {
-            let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+            let norm_sq: f32 = dot_product(v, v);
             (i, norm_sq)
         })
         .collect::<Vec<_>>();
