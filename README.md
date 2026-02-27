@@ -180,19 +180,32 @@ Arrow Flight ingest notes:
   - required metadata columns: `entity_id` (`UInt64`), `sequence_ts` (`UInt64`), `payload` (`Binary`)
   - optional metadata columns: `tags` (`List<Utf8>` or `List<Dictionary<*, Utf8>>`), `idempotency_key` (`Utf8`)
 
-### 4. Python Bindings
+### 4. Python SDK (Flight-First)
 
-Vibrato-DB exposes a high-performance Python API via PyO3.
+Install:
+
+```bash
+pip install vibrato-db
+```
+
+Use the V3 client with Arrow Flight ingest and HTTP query/identify:
 
 ```python
-import vibrato
+import numpy as np
+from vibrato import VibratoClient
 
-# Open an index (releases GIL during search)
-index = vibrato.VibratoIndex("data.idx", "data.vdb")
+client = VibratoClient(
+    http_url="http://127.0.0.1:8080",
+    flight_url="grpc://127.0.0.1:8815",
+    api_key="YOUR_API_KEY",
+)
 
-# Search
-results = index.search(query_vector, k=10)
-print(results) # [(id, score), ...]
+vectors = np.random.randn(1024, 128).astype("float32")
+ingest = client.ingest(vectors)
+print(ingest)
+
+query = client.query(vectors[0], k=10, ef=64)
+print(query["results"][0])
 ```
 
 ### 5. HTTP API

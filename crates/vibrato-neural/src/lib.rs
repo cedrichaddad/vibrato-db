@@ -18,11 +18,14 @@
 //! is the default; transient-aware mode is behind a feature flag.
 
 pub mod decoder;
-pub mod inference;
-pub mod models;
 pub mod resampler;
 pub mod spectrogram;
 pub mod windowing;
+
+#[cfg(feature = "onnx")]
+pub mod inference;
+#[cfg(feature = "onnx")]
+pub mod models;
 
 use thiserror::Error;
 

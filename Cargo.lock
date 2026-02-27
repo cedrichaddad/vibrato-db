@@ -4897,7 +4897,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "vibrato-core",
- "vibrato-neural",
 ]
 
 [[package]]
@@ -4915,6 +4914,7 @@ dependencies = [
  "hex",
  "ndarray 0.15.6",
  "ort",
+ "rayon",
  "reqwest",
  "rubato",
  "rustfft",

@@ -37,8 +37,10 @@ const DEFAULT_MIN_OPS_PER_SEC: f64 = 3500.0;
 const QUERY_BANK_CAP: usize = 4096;
 const BATCH_SIZE: usize = 200;
 const VERIFY_SAMPLE_CAP: usize = 20_000;
+const DEFAULT_VERIFY_SAMPLES: usize = 1_000;
 const RECENT_READ_WRITE_WINDOW: usize = 100;
 const DURABILITY_VERIFY_COUNT: usize = 5_000;
+const DEFAULT_DURABILITY_VERIFY_SAMPLES: usize = DURABILITY_VERIFY_COUNT;
 const WARMUP_VECTORS: usize = 128;
 const STRICT_EF: usize = 1024;
 const READ_PERCENT: usize = 50;
@@ -611,6 +613,7 @@ async fn flush_write_buffer_flight(
     worker_id: usize,
     op_idx: usize,
     seed: u64,
+    verify_sample_cap: usize,
 ) -> Result<(), String> {
     if buffer.is_empty() {
         return Ok(());
@@ -679,7 +682,7 @@ async fn flush_write_buffer_flight(
                 sequence_ts: row.sequence_ts,
                 payload: row.payload.clone(),
             };
-            if sample_pool.len() < VERIFY_SAMPLE_CAP {
+            if sample_pool.len() < verify_sample_cap {
                 sample_pool.push(sample.clone());
             } else {
                 let slot = rng.gen_range(0..sample_pool.len());
@@ -727,6 +730,14 @@ async fn stress_test_million_ops_flight_mixed() {
     );
     let max_elapsed_secs = env_u64("VIBRATO_STRESS_MAX_ELAPSED_SECS", DEFAULT_MAX_ELAPSED_SECS);
     let min_ops_per_sec = env_f64("VIBRATO_STRESS_MIN_OPS_PER_SEC", DEFAULT_MIN_OPS_PER_SEC);
+    let verify_samples_target = env_usize("VIBRATO_STRESS_VERIFY_SAMPLES", DEFAULT_VERIFY_SAMPLES);
+    let durability_verify_target = env_usize(
+        "VIBRATO_STRESS_DURABILITY_VERIFY_SAMPLES",
+        DEFAULT_DURABILITY_VERIFY_SAMPLES,
+    );
+    let verify_sample_cap = env_usize("VIBRATO_STRESS_VERIFY_SAMPLE_CAP", VERIFY_SAMPLE_CAP)
+        .max(1)
+        .max(verify_samples_target.max(durability_verify_target));
 
     if cfg!(debug_assertions) {
         eprintln!(
@@ -955,6 +966,7 @@ async fn stress_test_million_ops_flight_mixed() {
                             worker_id,
                             local_idx,
                             seed,
+                            verify_sample_cap,
                         )
                         .await
                         {
@@ -978,6 +990,7 @@ async fn stress_test_million_ops_flight_mixed() {
                         worker_id,
                         local_idx,
                         seed,
+                        verify_sample_cap,
                     )
                     .await
                     {
@@ -1064,6 +1077,7 @@ async fn stress_test_million_ops_flight_mixed() {
                 worker_id,
                 local_idx,
                 seed,
+                verify_sample_cap,
             )
             .await
             {
@@ -1137,7 +1151,7 @@ async fn stress_test_million_ops_flight_mixed() {
 
     let samples = verification_samples.lock().clone();
     let verify_count = if writes > 0 {
-        samples.len().min(1_000)
+        samples.len().min(verify_samples_target)
     } else {
         0
     };
@@ -1214,7 +1228,7 @@ async fn stress_test_million_ops_flight_mixed() {
 
     // Cold-start durability validation against persisted state.
     let durability_count = if writes > 0 {
-        samples.len().min(DURABILITY_VERIFY_COUNT)
+        samples.len().min(durability_verify_target)
     } else {
         0
     };

@@ -1,21 +1,44 @@
 //! `vibrato-edge`: C ABI wrapper for embedded/edge deployments.
 
-use std::collections::VecDeque;
-use std::ffi::{c_char, CStr};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
+use std::ffi::{c_char, CStr, CString};
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::slice;
 use std::sync::Arc;
 
+use vibrato_core::format_v2::VdbHeaderV2;
 use vibrato_core::hnsw::HNSW;
 use vibrato_core::simd::{dot_product, l2_normalized};
 use vibrato_core::store::VectorStore;
+
+const EDGE_DEFAULT_OVERLAY_CAPACITY: usize = 1024;
+const EDGE_MAX_OVERLAY_CAPACITY: usize = 65_536;
 
 pub struct EdgeDb {
     dim: usize,
     #[allow(dead_code)]
     vectors: Arc<Vec<Vec<f32>>>,
     hnsw: HNSW,
+}
+
+thread_local! {
+    static LAST_ERROR: std::cell::RefCell<Option<CString>> = const { std::cell::RefCell::new(None) };
+}
+
+fn set_last_error(msg: impl AsRef<str>) {
+    LAST_ERROR.with(|slot| {
+        *slot.borrow_mut() = CString::new(msg.as_ref()).ok();
+    });
+}
+
+fn clear_last_error() {
+    LAST_ERROR.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -66,18 +89,65 @@ pub struct EdgeRuntime {
     next_overlay_id: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TopKItem {
+    id: usize,
+    score: f32,
+}
+
+impl Eq for TopKItem {}
+
+impl PartialEq for TopKItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.score.to_bits() == other.score.to_bits()
+    }
+}
+
+impl Ord for TopKItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for TopKItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl EdgeRuntime {
     /// Open an immutable mmap base from a `.vdb` file and create a bounded overlay.
     pub fn open<P: AsRef<Path>>(
         vdb_path: P,
         overlay_capacity: usize,
     ) -> Result<Self, EdgeRuntimeError> {
-        let base_store = Arc::new(VectorStore::open(vdb_path)?);
-        Ok(Self::from_store(base_store, overlay_capacity))
+        let base_path = vdb_path.as_ref().to_path_buf();
+        let base_store = Arc::new(VectorStore::open(&base_path)?);
+        let base_hnsw = Self::load_embedded_graph_or_rebuild(&base_path, base_store.clone());
+        Ok(Self::from_parts(base_store, base_hnsw, overlay_capacity))
     }
 
     /// Build runtime from an already-open mmap store (test/helper path).
     pub fn from_store(base_store: Arc<VectorStore>, overlay_capacity: usize) -> Self {
+        let base_hnsw = Self::build_hnsw_from_store(base_store.clone());
+        Self::from_parts(base_store, base_hnsw, overlay_capacity)
+    }
+
+    fn from_parts(base_store: Arc<VectorStore>, base_hnsw: HNSW, overlay_capacity: usize) -> Self {
+        advise_random(base_store.vector_bytes());
+        let overlay_capacity = sanitize_overlay_capacity(overlay_capacity);
+        Self {
+            next_overlay_id: base_store.count,
+            base_store,
+            base_hnsw,
+            overlay: VecDeque::with_capacity(overlay_capacity),
+            overlay_capacity,
+        }
+    }
+
+    fn build_hnsw_from_store(base_store: Arc<VectorStore>) -> HNSW {
         let base_for_hnsw = base_store.clone();
         let mut base_hnsw = HNSW::new_with_accessor_and_seed(
             16,
@@ -88,13 +158,33 @@ impl EdgeRuntime {
         for id in 0..base_store.count {
             base_hnsw.insert(id);
         }
+        base_hnsw
+    }
 
-        Self {
-            next_overlay_id: base_store.count,
-            base_store,
-            base_hnsw,
-            overlay: VecDeque::with_capacity(overlay_capacity.max(1)),
-            overlay_capacity: overlay_capacity.max(1),
+    fn load_embedded_graph_or_rebuild(base_path: &Path, base_store: Arc<VectorStore>) -> HNSW {
+        let mut header_bytes = [0u8; 64];
+        let Ok(mut file) = File::open(base_path) else {
+            return Self::build_hnsw_from_store(base_store);
+        };
+        if file.read_exact(&mut header_bytes).is_err() {
+            return Self::build_hnsw_from_store(base_store);
+        }
+        let Ok(header) = VdbHeaderV2::from_bytes(&header_bytes) else {
+            return Self::build_hnsw_from_store(base_store);
+        };
+        if !header.has_graph() || header.graph_offset == 0 {
+            return Self::build_hnsw_from_store(base_store);
+        }
+        if file.seek(SeekFrom::Start(header.graph_offset)).is_err() {
+            return Self::build_hnsw_from_store(base_store);
+        }
+        let mut reader = BufReader::new(file);
+        let base_for_hnsw = base_store.clone();
+        match HNSW::load_from_reader_with_accessor(&mut reader, move |id, sink| {
+            sink(base_for_hnsw.get(id))
+        }) {
+            Ok(index) => index,
+            Err(_) => Self::build_hnsw_from_store(base_store),
         }
     }
 
@@ -146,14 +236,32 @@ impl EdgeRuntime {
         }
 
         let normalized = l2_normalized(query);
-        let mut merged = self.base_hnsw.search(&normalized, k.max(32), ef.max(k));
+        let mut top_k: BinaryHeap<Reverse<TopKItem>> = BinaryHeap::with_capacity(k + 1);
+        let mut consider = |id: usize, score: f32| {
+            let item = TopKItem { id, score };
+            if top_k.len() < k {
+                top_k.push(Reverse(item));
+                return;
+            }
+            let should_insert = top_k.peek().map(|worst| item > worst.0).unwrap_or(true);
+            if should_insert {
+                let _ = top_k.pop();
+                top_k.push(Reverse(item));
+            }
+        };
+
+        for (id, score) in self.base_hnsw.search(&normalized, k.max(32), ef.max(k)) {
+            consider(id, score);
+        }
         for ov in &self.overlay {
-            merged.push((ov.id, dot_product(&normalized, &ov.vec)));
+            consider(ov.id, dot_product(&normalized, &ov.vec));
         }
-        merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        if merged.len() > k {
-            merged.truncate(k);
-        }
+
+        let mut merged = top_k
+            .into_iter()
+            .map(|Reverse(item)| (item.id, item.score))
+            .collect::<Vec<_>>();
+        merged.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Ok(merged)
     }
 }
@@ -161,6 +269,45 @@ impl EdgeRuntime {
 #[inline]
 fn checked_len(a: usize, b: usize) -> Option<usize> {
     a.checked_mul(b)
+}
+
+#[inline]
+fn sanitize_overlay_capacity(requested: usize) -> usize {
+    let requested = if requested == 0 {
+        EDGE_DEFAULT_OVERLAY_CAPACITY
+    } else {
+        requested
+    };
+    requested.min(EDGE_MAX_OVERLAY_CAPACITY)
+}
+
+#[inline]
+fn advise_random(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::madvise(
+            bytes.as_ptr().cast::<std::ffi::c_void>().cast_mut(),
+            bytes.len(),
+            libc::MADV_RANDOM,
+        );
+    }
+}
+
+/// Return the most recent edge C-ABI error for the current thread.
+///
+/// # Safety
+/// Returned pointer is owned by this library and must not be freed by caller.
+#[no_mangle]
+pub extern "C" fn vibrato_edge_last_error() -> *const c_char {
+    LAST_ERROR.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|s| s.as_ptr())
+            .unwrap_or(std::ptr::null())
+    })
 }
 
 /// Best-effort MADV_RANDOM hint for mmap-backed regions.
@@ -198,18 +345,29 @@ pub unsafe extern "C" fn vibrato_edge_open_runtime(
 ) -> *mut EdgeRuntime {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if path_ptr.is_null() {
+            set_last_error("path pointer is null");
             return std::ptr::null_mut();
         }
         let c_str = unsafe { CStr::from_ptr(path_ptr) };
         let Ok(path) = c_str.to_str() else {
+            set_last_error("path is not valid UTF-8");
             return std::ptr::null_mut();
         };
         match EdgeRuntime::open(path, overlay_capacity) {
-            Ok(runtime) => Box::into_raw(Box::new(runtime)),
-            Err(_) => std::ptr::null_mut(),
+            Ok(runtime) => {
+                clear_last_error();
+                Box::into_raw(Box::new(runtime))
+            }
+            Err(err) => {
+                set_last_error(format!("failed to open edge runtime: {err}"));
+                std::ptr::null_mut()
+            }
         }
     }));
-    result.unwrap_or(std::ptr::null_mut())
+    result.unwrap_or_else(|_| {
+        set_last_error("panic in vibrato_edge_open_runtime");
+        std::ptr::null_mut()
+    })
 }
 
 /// Free an `EdgeRuntime` pointer returned by `vibrato_edge_open_runtime`.
@@ -240,6 +398,7 @@ pub unsafe extern "C" fn vibrato_edge_overlay_insert(
 ) -> i32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if runtime_ptr.is_null() || vector_ptr.is_null() || out_id_ptr.is_null() {
+            set_last_error("runtime/vector/output pointer must not be null");
             return -1;
         }
         let runtime = unsafe { &mut *runtime_ptr };
@@ -249,12 +408,19 @@ pub unsafe extern "C" fn vibrato_edge_overlay_insert(
                 unsafe {
                     *out_id_ptr = id;
                 }
+                clear_last_error();
                 0
             }
-            Err(_) => -1,
+            Err(err) => {
+                set_last_error(format!("overlay insert failed: {err}"));
+                -1
+            }
         }
     }));
-    result.unwrap_or(-1)
+    result.unwrap_or_else(|_| {
+        set_last_error("panic in vibrato_edge_overlay_insert");
+        -1
+    })
 }
 
 /// Search a batch of queries against mmap base + overlay runtime.
@@ -277,23 +443,32 @@ pub unsafe extern "C" fn vibrato_edge_runtime_search_batch(
 ) -> i32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if runtime_ptr.is_null() {
+            set_last_error("runtime pointer is null");
             return -1;
         }
         if num_queries == 0 || k == 0 {
+            clear_last_error();
             return 0;
         }
         if queries_ptr.is_null() || out_ids_ptr.is_null() || out_scores_ptr.is_null() {
+            set_last_error("query/output pointers must not be null");
             return -1;
         }
 
         let runtime = unsafe { &mut *runtime_ptr };
         let query_floats = match checked_len(num_queries, runtime.dim()) {
             Some(v) => v,
-            None => return -1,
+            None => {
+                set_last_error("query length overflow");
+                return -1;
+            }
         };
         let out_len = match checked_len(num_queries, k) {
             Some(v) => v,
-            None => return -1,
+            None => {
+                set_last_error("output length overflow");
+                return -1;
+            }
         };
 
         let queries = unsafe { slice::from_raw_parts(queries_ptr, query_floats) };
@@ -305,7 +480,10 @@ pub unsafe extern "C" fn vibrato_edge_runtime_search_batch(
             let query = &queries[query_start..query_start + runtime.dim()];
             let results = match runtime.search(query, k, ef.max(k)) {
                 Ok(r) => r,
-                Err(_) => return -1,
+                Err(err) => {
+                    set_last_error(format!("runtime search failed: {err}"));
+                    return -1;
+                }
             };
 
             let out_start = qi * k;
@@ -324,9 +502,13 @@ pub unsafe extern "C" fn vibrato_edge_runtime_search_batch(
                 ri += 1;
             }
         }
+        clear_last_error();
         0
     }));
-    result.unwrap_or(-1)
+    result.unwrap_or_else(|_| {
+        set_last_error("panic in vibrato_edge_runtime_search_batch");
+        -1
+    })
 }
 
 /// Build an in-memory HNSW index from a contiguous row-major vector matrix.
@@ -340,13 +522,18 @@ pub extern "C" fn vibrato_edge_build(
 ) -> *mut EdgeDb {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if dim == 0 || num_vectors == 0 {
+            set_last_error("dim and num_vectors must be > 0");
             return std::ptr::null_mut();
         }
         let total = match checked_len(dim, num_vectors) {
             Some(v) => v,
-            None => return std::ptr::null_mut(),
+            None => {
+                set_last_error("input length overflow");
+                return std::ptr::null_mut();
+            }
         };
         if vectors_ptr.is_null() {
+            set_last_error("vectors pointer is null");
             return std::ptr::null_mut();
         }
 
@@ -368,9 +555,13 @@ pub extern "C" fn vibrato_edge_build(
             hnsw.insert(id);
         }
 
+        clear_last_error();
         Box::into_raw(Box::new(EdgeDb { dim, vectors, hnsw }))
     }));
-    result.unwrap_or(std::ptr::null_mut())
+    result.unwrap_or_else(|_| {
+        set_last_error("panic in vibrato_edge_build");
+        std::ptr::null_mut()
+    })
 }
 
 /// Free a database pointer allocated by `vibrato_edge_build`.
@@ -408,23 +599,32 @@ pub extern "C" fn vibrato_search_batch(
 ) -> i32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if db_ptr.is_null() {
+            set_last_error("database pointer is null");
             return -1;
         }
         if num_queries == 0 || k == 0 {
+            clear_last_error();
             return 0;
         }
         if queries_ptr.is_null() || out_ids_ptr.is_null() || out_scores_ptr.is_null() {
+            set_last_error("query/output pointers must not be null");
             return -1;
         }
 
         let db = unsafe { &mut *db_ptr };
         let query_floats = match checked_len(num_queries, db.dim) {
             Some(v) => v,
-            None => return -1,
+            None => {
+                set_last_error("query length overflow");
+                return -1;
+            }
         };
         let out_len = match checked_len(num_queries, k) {
             Some(v) => v,
-            None => return -1,
+            None => {
+                set_last_error("output length overflow");
+                return -1;
+            }
         };
 
         let queries = unsafe { slice::from_raw_parts(queries_ptr, query_floats) };
@@ -453,15 +653,19 @@ pub extern "C" fn vibrato_search_batch(
                 ri += 1;
             }
         }
+        clear_last_error();
         0
     }));
-    result.unwrap_or(-1)
+    result.unwrap_or_else(|_| {
+        set_last_error("panic in vibrato_search_batch");
+        -1
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
     use vibrato_core::format::VdbWriter;
 
     fn create_test_vdb(path: &std::path::Path, vectors: &[Vec<f32>]) {
@@ -516,6 +720,10 @@ mod tests {
             std::ptr::null_mut(),
         );
         assert_eq!(rc, -1);
+        let err_ptr = vibrato_edge_last_error();
+        assert!(!err_ptr.is_null());
+        let err = unsafe { CStr::from_ptr(err_ptr) }.to_string_lossy();
+        assert!(err.contains("database pointer is null"));
     }
 
     #[test]
@@ -559,6 +767,33 @@ mod tests {
         runtime.insert_overlay(&[0.0, 1.0]).unwrap();
         runtime.insert_overlay(&[0.7, 0.7]).unwrap();
         assert_eq!(runtime.overlay_len(), 2);
+    }
+
+    #[test]
+    fn edge_runtime_uses_default_overlay_capacity_when_zero_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let vdb_path = dir.path().join("edge_default_cap.vdb");
+        create_test_vdb(&vdb_path, &[vec![1.0, 0.0], vec![0.0, 1.0]]);
+
+        let mut runtime = EdgeRuntime::open(&vdb_path, 0).expect("open runtime");
+        for _ in 0..(EDGE_DEFAULT_OVERLAY_CAPACITY + 10) {
+            runtime.insert_overlay(&[1.0, 0.0]).unwrap();
+        }
+        assert_eq!(runtime.overlay_len(), EDGE_DEFAULT_OVERLAY_CAPACITY);
+    }
+
+    #[test]
+    fn edge_runtime_caps_overlay_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let vdb_path = dir.path().join("edge_max_cap.vdb");
+        create_test_vdb(&vdb_path, &[vec![1.0, 0.0], vec![0.0, 1.0]]);
+
+        let mut runtime =
+            EdgeRuntime::open(&vdb_path, EDGE_MAX_OVERLAY_CAPACITY + 1000).expect("open runtime");
+        for _ in 0..(EDGE_MAX_OVERLAY_CAPACITY + 10) {
+            runtime.insert_overlay(&[1.0, 0.0]).unwrap();
+        }
+        assert_eq!(runtime.overlay_len(), EDGE_MAX_OVERLAY_CAPACITY);
     }
 
     #[test]

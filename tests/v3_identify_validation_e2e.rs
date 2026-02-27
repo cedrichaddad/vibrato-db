@@ -91,6 +91,14 @@ fn metric_value(metrics: &str, name: &str) -> Option<u64> {
     })
 }
 
+fn metric_value_f64(metrics: &str, name: &str) -> Option<f64> {
+    let prefix = format!("{name} ");
+    metrics.lines().find_map(|line| {
+        line.strip_prefix(&prefix)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+    })
+}
+
 fn histogram_bucket(metrics: &str, name: &str, le: &str) -> Option<u64> {
     let prefix = format!("{name}{{le=\"{le}\"}} ");
     metrics.lines().find_map(|line| {
@@ -228,46 +236,37 @@ async fn identify_endpoint_auth_validation_and_metrics() {
         .expect("identify metric should be present");
     assert_eq!(identify_total, 1);
 
-    let h_count = metric_value(&metrics, "vibrato_query_latency_us_count")
+    let h_count = metric_value(&metrics, "vibrato_query_latency_seconds_count")
         .expect("histogram count should be present");
-    let h_sum =
-        metric_value(&metrics, "vibrato_query_latency_us_sum").expect("histogram sum present");
+    let h_sum = metric_value_f64(&metrics, "vibrato_query_latency_seconds_sum")
+        .expect("histogram sum present");
     assert!(
         h_count >= 1,
         "latency histogram should observe at least one query"
     );
-    assert!(h_sum >= 1, "latency histogram sum should be non-zero");
+    assert!(h_sum > 0.0, "latency histogram sum should be non-zero");
 
-    let b10 = histogram_bucket(&metrics, "vibrato_query_latency_us_bucket", "10")
-        .expect("bucket le=10 missing");
-    let b25 = histogram_bucket(&metrics, "vibrato_query_latency_us_bucket", "25")
-        .expect("bucket le=25 missing");
-    let b50 = histogram_bucket(&metrics, "vibrato_query_latency_us_bucket", "50")
-        .expect("bucket le=50 missing");
-    let b100 = histogram_bucket(&metrics, "vibrato_query_latency_us_bucket", "100")
-        .expect("bucket le=100 missing");
-    let b250 = histogram_bucket(&metrics, "vibrato_query_latency_us_bucket", "250")
-        .expect("bucket le=250 missing");
-    let b500 = histogram_bucket(&metrics, "vibrato_query_latency_us_bucket", "500")
-        .expect("bucket le=500 missing");
-    let b1000 = histogram_bucket(&metrics, "vibrato_query_latency_us_bucket", "1000")
-        .expect("bucket le=1000 missing");
-    let b2500 = histogram_bucket(&metrics, "vibrato_query_latency_us_bucket", "2500")
-        .expect("bucket le=2500 missing");
-    let b5000 = histogram_bucket(&metrics, "vibrato_query_latency_us_bucket", "5000")
-        .expect("bucket le=5000 missing");
-    let b_inf = histogram_bucket(&metrics, "vibrato_query_latency_us_bucket", "+Inf")
+    let b10 = histogram_bucket(&metrics, "vibrato_query_latency_seconds_bucket", "0.00001")
+        .expect("bucket le=0.00001 missing");
+    let b25 = histogram_bucket(&metrics, "vibrato_query_latency_seconds_bucket", "0.000025")
+        .expect("bucket le=0.000025 missing");
+    let b50 = histogram_bucket(&metrics, "vibrato_query_latency_seconds_bucket", "0.00005")
+        .expect("bucket le=0.00005 missing");
+    let b100 = histogram_bucket(&metrics, "vibrato_query_latency_seconds_bucket", "0.0001")
+        .expect("bucket le=0.0001 missing");
+    let b500 = histogram_bucket(&metrics, "vibrato_query_latency_seconds_bucket", "0.0005")
+        .expect("bucket le=0.0005 missing");
+    let b1000 = histogram_bucket(&metrics, "vibrato_query_latency_seconds_bucket", "0.001")
+        .expect("bucket le=0.001 missing");
+    let b_inf = histogram_bucket(&metrics, "vibrato_query_latency_seconds_bucket", "+Inf")
         .expect("bucket le=+Inf missing");
 
     assert!(b10 <= b25);
     assert!(b25 <= b50);
     assert!(b50 <= b100);
-    assert!(b100 <= b250);
-    assert!(b250 <= b500);
+    assert!(b100 <= b500);
     assert!(b500 <= b1000);
-    assert!(b1000 <= b2500);
-    assert!(b2500 <= b5000);
-    assert!(b5000 <= b_inf);
+    assert!(b1000 <= b_inf);
     assert_eq!(b_inf, h_count);
 
     stop_server(&mut server).await;

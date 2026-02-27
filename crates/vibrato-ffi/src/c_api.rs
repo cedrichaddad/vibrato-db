@@ -9,11 +9,14 @@
 //! - -1 = error (call `vibrato_last_error` for details)
 
 use std::ffi::{c_char, CStr, CString};
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::slice;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use vibrato_core::format_v2::VdbHeaderV2;
 use vibrato_core::hnsw::HNSW;
 use vibrato_core::simd::l2_normalized;
 use vibrato_core::store::VectorStore;
@@ -38,6 +41,43 @@ fn set_last_error(msg: &str) {
 #[inline]
 fn checked_len(a: usize, b: usize) -> Option<usize> {
     a.checked_mul(b)
+}
+
+fn load_hnsw_from_vdb_or_rebuild(path: &Path, store: Arc<VectorStore>) -> HNSW {
+    let mut header_bytes = [0u8; 64];
+    let Ok(mut file) = File::open(path) else {
+        return rebuild_hnsw(store);
+    };
+    if file.read_exact(&mut header_bytes).is_err() {
+        return rebuild_hnsw(store);
+    }
+    let Ok(header) = VdbHeaderV2::from_bytes(&header_bytes) else {
+        return rebuild_hnsw(store);
+    };
+    if !header.has_graph() || header.graph_offset == 0 {
+        return rebuild_hnsw(store);
+    }
+    if file.seek(SeekFrom::Start(header.graph_offset)).is_err() {
+        return rebuild_hnsw(store);
+    }
+    let mut reader = BufReader::new(file);
+    let store_for_hnsw = store.clone();
+    match HNSW::load_from_reader_with_accessor(&mut reader, move |id, sink| {
+        sink(store_for_hnsw.get(id))
+    }) {
+        Ok(index) => index,
+        Err(_) => rebuild_hnsw(store),
+    }
+}
+
+fn rebuild_hnsw(store: Arc<VectorStore>) -> HNSW {
+    let store_for_hnsw = store.clone();
+    let mut hnsw =
+        HNSW::new_with_accessor_and_seed(16, 100, move |id, sink| sink(store_for_hnsw.get(id)), 42);
+    for id in 0..store.count {
+        hnsw.insert(id);
+    }
+    hnsw
 }
 
 /// Open a Vibrato database
@@ -77,16 +117,7 @@ pub unsafe extern "C" fn vibrato_open(path: *const c_char) -> *mut VibratoHandle
             }
         };
 
-        let store_for_hnsw = store.clone();
-        let mut hnsw = HNSW::new_with_accessor_and_seed(
-            16,
-            100,
-            move |id, sink| sink(store_for_hnsw.get(id)),
-            42,
-        );
-        for id in 0..store.count {
-            hnsw.insert(id);
-        }
+        let hnsw = load_hnsw_from_vdb_or_rebuild(Path::new(path_str), store.clone());
 
         let handle = Box::new(VibratoHandle {
             store,

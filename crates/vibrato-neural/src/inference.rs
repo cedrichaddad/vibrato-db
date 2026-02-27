@@ -4,13 +4,15 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ort::inputs;
 use ort::session::{builder::SessionBuilder, Session};
 use ort::value::Value;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use thiserror::Error;
 use tokenizers::Tokenizer;
-use tokio::task;
+use tokio::sync::{oneshot, Semaphore};
 
 use crate::models::ModelManager;
 use crate::spectrogram::Spectrogram;
@@ -23,8 +25,6 @@ pub enum InferenceError {
     Io(#[from] std::io::Error),
     #[error("Model error: {0}")]
     Model(#[from] crate::models::ModelError),
-    #[error("Join error: {0}")]
-    Join(#[from] task::JoinError),
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -38,6 +38,9 @@ pub struct InferenceEngine {
     text_session: Arc<Mutex<Session>>,
     tokenizer: Arc<Tokenizer>,
     spectrogram: Arc<Spectrogram>,
+    inference_pool: Arc<ThreadPool>,
+    inference_permits: Arc<Semaphore>,
+    slow_stage_warn_ms: u64,
 }
 
 impl InferenceEngine {
@@ -68,12 +71,21 @@ impl InferenceEngine {
 
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| InferenceError::Other(e.to_string()))?;
+        let threads = default_inference_threads();
+        let inference_pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|idx| format!("vibrato-neural-infer-{idx}"))
+            .build()
+            .map_err(|e| InferenceError::Other(format!("failed to build inference pool: {e}")))?;
 
         Ok(Self {
             audio_session: Arc::new(Mutex::new(audio_session)),
             text_session: Arc::new(Mutex::new(text_session)),
             tokenizer: Arc::new(tokenizer),
             spectrogram: Arc::new(Spectrogram::new()),
+            inference_pool: Arc::new(inference_pool),
+            inference_permits: Arc::new(Semaphore::new(threads.saturating_mul(2))),
+            slow_stage_warn_ms: 20,
         })
     }
 
@@ -93,9 +105,7 @@ impl InferenceEngine {
     pub async fn embed_audio(&self, audio: Vec<f32>) -> Result<Vec<f32>, InferenceError> {
         let session = self.audio_session.clone();
         let spectrogram = self.spectrogram.clone();
-
-        // Offload CPU-intensive inference to blocking thread
-        task::spawn_blocking(move || {
+        self.run_inference_task("embed_audio", move || {
             // 1. Compute Mel Spectrogram
             // Matches Librosa: [n_mels, time]
             let mel_spec = spectrogram.compute(&audio);
@@ -126,7 +136,7 @@ impl InferenceEngine {
 
             Ok(normalize(&embedding))
         })
-        .await?
+        .await
     }
 
     /// Embed audio from file
@@ -138,21 +148,23 @@ impl InferenceEngine {
         let path = path.to_path_buf();
         let engine = self.clone();
 
-        // Offload decoding (blocking I/O) to thread pool
-        let samples = task::spawn_blocking(move || {
-            // 1. Decode
-            let buffer = crate::decoder::decode_file(&path)
-                .map_err(|e| InferenceError::Other(e.to_string()))?;
+        // Decode/resample on the dedicated inference pool as well to avoid
+        // blocking Tokio worker threads under sustained ingest.
+        let samples = self
+            .run_inference_task("decode_audio_file", move || {
+                // 1. Decode
+                let buffer = crate::decoder::decode_file(&path)
+                    .map_err(|e| InferenceError::Other(e.to_string()))?;
 
-            // 2. Resample if needed
-            if buffer.sample_rate != 48000 {
-                crate::resampler::resample(&buffer.samples, buffer.sample_rate, 48000)
-                    .map_err(|e| InferenceError::Other(e.to_string()))
-            } else {
-                Ok(buffer.samples)
-            }
-        })
-        .await??;
+                // 2. Resample if needed
+                if buffer.sample_rate != 48000 {
+                    crate::resampler::resample(&buffer.samples, buffer.sample_rate, 48000)
+                        .map_err(|e| InferenceError::Other(e.to_string()))
+                } else {
+                    Ok(buffer.samples)
+                }
+            })
+            .await?;
 
         // 3. Embed
         engine.embed_audio(samples).await
@@ -164,7 +176,7 @@ impl InferenceEngine {
         let session = self.text_session.clone();
         let text = text.to_string();
 
-        task::spawn_blocking(move || {
+        self.run_inference_task("embed_text", move || {
             // 1. Tokenize
             let encoding = tokenizer
                 .encode(text, true)
@@ -194,8 +206,55 @@ impl InferenceEngine {
 
             Ok(normalize(&embedding))
         })
-        .await?
+        .await
     }
+
+    async fn run_inference_task<T, F>(
+        &self,
+        stage: &'static str,
+        task: F,
+    ) -> Result<T, InferenceError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, InferenceError> + Send + 'static,
+    {
+        let permit = self
+            .inference_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| InferenceError::Other("inference queue closed".to_string()))?;
+        let (tx, rx) = oneshot::channel();
+        let pool = self.inference_pool.clone();
+        pool.spawn_fifo(move || {
+            let _permit = permit;
+            let started = Instant::now();
+            let result = task();
+            let elapsed = started.elapsed();
+            let _ = tx.send((result, elapsed));
+        });
+
+        let (result, elapsed) = rx
+            .await
+            .map_err(|_| InferenceError::Other("inference worker dropped".to_string()))?;
+        if elapsed > Duration::from_millis(self.slow_stage_warn_ms) {
+            tracing::warn!(
+                "neural_stage_slow stage={} elapsed_ms={} threshold_ms={}",
+                stage,
+                elapsed.as_millis(),
+                self.slow_stage_warn_ms
+            );
+        }
+        result
+    }
+}
+
+#[inline]
+fn default_inference_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
 }
 
 fn normalize(v: &[f32]) -> Vec<f32> {

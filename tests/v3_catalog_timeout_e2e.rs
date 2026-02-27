@@ -43,7 +43,9 @@ fn catalog_read_timeout_bounds_slow_metadata_scan() {
     let tight_timeout = SqliteCatalog::open_with_options(
         &config.catalog_path(),
         CatalogOptions {
-            read_timeout_ms: 1,
+            // 1ms can fail during open() on slower CI hosts before scan begins.
+            // Keep timeout tight but large enough for deterministic initialization.
+            read_timeout_ms: 5,
             wal_autocheckpoint_pages: 1000,
             max_tag_registry_size: 500_000,
         },

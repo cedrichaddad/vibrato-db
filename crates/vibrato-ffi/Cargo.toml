@@ -10,11 +10,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 vibrato-core = { path = "../vibrato-core" }
-vibrato-neural = { path = "../vibrato-neural" }
 
 # Python bindings
-# Use abi3-py37 to support Python 3.7+ with a single wheel
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py37"], optional = true }
+# Use abi3-py311 so Python buffer protocol (`PyBuffer`) is available under
+# the limited API for safe zero-copy query paths.
+pyo3 = { version = "0.22", features = ["abi3-py311"], optional = true }
 
 # Utilities
 thiserror = "1.0"
@@ -23,7 +23,10 @@ parking_lot = "0.12"
 
 [features]
 default = []
-python = ["pyo3"]
+# Embedding/test path: links and initializes CPython for Rust tests/binaries.
+python = ["pyo3", "pyo3/auto-initialize"]
+# Extension-module path: build Python extension with dynamic symbol lookup behavior.
+python-extension = ["python", "pyo3/extension-module"]
 
 [dev-dependencies]
 tempfile = "3"

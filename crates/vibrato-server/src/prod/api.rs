@@ -49,9 +49,9 @@ async fn track_active_connections(
     request: Request,
     next: Next,
 ) -> Response {
-    state.connection_opened();
+    state.http_request_opened();
     let response = next.run(request).await;
-    state.connection_closed();
+    state.http_request_closed();
     response
 }
 

@@ -305,35 +305,64 @@ class VibratoClient:
         if pa is None:
             raise RuntimeError("pyarrow is required for Flight ingest")
         if table.num_rows == 0:
-            return []
-        row_bytes = max(1, table.nbytes // max(1, table.num_rows))
-        max_rows_by_size = max(1, self.flight_chunk_bytes // row_bytes)
-        chunk_rows = max(1, min(self.flight_chunk_rows, max_rows_by_size))
-        return table.to_batches(max_chunksize=chunk_rows)
+            return
+        total_rows = table.num_rows
+        max_rows = max(1, self.flight_chunk_rows)
+        max_bytes = max(1, self.flight_chunk_bytes)
+        start = 0
+
+        while start < total_rows:
+            rows = min(max_rows, total_rows - start)
+            batch = None
+            while rows > 0:
+                candidate = table.slice(start, rows).to_batches(max_chunksize=rows)[0]
+                if candidate.nbytes <= max_bytes:
+                    batch = candidate
+                    break
+                if rows == 1:
+                    raise ValueError(
+                        f"single row exceeds Flight chunk byte budget: "
+                        f"row_bytes={candidate.nbytes} limit={max_bytes}"
+                    )
+                rows //= 2
+
+            if batch is None:
+                raise ValueError("failed to build Flight chunk under byte budget")
+
+            yield batch
+            start += rows
 
     def _ingest_via_flight(self, table: "pa.Table") -> IngestResult:
         if paf is None:
             raise RuntimeError("pyarrow.flight is required for Flight ingest")
         if self.flight_url is None:
             raise RuntimeError("flight_url is required for Flight ingest")
+        if table.num_rows == 0:
+            return IngestResult(accepted=0, created=0)
+
         client = paf.FlightClient(self.flight_url)
         options = paf.FlightCallOptions(
             headers=[(b"authorization", f"Bearer {self.api_key}".encode("utf-8"))]
         )
         accepted = 0
         created = 0
-        for batch in self._iter_table_chunks(table):
-            descriptor = paf.FlightDescriptor.for_path("v3", "vectors")
-            writer, reader = client.do_put(descriptor, batch.schema, options=options)
-            writer.write_batch(batch)
+
+        descriptor = paf.FlightDescriptor.for_path("v3", "vectors")
+        writer, reader = client.do_put(descriptor, table.schema, options=options)
+        try:
+            for batch in self._iter_table_chunks(table):
+                writer.write_batch(batch)
+        finally:
+            # Ensure the stream is closed even when write_batch() raises.
             writer.done_writing()
-            while True:
-                metadata = reader.read()
-                if metadata is None:
-                    break
-                payload = json.loads(metadata.to_pybytes().decode("utf-8"))
-                accepted += int(payload.get("accepted", 0))
-                created += int(payload.get("created", 0))
+
+        while True:
+            metadata = reader.read()
+            if metadata is None:
+                break
+            payload = json.loads(metadata.to_pybytes().decode("utf-8"))
+            accepted += int(payload.get("accepted", 0))
+            created += int(payload.get("created", 0))
         return IngestResult(accepted=accepted, created=created)
 
     def _ingest_via_http(

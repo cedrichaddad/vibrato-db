@@ -45,7 +45,15 @@ impl RealtimeDspState {
         sample_rate_hz: f32,
         crossfade_ms: f32,
     ) {
-        if (self.current.wet_gain - target.wet_gain).abs() < 1e-6 {
+        // Retarget from the instantaneous gain, not the last fully committed state.
+        // This prevents gain discontinuities when updates arrive mid-crossfade.
+        let start_gain = self.current_gain();
+        if (start_gain - target.wet_gain).abs() < 1e-6 {
+            self.current = target;
+            self.from = target;
+            self.to = target;
+            self.fade_total_samples = 0;
+            self.fade_remaining_samples = 0;
             return;
         }
 
@@ -54,7 +62,9 @@ impl RealtimeDspState {
             .round()
             .max(1.0) as usize;
 
-        self.from = self.current;
+        let start = DspState::new(start_gain);
+        self.current = start;
+        self.from = start;
         self.to = target;
         self.fade_total_samples = fade_samples;
         self.fade_remaining_samples = fade_samples;
@@ -125,5 +135,24 @@ mod tests {
         // No new transition: value must remain at the last completed state.
         let out = rt.process_sample(1.0);
         assert!((out - 0.8).abs() < 1e-3);
+    }
+
+    #[test]
+    fn retarget_mid_fade_stays_continuous() {
+        let mut rt = RealtimeDspState::default();
+        rt.schedule_transition(DspState::new(0.5), 48_000.0, 3.0);
+        for _ in 0..50 {
+            let _ = rt.process_sample(1.0);
+        }
+
+        let before = rt.process_sample(1.0);
+        rt.schedule_transition(DspState::new(0.9), 48_000.0, 3.0);
+        let after = rt.process_sample(1.0);
+
+        // No gain jump/pop at retarget boundary.
+        assert!(
+            (after - before).abs() < 0.02,
+            "expected continuous retarget; before={before} after={after}"
+        );
     }
 }

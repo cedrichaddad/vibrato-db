@@ -207,6 +207,8 @@ pub struct Metrics {
     pub filter_allow_cache_hits_total: AtomicU64,
     pub filter_allow_cache_misses_total: AtomicU64,
     pub active_connections: AtomicU64,
+    pub active_http_requests: AtomicU64,
+    pub active_flight_streams: AtomicU64,
     pub tag_reject_overflow_total: AtomicU64,
     pub tag_reject_invalid_total: AtomicU64,
     pub flight_decode_chunk_warn_total: AtomicU64,
@@ -751,6 +753,38 @@ impl ProductionState {
             AtomicOrdering::Relaxed,
             |current| Some(current.saturating_sub(1)),
         );
+    }
+
+    pub fn http_request_opened(&self) {
+        self.metrics
+            .active_http_requests
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.connection_opened();
+    }
+
+    pub fn http_request_closed(&self) {
+        let _ = self.metrics.active_http_requests.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+        self.connection_closed();
+    }
+
+    pub fn flight_stream_opened(&self) {
+        self.metrics
+            .active_flight_streams
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.connection_opened();
+    }
+
+    pub fn flight_stream_closed(&self) {
+        let _ = self.metrics.active_flight_streams.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+        self.connection_closed();
     }
 
     pub fn audit_event_best_effort(
@@ -1783,6 +1817,20 @@ impl ProductionState {
             "vibrato_active_connections {}\n",
             self.metrics
                 .active_connections
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_active_http_requests gauge\n");
+        out.push_str(&format!(
+            "vibrato_active_http_requests {}\n",
+            self.metrics
+                .active_http_requests
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_active_flight_streams gauge\n");
+        out.push_str(&format!(
+            "vibrato_active_flight_streams {}\n",
+            self.metrics
+                .active_flight_streams
                 .load(AtomicOrdering::Relaxed)
         ));
 

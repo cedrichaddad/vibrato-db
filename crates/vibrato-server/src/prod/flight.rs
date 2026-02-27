@@ -39,14 +39,14 @@ struct ConnectionGaugeGuard {
 
 impl ConnectionGaugeGuard {
     fn new(state: Arc<ProductionState>) -> Self {
-        state.connection_opened();
+        state.flight_stream_opened();
         Self { state }
     }
 }
 
 impl Drop for ConnectionGaugeGuard {
     fn drop(&mut self) {
-        self.state.connection_closed();
+        self.state.flight_stream_closed();
     }
 }
 
@@ -774,7 +774,10 @@ mod tests {
     use arrow_array::{BinaryArray, FixedSizeListArray, RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::{estimate_batch_ingest_bytes, extract_batch_entries};
+    use super::{
+        estimate_batch_ingest_bytes, extract_batch_entries, FLIGHT_MAX_DECODING_MESSAGE_BYTES,
+        FLIGHT_MAX_ENCODING_MESSAGE_BYTES,
+    };
 
     fn make_batch() -> RecordBatch {
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
@@ -856,5 +859,11 @@ mod tests {
             estimated > raw_vector_bytes,
             "expected metadata-aware estimate to exceed raw vector payload"
         );
+    }
+
+    #[test]
+    fn flight_message_size_limits_match_contract() {
+        assert_eq!(FLIGHT_MAX_DECODING_MESSAGE_BYTES, 256 * 1024 * 1024);
+        assert_eq!(FLIGHT_MAX_ENCODING_MESSAGE_BYTES, 64 * 1024 * 1024);
     }
 }

@@ -28,7 +28,10 @@ pub fn create_editor(
                     WorkerResponse::Progress(p) => *progress.write() = p,
                     WorkerResponse::SearchResults(r) => *current_results.write() = r,
                     WorkerResponse::Error(e) => *status_msg.write() = format!("Error: {}", e),
-                    _ => {}
+                    WorkerResponse::IndexUpdated { count } => {
+                        *status_msg.write() = format!("Indexed {count} files")
+                    }
+                    WorkerResponse::FatalError(e) => *status_msg.write() = format!("Fatal: {}", e),
                 }
             }
 
@@ -58,6 +61,24 @@ pub fn create_editor(
                     if ui.button("Search").clicked() {
                         job_sender.send(GuiCommand::SearchText(text.clone())).ok();
                     }
+                    if ui.button("Search Audio Path").clicked() {
+                        job_sender
+                            .send(GuiCommand::SearchAudio(std::path::PathBuf::from(
+                                text.clone(),
+                            )))
+                            .ok();
+                    }
+                    if ui.button("Ingest Path").clicked() {
+                        job_sender
+                            .send(GuiCommand::Ingest(std::path::PathBuf::from(text.clone())))
+                            .ok();
+                    }
+                    if ui.button("Analyze Buffer").clicked() {
+                        // Diagnostic trigger for live-audio analysis path.
+                        job_sender
+                            .send(GuiCommand::AnalyzeAudio(vec![0.0; 48_000]))
+                            .ok();
+                    }
                 });
 
                 ui.separator();
@@ -70,7 +91,10 @@ pub fn create_editor(
                     } else {
                         for result in results.iter() {
                             ui.group(|ui| {
-                                let _label = ui.label(format!("Score: {:.2}", result.score));
+                                let _label = ui.label(format!(
+                                    "ID: {} | Score: {:.2}",
+                                    result.id, result.score
+                                ));
                                 // Ghost Dragging removed in favor of reliable Copy Path
                                 if let Some(path_str) = result.path.to_str() {
                                     ui.horizontal(|ui| {

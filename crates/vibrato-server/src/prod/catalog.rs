@@ -715,6 +715,78 @@ impl RawSqliteConnection {
         query_result?;
         Ok(rows)
     }
+
+    fn query_metadata_rows_by_ids(
+        &self,
+        collection_id: &str,
+        ids: &[usize],
+        timeout_ms: Option<u64>,
+    ) -> Result<Vec<MetadataRow>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        const FETCH_IDS_CHUNK_WIDTH: usize = 256;
+        let mut timeout_ctx = timeout_ms.map(|ms| TimeoutCtx {
+            start: Instant::now(),
+            timeout: Duration::from_millis(ms.max(1)),
+            timed_out: false,
+        });
+        if let Some(ctx) = timeout_ctx.as_mut() {
+            unsafe {
+                sqlite3_progress_handler(
+                    self.db,
+                    100,
+                    Some(progress_timeout_callback),
+                    ctx as *mut TimeoutCtx as *mut c_void,
+                );
+            }
+        }
+
+        let query_result = (|| -> Result<Vec<MetadataRow>> {
+            let placeholders = (0..FETCH_IDS_CHUNK_WIDTH)
+                .map(|idx| format!("?{}", idx + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT vm.vector_id, vm.schema_version, vm.entity_id, vm.sequence_ts, vm.payload_blob, vm.tags_blob
+                 FROM vector_metadata vm
+                 WHERE vm.collection_id = ?1 AND vm.vector_id IN ({})
+                 ORDER BY vm.vector_id ASC;",
+                placeholders
+            );
+            let mut stmt = PreparedStmt::new(self, &sql)?;
+            let mut rows = Vec::with_capacity(ids.len());
+
+            for chunk in ids.chunks(FETCH_IDS_CHUNK_WIDTH) {
+                stmt.reset()?;
+                stmt.bind_text(1, collection_id)?;
+                for idx in 0..FETCH_IDS_CHUNK_WIDTH {
+                    let bind_idx = (idx + 2) as c_int;
+                    if let Some(id) = chunk.get(idx) {
+                        let id_i64 = i64::try_from(*id).map_err(|_| {
+                            anyhow!("vector_id {} exceeds sqlite INTEGER range", id)
+                        })?;
+                        stmt.bind_i64(bind_idx, id_i64)?;
+                    } else {
+                        stmt.bind_null(bind_idx)?;
+                    }
+                }
+
+                while stmt.step_row()? {
+                    rows.push(unsafe { MetadataRow::from_row(stmt.stmt)? });
+                }
+            }
+
+            Ok(rows)
+        })();
+
+        unsafe {
+            sqlite3_progress_handler(self.db, 0, None, std::ptr::null_mut());
+        }
+
+        query_result
+    }
 }
 
 unsafe extern "C" fn progress_timeout_callback(data: *mut c_void) -> c_int {
@@ -1060,6 +1132,38 @@ impl SqliteCatalog {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.query_rows(sql, timeout)
+        };
+
+        if result
+            .as_ref()
+            .err()
+            .map(|e| e.to_string().contains("catalog_read_timeout"))
+            .unwrap_or(false)
+        {
+            self.read_timeout_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        result
+    }
+
+    fn fetch_metadata_rows_by_ids(
+        &self,
+        collection_id: &str,
+        ids: &[usize],
+    ) -> Result<Vec<MetadataRow>> {
+        let timeout = Some(self.options.read_timeout_ms.max(1));
+        let result = if !self.readers.is_empty() {
+            let idx = self.next_reader.fetch_add(1, AtomicOrdering::Relaxed) % self.readers.len();
+            let guard = self.readers[idx]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.query_metadata_rows_by_ids(collection_id, ids, timeout)
+        } else {
+            let guard = self
+                .writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.query_metadata_rows_by_ids(collection_id, ids, timeout)
         };
 
         if result
@@ -2320,19 +2424,7 @@ impl CatalogStore for SqliteCatalog {
         let mut unique_ids = ids.to_vec();
         unique_ids.sort_unstable();
         unique_ids.dedup();
-        let in_clause = unique_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let rows = self.query_rows::<MetadataRow>(&format!(
-            "SELECT vm.vector_id, vm.schema_version, vm.entity_id, vm.sequence_ts, vm.payload_blob, vm.tags_blob
-             FROM vector_metadata vm
-             WHERE vm.collection_id='{}' AND vm.vector_id IN ({})
-             ORDER BY vm.vector_id ASC;",
-            sql_quote(collection_id),
-            in_clause
-        ))?;
+        let rows = self.fetch_metadata_rows_by_ids(collection_id, &unique_ids)?;
 
         let mut out = HashMap::with_capacity(rows.len());
         for row in rows {

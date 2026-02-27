@@ -30,8 +30,10 @@ const DEFAULT_MAX_ELAPSED_SECS: u64 = 60;
 const QUERY_BANK_CAP: usize = 4096;
 const BATCH_SIZE: usize = 100;
 const VERIFY_SAMPLE_CAP: usize = 20_000;
+const DEFAULT_VERIFY_SAMPLES: usize = 1_000;
 const RECENT_READ_WRITE_WINDOW: usize = 100;
 const DURABILITY_VERIFY_COUNT: usize = 5_000;
+const DEFAULT_DURABILITY_VERIFY_SAMPLES: usize = DURABILITY_VERIFY_COUNT;
 const WARMUP_VECTORS: usize = 128;
 const STRICT_EF: usize = 1024;
 
@@ -513,6 +515,7 @@ async fn flush_write_buffer(
     worker_id: usize,
     op_idx: usize,
     seed: u64,
+    verify_sample_cap: usize,
 ) -> Result<(), String> {
     if buffer.is_empty() {
         return Ok(());
@@ -620,7 +623,7 @@ async fn flush_write_buffer(
                 sequence_ts: request.metadata.sequence_ts,
                 payload: request.payload.clone(),
             };
-            if sample_pool.len() < VERIFY_SAMPLE_CAP {
+            if sample_pool.len() < verify_sample_cap {
                 sample_pool.push(sample.clone());
             } else {
                 let slot = rng.gen_range(0..sample_pool.len());
@@ -666,6 +669,14 @@ async fn stress_test_million_ops_mixed() {
     );
     let enable_admin_chaos = env_usize("VIBRATO_STRESS_ENABLE_ADMIN_CHAOS", 0) > 0;
     let max_elapsed_secs = env_u64("VIBRATO_STRESS_MAX_ELAPSED_SECS", DEFAULT_MAX_ELAPSED_SECS);
+    let verify_samples_target = env_usize("VIBRATO_STRESS_VERIFY_SAMPLES", DEFAULT_VERIFY_SAMPLES);
+    let durability_verify_target = env_usize(
+        "VIBRATO_STRESS_DURABILITY_VERIFY_SAMPLES",
+        DEFAULT_DURABILITY_VERIFY_SAMPLES,
+    );
+    let verify_sample_cap = env_usize("VIBRATO_STRESS_VERIFY_SAMPLE_CAP", VERIFY_SAMPLE_CAP)
+        .max(1)
+        .max(verify_samples_target.max(durability_verify_target));
     if cfg!(debug_assertions) {
         eprintln!(
             "warning: stress test running in debug profile; use --release for realistic contention/latency behavior"
@@ -889,11 +900,12 @@ async fn stress_test_million_ops_mixed() {
                             &max_seen_id,
                             &counters,
                             &mut rng,
-                            worker_id,
-                            local_idx,
-                            seed,
-                        )
-                        .await
+                                worker_id,
+                                local_idx,
+                                seed,
+                                verify_sample_cap,
+                            )
+                            .await
                         {
                             record_failure(&first_error, &stop, msg);
                             break;
@@ -915,11 +927,12 @@ async fn stress_test_million_ops_mixed() {
                         &max_seen_id,
                         &counters,
                         &mut rng,
-                        worker_id,
-                        local_idx,
-                        seed,
-                    )
-                    .await
+                            worker_id,
+                            local_idx,
+                            seed,
+                            verify_sample_cap,
+                        )
+                        .await
                     {
                         record_failure(&first_error, &stop, msg);
                         break;
@@ -1006,9 +1019,10 @@ async fn stress_test_million_ops_mixed() {
                     worker_id,
                     local_idx,
                     seed,
+                    verify_sample_cap,
                 )
                 .await
-                {
+            {
                     record_failure(&first_error, &stop, msg);
                 }
             }
@@ -1099,7 +1113,7 @@ async fn stress_test_million_ops_mixed() {
 
     let samples = verification_samples.lock().clone();
     let verify_count = if writes > 0 {
-        samples.len().min(1_000)
+        samples.len().min(verify_samples_target)
     } else {
         0
     };
@@ -1153,7 +1167,7 @@ async fn stress_test_million_ops_mixed() {
 
     // Cold-start durability validation against the same data directory.
     let durability_count = if writes > 0 {
-        samples.len().min(DURABILITY_VERIFY_COUNT)
+        samples.len().min(durability_verify_target)
     } else {
         0
     };

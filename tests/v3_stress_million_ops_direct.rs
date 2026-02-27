@@ -24,8 +24,10 @@ const DEFAULT_MAX_ELAPSED_SECS: u64 = 60;
 const QUERY_BANK_CAP: usize = 4096;
 const BATCH_SIZE: usize = 100;
 const VERIFY_SAMPLE_CAP: usize = 20_000;
+const DEFAULT_VERIFY_SAMPLES: usize = 1_000;
 const RECENT_READ_WRITE_WINDOW: usize = 100;
 const DURABILITY_VERIFY_COUNT: usize = 5_000;
+const DEFAULT_DURABILITY_VERIFY_SAMPLES: usize = DURABILITY_VERIFY_COUNT;
 const WARMUP_VECTORS: usize = 128;
 const STRICT_EF: usize = 1024;
 
@@ -236,6 +238,7 @@ fn flush_write_buffer_direct(
     worker_id: usize,
     op_idx: usize,
     seed: u64,
+    verify_sample_cap: usize,
 ) -> Result<(), String> {
     if buffer.is_empty() {
         return Ok(());
@@ -281,7 +284,7 @@ fn flush_write_buffer_direct(
                 let slot = rng.gen_range(0..QUERY_BANK_CAP);
                 bank[slot] = sample.vector.clone();
             }
-            if sample_pool.len() >= VERIFY_SAMPLE_CAP {
+            if sample_pool.len() >= verify_sample_cap {
                 sample_pool.pop_front();
             }
             sample_pool.push_back(sample.clone());
@@ -306,6 +309,14 @@ fn stress_test_million_ops_direct_engine() {
     let seed = env_u64("VIBRATO_STRESS_SEED", DEFAULT_SEED);
     let enable_admin_chaos = env_usize("VIBRATO_STRESS_ENABLE_ADMIN_CHAOS", 0) > 0;
     let max_elapsed_secs = env_u64("VIBRATO_STRESS_MAX_ELAPSED_SECS", DEFAULT_MAX_ELAPSED_SECS);
+    let verify_samples_target = env_usize("VIBRATO_STRESS_VERIFY_SAMPLES", DEFAULT_VERIFY_SAMPLES);
+    let durability_verify_target = env_usize(
+        "VIBRATO_STRESS_DURABILITY_VERIFY_SAMPLES",
+        DEFAULT_DURABILITY_VERIFY_SAMPLES,
+    );
+    let verify_sample_cap = env_usize("VIBRATO_STRESS_VERIFY_SAMPLE_CAP", VERIFY_SAMPLE_CAP)
+        .max(1)
+        .max(verify_samples_target.max(durability_verify_target));
     if cfg!(debug_assertions) {
         eprintln!(
             "warning: direct stress test running in debug profile; use --release for realistic behavior"
@@ -460,6 +471,7 @@ fn stress_test_million_ops_direct_engine() {
                                 worker_id,
                                 local_idx,
                                 seed,
+                                verify_sample_cap,
                             ) {
                                 record_failure(&first_error, &stop, msg);
                                 break;
@@ -478,6 +490,7 @@ fn stress_test_million_ops_direct_engine() {
                             worker_id,
                             local_idx,
                             seed,
+                            verify_sample_cap,
                         ) {
                             record_failure(&first_error, &stop, msg);
                             break;
@@ -533,6 +546,7 @@ fn stress_test_million_ops_direct_engine() {
                         worker_id,
                         local_idx,
                         seed,
+                        verify_sample_cap,
                     ) {
                         record_failure(&first_error, &stop, msg);
                     }
@@ -571,7 +585,7 @@ fn stress_test_million_ops_direct_engine() {
 
     let samples = verification_samples.lock().clone();
     let verify_count = if writes > 0 {
-        samples.len().min(1_000)
+        samples.len().min(verify_samples_target)
     } else {
         0
     };
@@ -594,7 +608,7 @@ fn stress_test_million_ops_direct_engine() {
     // Cold-start durability check: initialize a second state on the same data
     // directory and run strict verification against persisted WAL/segments.
     let durability_count = if writes > 0 {
-        samples.len().min(DURABILITY_VERIFY_COUNT)
+        samples.len().min(durability_verify_target)
     } else {
         0
     };

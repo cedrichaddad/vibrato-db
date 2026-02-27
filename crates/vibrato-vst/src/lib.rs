@@ -16,6 +16,9 @@ use dsp_state::{DspState, RealtimeDspState};
 use rtrb::{Consumer, Producer, RingBuffer};
 use worker::VibratoWorker;
 
+const GUI_CMD_QUEUE_CAPACITY: usize = 64;
+const WORKER_RESULT_QUEUE_CAPACITY: usize = 256;
+
 pub struct VibratoPlugin {
     params: Arc<VibratoParams>,
 
@@ -52,8 +55,8 @@ impl Default for VibratoParams {
 
 impl Default for VibratoPlugin {
     fn default() -> Self {
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let (_res_tx, res_rx) = crossbeam_channel::unbounded();
+        let (tx, _rx) = crossbeam_channel::bounded(GUI_CMD_QUEUE_CAPACITY);
+        let (_res_tx, res_rx) = crossbeam_channel::bounded(WORKER_RESULT_QUEUE_CAPACITY);
 
         // Default impl just creates dummy channels or holds them until init?
         // Ideally we don't spawn here.
@@ -119,8 +122,8 @@ impl Plugin for VibratoPlugin {
         // But `default()` returns `VibratoPlugin` which holds `Sender<GuiCommand>` and `Receiver<WorkerResponse>`.
         // So we need to store the *other ends* temporarily? Or just recreate channels here.
 
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let (res_tx, res_rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crossbeam_channel::bounded(GUI_CMD_QUEUE_CAPACITY);
+        let (res_tx, res_rx) = crossbeam_channel::bounded(WORKER_RESULT_QUEUE_CAPACITY);
 
         // Ring Buffer (e.g., 2 seconds of mono audio at 48kHz for analysis)
         // 48000 * 2 = 96000
