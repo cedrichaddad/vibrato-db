@@ -4904,6 +4904,7 @@ name = "vibrato-midas"
 version = "0.2.0"
 dependencies = [
  "thiserror 1.0.69",
+ "vibrato-core",
 ]
 
 [[package]]

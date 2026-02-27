@@ -115,11 +115,15 @@ impl VibratoIndex {
                 )));
             }
             let owner = query.clone().unbind();
-            let results = py.allow_threads(move || {
-                let _keep_owner_alive = owner;
+            let slice = buf.as_slice();
+            let results = py.allow_threads(|| {
                 let index_guard = index.read();
-                index_guard.search(buf.as_slice(), k, ef)
+                index_guard.search(slice, k, ef)
             });
+            // Drop Python-owned resources only after allow_threads() has returned,
+            // which guarantees the GIL is re-acquired.
+            drop(buf);
+            drop(owner);
             return Ok(results);
         }
 

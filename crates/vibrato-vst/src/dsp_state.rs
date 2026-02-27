@@ -23,6 +23,7 @@ pub struct RealtimeDspState {
     to: DspState,
     fade_total_samples: usize,
     fade_remaining_samples: usize,
+    fade_step: f32,
 }
 
 impl Default for RealtimeDspState {
@@ -34,6 +35,7 @@ impl Default for RealtimeDspState {
             to: s,
             fade_total_samples: 0,
             fade_remaining_samples: 0,
+            fade_step: 0.0,
         }
     }
 }
@@ -54,6 +56,7 @@ impl RealtimeDspState {
             self.to = target;
             self.fade_total_samples = 0;
             self.fade_remaining_samples = 0;
+            self.fade_step = 0.0;
             return;
         }
 
@@ -68,6 +71,7 @@ impl RealtimeDspState {
         self.to = target;
         self.fade_total_samples = fade_samples;
         self.fade_remaining_samples = fade_samples;
+        self.fade_step = 1.0 / fade_samples as f32;
     }
 
     #[inline(always)]
@@ -77,7 +81,7 @@ impl RealtimeDspState {
         }
 
         let progressed = self.fade_total_samples - self.fade_remaining_samples;
-        let t = progressed as f32 / self.fade_total_samples as f32;
+        let t = (progressed as f32 * self.fade_step).min(1.0);
         self.from.wet_gain + (self.to.wet_gain - self.from.wet_gain) * t
     }
 

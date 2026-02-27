@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use thiserror::Error;
+use vibrato_core::simd::l2_distance_squared;
 
 #[derive(Default)]
 struct DtwWorkspace {
@@ -89,10 +90,7 @@ fn sq_l2(a: f32, b: f32) -> f32 {
 #[inline]
 fn ann_proxy_l2_distance(query: &[f32], candidate: &[f32]) -> f32 {
     let min_len = query.len().min(candidate.len());
-    let mut dist = 0.0f32;
-    for i in 0..min_len {
-        dist += sq_l2(query[i], candidate[i]);
-    }
+    let dist = l2_distance_squared(&query[..min_len], &candidate[..min_len]);
     let len_penalty = query.len().abs_diff(candidate.len()) as f32;
     dist + len_penalty
 }

@@ -186,24 +186,37 @@ class VibratoClient:
         nrows, dim = arr.shape
         flat = pa.array(arr.reshape(-1), type=pa.float32())
         vector_col = pa.FixedSizeListArray.from_arrays(flat, dim)
-        entity_col = pa.array(
-            list(entity_ids) if entity_ids is not None else list(range(nrows)),
-            type=pa.uint64(),
-        )
-        seq_col = pa.array(
-            list(sequence_ts) if sequence_ts is not None else list(range(nrows)),
-            type=pa.uint64(),
-        )
-        payload_src = payloads if payloads is not None else [b""] * nrows
-        payload_col = pa.array(
-            [
-                p if isinstance(p, (bytes, bytearray)) else str(p).encode("utf-8")
-                for p in payload_src
-            ],
-            type=pa.binary(),
-        )
-        tags_src = tags if tags is not None else [[] for _ in range(nrows)]
-        tags_col = self._dictionary_encode_tags(pa.array(tags_src, type=pa.list_(pa.utf8())))
+        if entity_ids is not None:
+            entity_col = pa.array(entity_ids, type=pa.uint64())
+        else:
+            entity_col = pa.array(np.arange(nrows, dtype=np.uint64), type=pa.uint64())
+
+        if sequence_ts is not None:
+            seq_col = pa.array(sequence_ts, type=pa.uint64())
+        else:
+            seq_col = pa.array(np.arange(nrows, dtype=np.uint64), type=pa.uint64())
+
+        if payloads is not None:
+            payload_col = pa.array(
+                [
+                    p if isinstance(p, (bytes, bytearray)) else str(p).encode("utf-8")
+                    for p in payloads
+                ],
+                type=pa.binary(),
+            )
+        else:
+            payload_col = pa.array(np.zeros(nrows, dtype="|S0"), type=pa.binary())
+
+        if tags is not None:
+            tags_col = self._dictionary_encode_tags(
+                pa.array(tags, type=pa.list_(pa.utf8()))
+            )
+        else:
+            # Build N empty tag lists without Python-per-row allocation.
+            tag_offsets = pa.array(np.zeros(nrows + 1, dtype=np.int32))
+            tags_col = pa.ListArray.from_arrays(
+                tag_offsets, pa.array([], type=pa.utf8())
+            )
         cols: dict[str, pa.Array] = {
             "vector": vector_col,
             "entity_id": entity_col,
