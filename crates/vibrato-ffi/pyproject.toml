@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "vibrato-db"
+version = "0.2.0"
+description = "Python SDK with native Rust acceleration for Vibrato V3"
+requires-python = ">=3.11"
+authors = [{ name = "Vibrato" }]
+dependencies = [
+  "numpy>=1.24",
+  "requests>=2.31",
+  "pyarrow>=14.0.0",
+]
+
+[project.optional-dependencies]
+polars = ["polars>=0.20"]
+
+[tool.maturin]
+bindings = "pyo3"
+manifest-path = "Cargo.toml"
+features = ["python-extension"]
+python-source = "../../python"
+module-name = "vibrato_ffi"
