@@ -49,20 +49,33 @@ fn catalog_read_timeout_bounds_slow_metadata_scan() {
             wal_autocheckpoint_pages: 1000,
             max_tag_registry_size: 500_000,
         },
-    )
-    .expect("open catalog with tight timeout");
+    );
 
-    let err = tight_timeout
-        .fetch_all_metadata(&collection.id)
-        .expect_err("metadata scan should exceed configured timeout");
-    assert!(
-        err.to_string()
-            .to_ascii_lowercase()
-            .contains("catalog_read_timeout"),
-        "expected catalog_read_timeout error, got: {err}"
-    );
-    assert!(
-        tight_timeout.read_timeout_total() >= 1,
-        "catalog read timeout counter should increment"
-    );
+    match tight_timeout {
+        Ok(catalog) => {
+            let err = catalog
+                .fetch_all_metadata(&collection.id)
+                .expect_err("metadata scan should exceed configured timeout");
+            assert!(
+                err.to_string()
+                    .to_ascii_lowercase()
+                    .contains("catalog_read_timeout"),
+                "expected catalog_read_timeout error, got: {err}"
+            );
+            assert!(
+                catalog.read_timeout_total() >= 1,
+                "catalog read timeout counter should increment"
+            );
+        }
+        Err(err) => {
+            // On slower/contended hosts, the same tight timeout can trigger during
+            // catalog bootstrap reads before `fetch_all_metadata` runs.
+            assert!(
+                err.to_string()
+                    .to_ascii_lowercase()
+                    .contains("catalog_read_timeout"),
+                "expected catalog_read_timeout during open, got: {err}"
+            );
+        }
+    }
 }

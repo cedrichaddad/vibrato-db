@@ -151,6 +151,8 @@ pub struct ProductionConfig {
     pub hnsw_ef_construction: usize,
     pub checkpoint_interval: Duration,
     pub compaction_interval: Duration,
+    pub admin_checkpoint_cooldown_secs: u64,
+    pub admin_compaction_cooldown_secs: u64,
     pub orphan_ttl: Duration,
     pub audio_colocated: bool,
     pub public_health_metrics: bool,
@@ -296,6 +298,8 @@ impl ProductionConfig {
             hnsw_ef_construction: 100,
             checkpoint_interval: Duration::from_secs(30),
             compaction_interval: Duration::from_secs(180),
+            admin_checkpoint_cooldown_secs: 30,
+            admin_compaction_cooldown_secs: 30,
             orphan_ttl: Duration::from_secs(168 * 3600),
             audio_colocated: true,
             public_health_metrics: true,
@@ -1385,11 +1389,12 @@ impl ProductionState {
                         let max_exclusive = seg.record.vector_id_end.saturating_add(1);
                         let local = {
                             let index = seg.index.read();
-                            index.search_subsequence(
+                            index.search_subsequence_with_predicate(
                                 &request.vectors,
                                 request.k,
                                 request.ef.max(request.k),
                                 max_exclusive,
+                                move |id| id >= min_start && id < max_exclusive,
                             )
                         };
 
@@ -1924,8 +1929,6 @@ impl ProductionState {
         &self,
         trigger: CheckpointTrigger,
     ) -> Result<JobResponseV2> {
-        const ADMIN_CHECKPOINT_COOLDOWN_SECS: u64 = 30;
-
         let _admin_guard = match trigger {
             CheckpointTrigger::Admin => Some(
                 self.admin_ops_lock
@@ -1950,17 +1953,18 @@ impl ProductionState {
             });
         }
         if matches!(trigger, CheckpointTrigger::Admin) {
+            let cooldown_secs = self.config.admin_checkpoint_cooldown_secs;
             let now = current_unix_ts();
             let last = self
                 .last_checkpoint_started_unix
                 .load(AtomicOrdering::Relaxed);
-            if last > 0 && now.saturating_sub(last) < ADMIN_CHECKPOINT_COOLDOWN_SECS {
+            if cooldown_secs > 0 && last > 0 && now.saturating_sub(last) < cooldown_secs {
                 return Ok(JobResponseV2 {
                     job_id,
                     state: "idle".to_string(),
                     details: Some(json!({
                         "reason": "checkpoint_cooldown",
-                        "cooldown_secs": ADMIN_CHECKPOINT_COOLDOWN_SECS,
+                        "cooldown_secs": cooldown_secs,
                     })),
                 });
             }
@@ -2131,7 +2135,6 @@ impl ProductionState {
     }
 
     pub fn compact_once(&self) -> Result<JobResponseV2> {
-        const ADMIN_COMPACTION_COOLDOWN_SECS: u64 = 30;
         const COMPACTION_SKIP_WAL_PENDING_THRESHOLD: usize = 4_096;
 
         let _admin_guard = self
@@ -2159,13 +2162,14 @@ impl ProductionState {
         let last = self
             .last_compaction_started_unix
             .load(AtomicOrdering::Relaxed);
-        if last > 0 && now.saturating_sub(last) < ADMIN_COMPACTION_COOLDOWN_SECS {
+        let cooldown_secs = self.config.admin_compaction_cooldown_secs;
+        if cooldown_secs > 0 && last > 0 && now.saturating_sub(last) < cooldown_secs {
             return Ok(JobResponseV2 {
                 job_id,
                 state: "idle".to_string(),
                 details: Some(json!({
                     "reason": "compaction_cooldown",
-                    "cooldown_secs": ADMIN_COMPACTION_COOLDOWN_SECS,
+                    "cooldown_secs": cooldown_secs,
                 })),
             });
         }

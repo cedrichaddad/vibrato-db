@@ -130,10 +130,9 @@ async fn ingest_count(
         let body = serde_json::json!({
             "vector": [id as f32 / 100.0, 1.0 - (id as f32 / 100.0)],
             "metadata": {
-                "source_file": format!("{}-{}.wav", prefix, id),
-                "start_time_ms": id * 5,
-                "duration_ms": 200,
-                "bpm": 120.0,
+                "entity_id": id,
+                "sequence_ts": id * 5,
+                "payload_base64": "",
                 "tags": ["snapshot", prefix]
             },
             "idempotency_key": format!("{}-{}", prefix, id)

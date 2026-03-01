@@ -190,6 +190,14 @@ enum Commands {
         #[arg(long, default_value = "180")]
         compaction_interval_secs: u64,
 
+        /// Admin checkpoint endpoint cooldown in seconds (0 disables cooldown)
+        #[arg(long, default_value = "30")]
+        admin_checkpoint_cooldown_secs: u64,
+
+        /// Admin compaction endpoint cooldown in seconds (0 disables cooldown)
+        #[arg(long, default_value = "30")]
+        admin_compaction_cooldown_secs: u64,
+
         /// Quarantine GC TTL in hours
         #[arg(long, default_value = "168")]
         orphan_ttl_hours: u64,
@@ -624,6 +632,8 @@ async fn main() -> anyhow::Result<()> {
             host,
             checkpoint_interval_secs,
             compaction_interval_secs,
+            admin_checkpoint_cooldown_secs,
+            admin_compaction_cooldown_secs,
             orphan_ttl_hours,
             audio_colocated,
             public_health_metrics,
@@ -652,6 +662,8 @@ async fn main() -> anyhow::Result<()> {
             let mut config = ProductionConfig::from_data_dir(data_dir, collection, dim);
             config.checkpoint_interval = std::time::Duration::from_secs(checkpoint_interval_secs);
             config.compaction_interval = std::time::Duration::from_secs(compaction_interval_secs);
+            config.admin_checkpoint_cooldown_secs = admin_checkpoint_cooldown_secs;
+            config.admin_compaction_cooldown_secs = admin_compaction_cooldown_secs;
             config.orphan_ttl = std::time::Duration::from_secs(orphan_ttl_hours * 3600);
             config.audio_colocated = audio_colocated;
             config.public_health_metrics = public_health_metrics;

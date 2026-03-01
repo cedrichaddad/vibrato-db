@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use reqwest::header::{CONTENT_TYPE, EXPECT};
 use reqwest::StatusCode;
 use tempfile::tempdir;
 use tokio::time::sleep;
@@ -68,10 +69,19 @@ async fn http_body_limit_rejects_oversized_payload() {
     wait_for_ready(&base_url).await.expect("ready");
 
     let client = reqwest::Client::new();
-    let oversized_body = vec![b'a'; 65 * 1024 * 1024];
+    // Send a syntactically valid JSON payload with explicit content type so the
+    // request is rejected by HTTP body-size limits (413), not by early media-type
+    // or decode-path rejection that can race into a transport reset.
+    let oversized_pad = "a".repeat(65 * 1024 * 1024);
+    let oversized_json = format!(
+        r#"{{"vector":[0.0],"k":1,"ef":1,"include_metadata":false,"pad":"{}"}}"#,
+        oversized_pad
+    );
     let resp = client
         .post(format!("{}/v3/query", base_url))
-        .body(oversized_body)
+        .header(CONTENT_TYPE, "application/json")
+        .header(EXPECT, "100-continue")
+        .body(oversized_json)
         .send()
         .await
         .expect("oversized request");

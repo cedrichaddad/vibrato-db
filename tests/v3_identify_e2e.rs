@@ -8,6 +8,7 @@ use reqwest::StatusCode;
 use tempfile::tempdir;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
+use vibrato_db::prod::model::encode_payload_base64;
 
 fn reserve_local_port() -> Option<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
@@ -34,6 +35,10 @@ async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
         .arg("3600")
         .arg("--compaction-interval-secs")
         .arg("3600")
+        .arg("--admin-checkpoint-cooldown-secs")
+        .arg("0")
+        .arg("--admin-compaction-cooldown-secs")
+        .arg("0")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd.spawn()
@@ -101,13 +106,13 @@ async fn ingest_track(
     for i in 0..count {
         let id = start_idx + i;
         let frame = make_frame(base_phase, i);
+        let payload = format!("{source_file}-frame-{i}");
         let body = serde_json::json!({
             "vector": frame,
             "metadata": {
-                "source_file": source_file,
-                "start_time_ms": i * 100,
-                "duration_ms": 100,
-                "bpm": 120.0,
+                "entity_id": id as u64,
+                "sequence_ts": (i * 100) as u64,
+                "payload_base64": encode_payload_base64(payload.as_bytes()),
                 "tags": ["identify", source_file]
             },
             "idempotency_key": format!("{}-{}", source_file, id)
@@ -131,6 +136,13 @@ async fn checkpoint(client: &reqwest::Client, base_url: &str, token: &str) {
         .await
         .expect("checkpoint");
     assert_eq!(resp.status(), StatusCode::OK);
+    let payload: serde_json::Value = resp.json().await.expect("checkpoint payload");
+    assert_eq!(
+        payload["data"]["state"].as_str(),
+        Some("completed"),
+        "checkpoint did not complete: {}",
+        payload
+    );
 }
 
 #[tokio::test]
@@ -162,7 +174,12 @@ async fn identify_matches_sequence_and_handles_segment_boundaries() {
     ingest_track(&client, &base_url, &token, "track_b.wav", PI * 0.6, 8, 8).await;
     checkpoint(&client, &base_url, &token).await;
 
-    let identify_query: Vec<[f32; 2]> = (1..7).map(|i| make_frame(0.0, i)).collect();
+    let identify_query: Vec<Vec<f32>> = (1..7)
+        .map(|i| {
+            let frame = make_frame(0.0, i);
+            vec![frame[0], frame[1]]
+        })
+        .collect();
     let identify_resp = client
         .post(format!("{}/v3/identify", base_url))
         .bearer_auth(&token)
@@ -170,13 +187,23 @@ async fn identify_matches_sequence_and_handles_segment_boundaries() {
             "vectors": identify_query,
             "k": 3,
             "ef": 200,
-            "include_metadata": true
+            "include_metadata": true,
+            "search_tier": "active"
         }))
         .send()
         .await
         .expect("identify");
-    assert_eq!(identify_resp.status(), StatusCode::OK);
-    let identify_payload: serde_json::Value = identify_resp.json().await.expect("identify json");
+    let identify_status = identify_resp.status();
+    let identify_body = identify_resp.text().await.expect("identify body");
+    assert_eq!(
+        identify_status,
+        StatusCode::OK,
+        "identify status={} body={}",
+        identify_status,
+        identify_body
+    );
+    let identify_payload: serde_json::Value =
+        serde_json::from_str(&identify_body).expect("identify json");
     let results = identify_payload["data"]["results"]
         .as_array()
         .expect("results array");
@@ -186,13 +213,38 @@ async fn identify_matches_sequence_and_handles_segment_boundaries() {
     );
     assert_eq!(results[0]["id"].as_u64(), Some(1));
     assert_eq!(
-        results[0]["metadata"]["source_file"].as_str(),
-        Some("track_a.wav")
+        results[0]["metadata"]["entity_id"].as_u64(),
+        Some(1),
+        "expected entity_id to match vector id"
+    );
+    assert_eq!(
+        results[0]["metadata"]["sequence_ts"].as_u64(),
+        Some(100),
+        "expected sequence_ts for frame idx=1"
+    );
+    let tags = results[0]["metadata"]["tags"]
+        .as_array()
+        .expect("metadata.tags array");
+    assert!(
+        tags.iter().any(|v| v.as_str() == Some("track_a.wav")),
+        "expected track tag in metadata.tags: {:?}",
+        tags
+    );
+    let expected_payload_b64 = encode_payload_base64("track_a.wav-frame-1".as_bytes());
+    assert_eq!(
+        results[0]["metadata"]["payload_base64"].as_str(),
+        Some(expected_payload_b64.as_str())
     );
 
-    let boundary_query: Vec<[f32; 2]> = (5..8)
-        .map(|i| make_frame(0.0, i))
-        .chain((0..3).map(|i| make_frame(PI * 0.6, i)))
+    let boundary_query: Vec<Vec<f32>> = (5..8)
+        .map(|i| {
+            let frame = make_frame(0.0, i);
+            vec![frame[0], frame[1]]
+        })
+        .chain((0..3).map(|i| {
+            let frame = make_frame(PI * 0.6, i);
+            vec![frame[0], frame[1]]
+        }))
         .collect();
     let boundary_resp = client
         .post(format!("{}/v3/identify", base_url))
@@ -201,13 +253,23 @@ async fn identify_matches_sequence_and_handles_segment_boundaries() {
             "vectors": boundary_query,
             "k": 8,
             "ef": 200,
-            "include_metadata": true
+            "include_metadata": true,
+            "search_tier": "active"
         }))
         .send()
         .await
         .expect("identify boundary");
-    assert_eq!(boundary_resp.status(), StatusCode::OK);
-    let boundary_payload: serde_json::Value = boundary_resp.json().await.expect("boundary json");
+    let boundary_status = boundary_resp.status();
+    let boundary_body = boundary_resp.text().await.expect("boundary body");
+    assert_eq!(
+        boundary_status,
+        StatusCode::OK,
+        "identify boundary status={} body={}",
+        boundary_status,
+        boundary_body
+    );
+    let boundary_payload: serde_json::Value =
+        serde_json::from_str(&boundary_body).expect("boundary json");
     let boundary_results = boundary_payload["data"]["results"]
         .as_array()
         .expect("boundary results array");

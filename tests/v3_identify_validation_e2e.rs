@@ -177,10 +177,9 @@ async fn identify_endpoint_auth_validation_and_metrics() {
         .json(&serde_json::json!({
             "vector": [1.0, 0.0],
             "metadata": {
-                "source_file": "one.wav",
-                "start_time_ms": 0,
-                "duration_ms": 100,
-                "bpm": 120.0,
+                "entity_id": 1,
+                "sequence_ts": 0,
+                "payload_base64": "",
                 "tags": ["identify"]
             },
             "idempotency_key": "identify-validation-1"
