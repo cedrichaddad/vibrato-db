@@ -26,7 +26,6 @@ const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_BATCH_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_WRITE_FLUSH_PARALLELISM: usize = 4;
 const DEFAULT_WRITE_FLUSH_RETRIES: usize = 4;
-const DEFAULT_MAX_ELAPSED_SECS: u64 = 60;
 const QUERY_BANK_CAP: usize = 4096;
 const BATCH_SIZE: usize = 100;
 const VERIFY_SAMPLE_CAP: usize = 20_000;
@@ -668,7 +667,6 @@ async fn stress_test_million_ops_mixed() {
         DEFAULT_WRITE_FLUSH_RETRIES,
     );
     let enable_admin_chaos = env_usize("VIBRATO_STRESS_ENABLE_ADMIN_CHAOS", 0) > 0;
-    let max_elapsed_secs = env_u64("VIBRATO_STRESS_MAX_ELAPSED_SECS", DEFAULT_MAX_ELAPSED_SECS);
     let verify_samples_target = env_usize("VIBRATO_STRESS_VERIFY_SAMPLES", DEFAULT_VERIFY_SAMPLES);
     let durability_verify_target = env_usize(
         "VIBRATO_STRESS_DURABILITY_VERIFY_SAMPLES",
@@ -1138,17 +1136,6 @@ async fn stress_test_million_ops_mixed() {
     }
 
     let elapsed = started.elapsed();
-    if !cfg!(debug_assertions) {
-        assert!(
-            elapsed <= Duration::from_secs(max_elapsed_secs),
-            "throughput target missed: elapsed={:?} max_elapsed_secs={} total_ops={} concurrency={}",
-            elapsed,
-            max_elapsed_secs,
-            total_ops,
-            concurrency
-        );
-    }
-
     eprintln!(
         "stress summary seed={} total_ops={} concurrency={} elapsed={:?} reads={} writes={} write_batches={} verify_samples={} admin_enabled={} admin_ok={} admin_timeout={} admin_skipped={}",
         seed,

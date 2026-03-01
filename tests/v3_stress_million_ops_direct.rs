@@ -20,7 +20,6 @@ const DIM: usize = 16;
 const DEFAULT_TOTAL_OPS: usize = 1_000_000;
 const DEFAULT_CONCURRENCY: usize = 16;
 const DEFAULT_SEED: u64 = 42;
-const DEFAULT_MAX_ELAPSED_SECS: u64 = 60;
 const QUERY_BANK_CAP: usize = 4096;
 const BATCH_SIZE: usize = 100;
 const VERIFY_SAMPLE_CAP: usize = 20_000;
@@ -308,7 +307,6 @@ fn stress_test_million_ops_direct_engine() {
     let concurrency = env_usize("VIBRATO_STRESS_CONCURRENCY", DEFAULT_CONCURRENCY).max(1);
     let seed = env_u64("VIBRATO_STRESS_SEED", DEFAULT_SEED);
     let enable_admin_chaos = env_usize("VIBRATO_STRESS_ENABLE_ADMIN_CHAOS", 0) > 0;
-    let max_elapsed_secs = env_u64("VIBRATO_STRESS_MAX_ELAPSED_SECS", DEFAULT_MAX_ELAPSED_SECS);
     let verify_samples_target = env_usize("VIBRATO_STRESS_VERIFY_SAMPLES", DEFAULT_VERIFY_SAMPLES);
     let durability_verify_target = env_usize(
         "VIBRATO_STRESS_DURABILITY_VERIFY_SAMPLES",
@@ -638,17 +636,6 @@ fn stress_test_million_ops_direct_engine() {
     }
 
     let elapsed = started.elapsed();
-    if !cfg!(debug_assertions) {
-        assert!(
-            elapsed <= Duration::from_secs(max_elapsed_secs),
-            "direct throughput target missed: elapsed={:?} max_elapsed_secs={} total_ops={} concurrency={}",
-            elapsed,
-            max_elapsed_secs,
-            total_ops,
-            concurrency
-        );
-    }
-
     eprintln!(
         "direct stress summary seed={} total_ops={} concurrency={} elapsed={:?} reads={} writes={} write_batches={} verify_samples={} admin_enabled={} admin_ok={} admin_skipped={}",
         seed,

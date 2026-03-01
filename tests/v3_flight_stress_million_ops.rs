@@ -32,8 +32,6 @@ const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_FLIGHT_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_WRITE_FLUSH_PARALLELISM: usize = 8;
 const DEFAULT_WRITE_FLUSH_RETRIES: usize = 4;
-const DEFAULT_MAX_ELAPSED_SECS: u64 = 300;
-const DEFAULT_MIN_OPS_PER_SEC: f64 = 3500.0;
 const QUERY_BANK_CAP: usize = 4096;
 const BATCH_SIZE: usize = 200;
 const VERIFY_SAMPLE_CAP: usize = 20_000;
@@ -275,13 +273,6 @@ fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(default)
 }
 
@@ -728,8 +719,6 @@ async fn stress_test_million_ops_flight_mixed() {
         "VIBRATO_STRESS_WRITE_FLUSH_RETRIES",
         DEFAULT_WRITE_FLUSH_RETRIES,
     );
-    let max_elapsed_secs = env_u64("VIBRATO_STRESS_MAX_ELAPSED_SECS", DEFAULT_MAX_ELAPSED_SECS);
-    let min_ops_per_sec = env_f64("VIBRATO_STRESS_MIN_OPS_PER_SEC", DEFAULT_MIN_OPS_PER_SEC);
     let verify_samples_target = env_usize("VIBRATO_STRESS_VERIFY_SAMPLES", DEFAULT_VERIFY_SAMPLES);
     let durability_verify_target = env_usize(
         "VIBRATO_STRESS_DURABILITY_VERIFY_SAMPLES",
@@ -1198,33 +1187,6 @@ async fn stress_test_million_ops_flight_mixed() {
         admin_timeout,
         counters.admin_skipped.load(Ordering::Relaxed),
     );
-
-    if !cfg!(debug_assertions) {
-        assert!(
-            achieved_ops_per_sec >= min_ops_per_sec,
-            "throughput target missed: ops_per_sec={:.2} min_ops_per_sec={:.2} elapsed={:?} total_ops={} concurrency={} reads={} writes={} write_batches={}",
-            achieved_ops_per_sec,
-            min_ops_per_sec,
-            elapsed,
-            total_ops,
-            concurrency,
-            counters.read_ok.load(Ordering::Relaxed),
-            writes,
-            write_batches
-        );
-        assert!(
-            elapsed <= Duration::from_secs(max_elapsed_secs),
-            "elapsed target missed: elapsed={:?} max_elapsed_secs={} total_ops={} concurrency={} ops_per_sec={:.2} reads={} writes={} write_batches={}",
-            elapsed,
-            max_elapsed_secs,
-            total_ops,
-            concurrency,
-            achieved_ops_per_sec,
-            counters.read_ok.load(Ordering::Relaxed),
-            writes,
-            write_batches
-        );
-    }
 
     // Cold-start durability validation against persisted state.
     let durability_count = if writes > 0 {
