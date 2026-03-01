@@ -118,10 +118,9 @@ async fn ingest_dataset(client: &reqwest::Client, base_url: &str, token: &str) {
         let body = serde_json::json!({
             "vector": normalized_vector(12345, i),
             "metadata": {
-                "source_file": format!("madvise_{i}.wav"),
-                "start_time_ms": i * 5,
-                "duration_ms": 20,
-                "bpm": 128.0,
+                "entity_id": i,
+                "sequence_ts": i * 5,
+                "payload_base64": "",
                 "tags": ["perf", "madvise"]
             },
             "idempotency_key": format!("madvise-{i}")

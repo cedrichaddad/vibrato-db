@@ -22,4 +22,4 @@ bindings = "pyo3"
 manifest-path = "Cargo.toml"
 features = ["python-extension"]
 python-source = "../../python"
-module-name = "vibrato_ffi"
+module-name = "vibrato.vibrato_ffi"

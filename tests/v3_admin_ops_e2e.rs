@@ -164,10 +164,9 @@ async fn test_ops_health_auth_and_replay_to_lsn() {
         let body = serde_json::json!({
             "vector": [i as f32 / 20.0, 1.0 - (i as f32 / 20.0)],
             "metadata": {
-                "source_file": format!("take_{}.wav", i),
-                "start_time_ms": i * 10,
-                "duration_ms": 300,
-                "bpm": 120.0,
+                "entity_id": i,
+                "sequence_ts": i * 10,
+                "payload_base64": "",
                 "tags": ["drums"]
             },
             "idempotency_key": format!("ops-{}", i)

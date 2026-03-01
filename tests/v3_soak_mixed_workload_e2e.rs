@@ -227,10 +227,9 @@ async fn mixed_workload_soak() {
             let body = serde_json::json!({
                 "vector": vec,
                 "metadata": {
-                    "source_file": format!("soak_{op_idx}.wav"),
-                    "start_time_ms": op_idx * 10,
-                    "duration_ms": 80,
-                    "bpm": 120.0 + ((op_idx % 20) as f32),
+                    "entity_id": op_idx,
+                    "sequence_ts": op_idx * 10,
+                    "payload_base64": "",
                     "tags": ["soak", "mixed"]
                 },
                 "idempotency_key": format!("soak-{op_idx}")

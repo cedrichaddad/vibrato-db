@@ -189,11 +189,10 @@ async fn ingest_frame(
     let body = serde_json::json!({
         "vector": vector,
         "metadata": {
-            "source_file": "known_track.wav",
-            "start_time_ms": idx * 20,
-            "duration_ms": 20,
-            "bpm": 128.0,
-            "tags": ["identify", "protocol"]
+            "entity_id": idx,
+            "sequence_ts": idx * 20,
+            "payload_base64": "",
+            "tags": ["identify", "protocol", "known_track.wav"]
         },
         "idempotency_key": format!("known-track-{idx}")
     });
@@ -241,10 +240,9 @@ async fn ingest_frame_for_track(
     let body = serde_json::json!({
         "vector": vector,
         "metadata": {
-            "source_file": source_file,
-            "start_time_ms": local_idx * 20,
-            "duration_ms": 20,
-            "bpm": 128.0,
+            "entity_id": global_idx,
+            "sequence_ts": local_idx * 20,
+            "payload_base64": "",
             "tags": ["identify", "protocol", source_file]
         },
         "idempotency_key": format!("{source_file}-{global_idx}")
@@ -279,6 +277,13 @@ async fn ingest_frame_for_track(
         "ingest track request exhausted retries: {}",
         last_err.unwrap_or_else(|| "unknown".to_string())
     );
+}
+
+fn metadata_has_tag(result_row: &serde_json::Value, expected_tag: &str) -> bool {
+    result_row["metadata"]["tags"]
+        .as_array()
+        .map(|tags| tags.iter().any(|tag| tag.as_str() == Some(expected_tag)))
+        .unwrap_or(false)
 }
 
 async fn identify(
@@ -552,10 +557,22 @@ async fn identify_matches_multiple_sequences_across_tracks() {
                 local_start
             );
             assert_eq!(
-                top["metadata"]["source_file"].as_str(),
-                Some(track.source_file),
-                "top-1 source_file mismatch for {}",
+                top["metadata"]["entity_id"].as_u64(),
+                Some(expected_id as u64),
+                "top-1 metadata.entity_id mismatch for {}",
                 track.source_file
+            );
+            assert_eq!(
+                top["metadata"]["sequence_ts"].as_u64(),
+                Some((local_start * 20) as u64),
+                "top-1 metadata.sequence_ts mismatch for {}",
+                track.source_file
+            );
+            assert_eq!(
+                metadata_has_tag(top, track.source_file),
+                true,
+                "top-1 metadata.tags missing track tag for {}",
+                track.source_file,
             );
             let score = top["score"].as_f64().expect("top score");
             assert!(
@@ -590,10 +607,22 @@ async fn identify_matches_multiple_sequences_across_tracks() {
             rank + 1
         );
         assert_eq!(
-            results[rank]["metadata"]["source_file"].as_str(),
-            Some(track.source_file),
-            "noisy match source_file mismatch for {}",
-            track.source_file
+            results[rank]["metadata"]["entity_id"].as_u64(),
+            Some(expected_id as u64),
+            "noisy match metadata.entity_id mismatch for {}",
+            track.source_file,
+        );
+        assert_eq!(
+            results[rank]["metadata"]["sequence_ts"].as_u64(),
+            Some((local_start * 20) as u64),
+            "noisy match metadata.sequence_ts mismatch for {}",
+            track.source_file,
+        );
+        assert_eq!(
+            metadata_has_tag(&results[rank], track.source_file),
+            true,
+            "noisy match metadata.tags missing track tag for {}",
+            track.source_file,
         );
     }
 

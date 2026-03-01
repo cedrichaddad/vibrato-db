@@ -8,6 +8,7 @@ use tempfile::tempdir;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use vibrato_core::format_v2::VdbHeaderV2;
+use vibrato_db::prod::model::encode_payload_base64;
 
 fn reserve_local_port() -> Option<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
@@ -34,6 +35,10 @@ async fn start_server(data_dir: &Path, port: u16) -> std::io::Result<Child> {
         .arg("3600")
         .arg("--compaction-interval-secs")
         .arg("3600")
+        .arg("--admin-checkpoint-cooldown-secs")
+        .arg("0")
+        .arg("--admin-compaction-cooldown-secs")
+        .arg("0")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd.spawn()
@@ -95,13 +100,13 @@ async fn ingest_batch(
     for i in 0..count {
         let id = start + i;
         let v = id as f32 / 300.0;
+        let payload = format!("{prefix}-payload-{id}");
         let body = serde_json::json!({
             "vector": [v, 1.0 - v],
             "metadata": {
-                "source_file": format!("{}-{}.wav", prefix, id),
-                "start_time_ms": id * 5,
-                "duration_ms": 220,
-                "bpm": 124.0,
+                "entity_id": id as u64,
+                "sequence_ts": (id * 5) as u64,
+                "payload_base64": encode_payload_base64(payload.as_bytes()),
                 "tags": ["archive", "pq", prefix]
             },
             "idempotency_key": format!("{}-{}", prefix, id)
@@ -125,6 +130,13 @@ async fn run_admin_job(client: &reqwest::Client, base_url: &str, token: &str, pa
         .await
         .expect("admin request");
     assert_eq!(resp.status(), StatusCode::OK, "job path {}", path);
+    let payload: serde_json::Value = resp.json().await.expect("admin response payload");
+    let state = payload["data"]["state"].as_str().unwrap_or("<missing>");
+    assert_eq!(
+        state, "completed",
+        "job path {} returned state={} details={}",
+        path, state, payload["data"]["details"]
+    );
 }
 
 #[tokio::test]
@@ -151,18 +163,18 @@ async fn level2_archive_segments_are_pq_encoded_and_queryable() {
     wait_for_ready(&base_url).await.expect("ready");
 
     ingest_batch(&client, &base_url, &token, "a", 0, 64).await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
+    run_admin_job(&client, &base_url, &token, "v3/admin/checkpoint").await;
     ingest_batch(&client, &base_url, &token, "b", 64, 64).await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // L1 #1
+    run_admin_job(&client, &base_url, &token, "v3/admin/checkpoint").await;
+    run_admin_job(&client, &base_url, &token, "v3/admin/compact").await; // L1 #1
 
     ingest_batch(&client, &base_url, &token, "c", 128, 64).await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
+    run_admin_job(&client, &base_url, &token, "v3/admin/checkpoint").await;
     ingest_batch(&client, &base_url, &token, "d", 192, 64).await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/checkpoint").await;
-    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // L1 #2
+    run_admin_job(&client, &base_url, &token, "v3/admin/checkpoint").await;
+    run_admin_job(&client, &base_url, &token, "v3/admin/compact").await; // L1 #2
 
-    run_admin_job(&client, &base_url, &token, "v2/admin/compact").await; // L2 from two L1s
+    run_admin_job(&client, &base_url, &token, "v3/admin/compact").await; // L2 from two L1s
 
     let query = serde_json::json!({
         "vector": [0.22, 0.78],
