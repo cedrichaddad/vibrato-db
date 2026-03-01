@@ -129,7 +129,7 @@ impl Spectrogram {
 
         for (t, power_frame) in frames.iter().enumerate() {
             for m in 0..n_mels {
-                let mut dot = 0.0;
+                let mut dot: f32 = 0.0;
                 for b in 0..num_bins {
                     dot += self.mel_basis[[m, b]] * power_frame[b];
                 }

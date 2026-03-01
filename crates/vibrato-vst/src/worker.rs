@@ -1,10 +1,11 @@
 use crossbeam_channel::{Receiver, Sender};
 use directories::ProjectDirs;
-use rtrb::Consumer;
+use parking_lot::RwLock;
+use rtrb::{Consumer, Producer};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use vibrato_core::format_v2::VdbHeaderV2;
@@ -14,14 +15,19 @@ use vibrato_core::store::VectorStore;
 use vibrato_neural::inference::InferenceEngine;
 
 use crate::commands::{GuiCommand, SearchResult, WorkerResponse};
+use crate::dsp_state::DspState;
 
 pub struct VibratoWorker {
     receiver: Receiver<GuiCommand>,
     sender: Sender<WorkerResponse>,
     audio_consumer: Consumer<f32>,
+    dsp_state_producer: Producer<DspState>,
     engine: Option<InferenceEngine>,
     searcher: Option<(Arc<VectorStore>, HNSW)>,
     metadata: HashMap<usize, PathBuf>,
+    overlay_vectors: Arc<RwLock<Vec<Vec<f32>>>>,
+    overlay_hnsw: HNSW,
+    overlay_metadata: HashMap<usize, PathBuf>,
 }
 
 impl VibratoWorker {
@@ -29,14 +35,28 @@ impl VibratoWorker {
         rx: Receiver<GuiCommand>,
         tx: Sender<WorkerResponse>,
         audio_consumer: Consumer<f32>,
+        dsp_state_producer: Producer<DspState>,
     ) -> Self {
+        let overlay_vectors = Arc::new(RwLock::new(Vec::<Vec<f32>>::new()));
+        let overlay_for_hnsw = overlay_vectors.clone();
+        let overlay_hnsw = HNSW::new_with_accessor(16, 100, move |id, sink| {
+            let guard = overlay_for_hnsw.read();
+            let vec = guard
+                .get(id)
+                .unwrap_or_else(|| panic!("overlay accessor missing vector id={id}"));
+            sink(vec);
+        });
         Self {
             receiver: rx,
             sender: tx,
             audio_consumer,
+            dsp_state_producer,
             engine: None,
             searcher: None,
             metadata: HashMap::new(),
+            overlay_vectors,
+            overlay_hnsw,
+            overlay_metadata: HashMap::new(),
         }
     }
 
@@ -49,8 +69,9 @@ impl VibratoWorker {
                 if let Err(cause) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     worker.run();
                 })) {
-                    eprintln!("VibratoWorker crashed: {:?}", cause);
-                    // In a real implementation, we might try to signal the GUI if we still have the sender
+                    let msg = format!("VibratoWorker crashed: {cause:?}");
+                    eprintln!("{msg}");
+                    let _ = worker.sender.send(WorkerResponse::FatalError(msg));
                 }
             })
             .expect("Failed to spawn VibratoWorker thread");
@@ -201,14 +222,10 @@ impl VibratoWorker {
                 match self.receiver.recv_timeout(Duration::from_millis(10)) {
                     Ok(cmd) => match cmd {
                         GuiCommand::SearchText(query) => self.handle_text_search(query).await,
-                        GuiCommand::Ingest(_path) => {
-                            self.report_status("Ingest not implemented yet")
-                        }
-                        GuiCommand::SearchAudio(_path) => {
-                            self.report_status("Audio search not implemented yet")
-                        }
-                        GuiCommand::AnalyzeAudio(_samples) => {
-                            self.report_status("Audio analysis not implemented yet")
+                        GuiCommand::Ingest(path) => self.handle_ingest(path).await,
+                        GuiCommand::SearchAudio(path) => self.handle_audio_search(path).await,
+                        GuiCommand::AnalyzeAudio(samples) => {
+                            self.handle_audio_analysis(samples).await
                         }
                     },
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -242,41 +259,249 @@ impl VibratoWorker {
         self.sender.send(WorkerResponse::Progress(progress)).ok();
     }
 
-    async fn handle_text_search(&self, text: String) {
-        if let (Some(engine), Some((_store, hnsw))) = (&self.engine, &self.searcher) {
-            self.report_status("Embedding text...");
-            match engine.embed_text(&text).await {
-                Ok(vec) => {
-                    self.report_status("Searching...");
-                    let results = hnsw.search(&vec, 10, 64); // k=10, ef=64
+    fn overlay_base_id(&self) -> usize {
+        self.searcher
+            .as_ref()
+            .map(|(store, _)| store.count)
+            .unwrap_or(0)
+    }
 
-                    let mapped_results: Vec<SearchResult> = results
-                        .into_iter()
-                        .map(|(id, score)| {
-                            // Use Metadata Store
-                            let path =
-                                self.metadata.get(&id).cloned().unwrap_or_else(|| {
-                                    PathBuf::from(format!("/unknown/id_{}", id))
-                                });
-                            SearchResult { id, path, score }
-                        })
-                        .collect();
+    fn insert_overlay_embedding(&mut self, path: PathBuf, embedding: Vec<f32>) {
+        let local_id = {
+            let mut vectors = self.overlay_vectors.write();
+            vectors.push(embedding);
+            vectors.len() - 1
+        };
+        self.overlay_hnsw.insert(local_id);
+        self.overlay_metadata.insert(local_id, path);
+    }
 
-                    self.sender
-                        .send(WorkerResponse::SearchResults(mapped_results))
-                        .ok();
-                    self.report_status("Ready");
+    fn map_base_results(&self, hits: Vec<(usize, f32)>) -> Vec<SearchResult> {
+        hits.into_iter()
+            .map(|(id, score)| {
+                let path = self
+                    .metadata
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from(format!("/unknown/id_{id}")));
+                SearchResult { id, path, score }
+            })
+            .collect()
+    }
+
+    fn map_overlay_results(&self, hits: Vec<(usize, f32)>) -> Vec<SearchResult> {
+        let base_id = self.overlay_base_id();
+        hits.into_iter()
+            .map(|(local_id, score)| {
+                let path = self
+                    .overlay_metadata
+                    .get(&local_id)
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from(format!("/overlay/id_{local_id}")));
+                SearchResult {
+                    id: base_id + local_id,
+                    path,
+                    score,
                 }
-                Err(e) => {
-                    self.sender.send(WorkerResponse::Error(e.to_string())).ok();
-                    self.report_status("Error");
+            })
+            .collect()
+    }
+
+    fn search_vector(&mut self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult> {
+        let mut merged = Vec::new();
+        if let Some((_store, hnsw)) = &self.searcher {
+            merged.extend(self.map_base_results(hnsw.search(query, k, ef)));
+        }
+        if !self.overlay_vectors.read().is_empty() {
+            merged.extend(self.map_overlay_results(self.overlay_hnsw.search(query, k, ef)));
+        }
+        merged.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        merged.truncate(k);
+        merged
+    }
+
+    fn complete_search(&mut self, hits: Vec<SearchResult>) {
+        let best_state = hits.first().map(|best| DspState::from_score(best.score));
+        self.sender.send(WorkerResponse::SearchResults(hits)).ok();
+        if let Some(state) = best_state {
+            let _ = self.dsp_state_producer.push(state);
+        }
+    }
+
+    fn collect_audio_files(path: &Path) -> Vec<PathBuf> {
+        fn is_supported(path: &Path) -> bool {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|ext| {
+                    matches!(
+                        ext.to_ascii_lowercase().as_str(),
+                        "wav" | "flac" | "mp3" | "ogg" | "m4a" | "aac"
+                    )
+                })
+                .unwrap_or(false)
+        }
+
+        if path.is_file() {
+            return if is_supported(path) {
+                vec![path.to_path_buf()]
+            } else {
+                Vec::new()
+            };
+        }
+
+        let mut out = Vec::new();
+        let mut stack = vec![path.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read_dir) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read_dir.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if is_supported(&p) {
+                    out.push(p);
                 }
             }
-        } else {
+        }
+        out
+    }
+
+    async fn handle_text_search(&mut self, text: String) {
+        if self.engine.is_none() || self.searcher.is_none() {
             self.sender
                 .send(WorkerResponse::Error("Engine or Index not loaded".into()))
                 .ok();
+            return;
         }
+        let Some(engine) = self.engine.as_ref().cloned() else {
+            return;
+        };
+
+        self.report_status("Embedding text...");
+        match engine.embed_text(&text).await {
+            Ok(vec) => {
+                self.report_status("Searching...");
+                let hits = self.search_vector(&vec, 10, 64);
+                self.complete_search(hits);
+                self.report_status("Ready");
+            }
+            Err(e) => {
+                self.sender.send(WorkerResponse::Error(e.to_string())).ok();
+                self.report_status("Error");
+            }
+        }
+    }
+
+    async fn handle_audio_search(&mut self, path: PathBuf) {
+        if self.engine.is_none() || self.searcher.is_none() {
+            self.sender
+                .send(WorkerResponse::Error("Engine or Index not loaded".into()))
+                .ok();
+            return;
+        }
+        let Some(engine) = self.engine.as_ref().cloned() else {
+            return;
+        };
+
+        self.report_status("Embedding audio file...");
+        match engine.embed_audio_file(&path).await {
+            Ok(vec) => {
+                self.report_status("Searching...");
+                let hits = self.search_vector(&vec, 10, 64);
+                self.complete_search(hits);
+                self.report_status("Ready");
+            }
+            Err(e) => {
+                self.sender.send(WorkerResponse::Error(e.to_string())).ok();
+                self.report_status("Error");
+            }
+        }
+    }
+
+    async fn handle_audio_analysis(&mut self, samples: Vec<f32>) {
+        if self.engine.is_none() || self.searcher.is_none() {
+            self.sender
+                .send(WorkerResponse::Error("Engine or Index not loaded".into()))
+                .ok();
+            return;
+        }
+        if samples.is_empty() {
+            self.sender
+                .send(WorkerResponse::Error("No audio samples provided".into()))
+                .ok();
+            return;
+        }
+        let Some(engine) = self.engine.as_ref().cloned() else {
+            return;
+        };
+
+        match engine.embed_audio(samples).await {
+            Ok(vec) => {
+                let hits = self.search_vector(&vec, 10, 64);
+                self.complete_search(hits);
+                self.report_status("Ready");
+            }
+            Err(e) => {
+                self.sender.send(WorkerResponse::Error(e.to_string())).ok();
+                self.report_status("Error");
+            }
+        }
+    }
+
+    async fn handle_ingest(&mut self, path: PathBuf) {
+        if self.engine.is_none() {
+            self.sender
+                .send(WorkerResponse::Error("Engine not loaded".into()))
+                .ok();
+            return;
+        }
+        let Some(engine) = self.engine.as_ref().cloned() else {
+            return;
+        };
+
+        let files = Self::collect_audio_files(&path);
+        if files.is_empty() {
+            self.sender
+                .send(WorkerResponse::Error(format!(
+                    "No supported audio files found under {}",
+                    path.display()
+                )))
+                .ok();
+            return;
+        }
+
+        self.report_status("Ingesting audio...");
+        let total = files.len().max(1);
+        let mut inserted = 0usize;
+        for (i, file) in files.iter().enumerate() {
+            match engine.embed_audio_file(file).await {
+                Ok(vec) => {
+                    self.insert_overlay_embedding(file.clone(), vec);
+                    inserted += 1;
+                }
+                Err(e) => {
+                    self.sender
+                        .send(WorkerResponse::Error(format!(
+                            "failed to ingest {}: {}",
+                            file.display(),
+                            e
+                        )))
+                        .ok();
+                }
+            }
+            let progress = (i + 1) as f32 / total as f32;
+            self.report_progress(progress);
+        }
+
+        self.sender
+            .send(WorkerResponse::IndexUpdated { count: inserted })
+            .ok();
+        self.report_status("Ready");
     }
 }
 
@@ -288,12 +513,13 @@ mod tests {
 
     #[test]
     fn test_worker_boots_and_reports_status() {
-        let (gui_tx, worker_rx) = crossbeam_channel::unbounded();
-        let (worker_tx, gui_rx) = crossbeam_channel::unbounded();
+        let (gui_tx, worker_rx) = crossbeam_channel::bounded(16);
+        let (worker_tx, gui_rx) = crossbeam_channel::bounded(32);
         let (producer, consumer) = RingBuffer::new(1024);
+        let (dsp_prod, _dsp_cons) = RingBuffer::new(64);
         drop(producer); // No audio in this test.
 
-        let worker = VibratoWorker::new(worker_rx, worker_tx, consumer);
+        let worker = VibratoWorker::new(worker_rx, worker_tx, consumer, dsp_prod);
         worker.spawn();
 
         // Worker should emit at least one status/progress message during boot.

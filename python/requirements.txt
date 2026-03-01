@@ -1,5 +1,8 @@
 # Core dependencies
 numpy>=1.21.0
+requests>=2.31.0
+pyarrow>=14.0.0
+polars>=0.20.0
 librosa>=0.10.0
 click>=8.0.0
 

@@ -4,7 +4,7 @@ use std::fs::File;
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::io::{BufReader, Read, Seek};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -81,6 +81,12 @@ pub enum IngestBackpressureDecision {
         projected_bytes: u64,
         hard_limit_bytes: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointTrigger {
+    Admin,
+    Background,
 }
 
 #[derive(Debug)]
@@ -189,17 +195,20 @@ pub struct Metrics {
     pub ingest_backpressure_hard_total: AtomicU64,
     pub ingest_semantic_throttle_ms_total: AtomicU64,
     pub query_latency_count: AtomicU64,
-    pub query_latency_us_sum: AtomicU64,
-    pub query_latency_us_le_10: AtomicU64,
-    pub query_latency_us_le_25: AtomicU64,
-    pub query_latency_us_le_50: AtomicU64,
-    pub query_latency_us_le_100: AtomicU64,
-    pub query_latency_us_le_250: AtomicU64,
-    pub query_latency_us_le_500: AtomicU64,
-    pub query_latency_us_le_1000: AtomicU64,
-    pub query_latency_us_le_2500: AtomicU64,
-    pub query_latency_us_le_5000: AtomicU64,
-    pub query_latency_us_gt_5000: AtomicU64,
+    pub query_latency_seconds_sum: AtomicU64,
+    pub query_latency_seconds_le_10us: AtomicU64,
+    pub query_latency_seconds_le_25us: AtomicU64,
+    pub query_latency_seconds_le_50us: AtomicU64,
+    pub query_latency_seconds_le_100us: AtomicU64,
+    pub query_latency_seconds_le_500us: AtomicU64,
+    pub query_latency_seconds_le_1000us: AtomicU64,
+    pub metadata_cache_hits_total: AtomicU64,
+    pub metadata_cache_misses_total: AtomicU64,
+    pub filter_allow_cache_hits_total: AtomicU64,
+    pub filter_allow_cache_misses_total: AtomicU64,
+    pub active_connections: AtomicU64,
+    pub active_http_requests: AtomicU64,
+    pub active_flight_streams: AtomicU64,
     pub tag_reject_overflow_total: AtomicU64,
     pub tag_reject_invalid_total: AtomicU64,
     pub flight_decode_chunk_warn_total: AtomicU64,
@@ -249,6 +258,8 @@ pub struct ProductionState {
     pub hot_vectors_bytes: AtomicU64,
     pub hnsw_graph_bytes: AtomicU64,
     pub metadata_cache_bytes: AtomicU64,
+    pub hot_min_id: AtomicUsize,
+    pub hot_max_id_exclusive: AtomicUsize,
     pub inflight_decode_bytes: AtomicU64,
     pub admin_ops_lock: std::sync::Mutex<()>,
     pub checkpoint_lock: std::sync::Mutex<()>,
@@ -412,6 +423,8 @@ impl ProductionState {
             hot_vectors_bytes: AtomicU64::new(0),
             hnsw_graph_bytes: AtomicU64::new(0),
             metadata_cache_bytes: AtomicU64::new(0),
+            hot_min_id: AtomicUsize::new(0),
+            hot_max_id_exclusive: AtomicUsize::new(0),
             inflight_decode_bytes: AtomicU64::new(0),
             admin_ops_lock: std::sync::Mutex::new(()),
             checkpoint_lock: std::sync::Mutex::new(()),
@@ -527,6 +540,35 @@ impl ProductionState {
         tags_bytes
             .saturating_add(metadata.payload.len() as u64)
             .saturating_add(std::mem::size_of::<u64>() as u64 * 2)
+    }
+
+    fn update_hot_window_from_created_range(&self, min_id: usize, max_id_exclusive: usize) {
+        if min_id >= max_id_exclusive {
+            return;
+        }
+
+        let current_max = self.hot_max_id_exclusive.load(AtomicOrdering::Relaxed);
+        if current_max == 0 {
+            self.hot_min_id.store(min_id, AtomicOrdering::Relaxed);
+            self.hot_max_id_exclusive
+                .store(max_id_exclusive, AtomicOrdering::Relaxed);
+            return;
+        }
+
+        self.hot_max_id_exclusive
+            .fetch_max(max_id_exclusive, AtomicOrdering::Relaxed);
+        let mut current_min = self.hot_min_id.load(AtomicOrdering::Relaxed);
+        while min_id < current_min {
+            match self.hot_min_id.compare_exchange_weak(
+                current_min,
+                min_id,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current_min = observed,
+            }
+        }
     }
 
     fn estimate_hnsw_bytes_per_vector(&self) -> u64 {
@@ -670,49 +712,79 @@ impl ProductionState {
             .query_latency_count
             .fetch_add(1, AtomicOrdering::Relaxed);
         bucket
-            .query_latency_us_sum
+            .query_latency_seconds_sum
             .fetch_add(us, AtomicOrdering::Relaxed);
         if us <= 10 {
             bucket
-                .query_latency_us_le_10
+                .query_latency_seconds_le_10us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         } else if us <= 25 {
             bucket
-                .query_latency_us_le_25
+                .query_latency_seconds_le_25us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         } else if us <= 50 {
             bucket
-                .query_latency_us_le_50
+                .query_latency_seconds_le_50us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         } else if us <= 100 {
             bucket
-                .query_latency_us_le_100
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        } else if us <= 250 {
-            bucket
-                .query_latency_us_le_250
+                .query_latency_seconds_le_100us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         } else if us <= 500 {
             bucket
-                .query_latency_us_le_500
+                .query_latency_seconds_le_500us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         } else if us <= 1_000 {
             bucket
-                .query_latency_us_le_1000
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        } else if us <= 2_500 {
-            bucket
-                .query_latency_us_le_2500
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        } else if us <= 5_000 {
-            bucket
-                .query_latency_us_le_5000
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        } else {
-            bucket
-                .query_latency_us_gt_5000
+                .query_latency_seconds_le_1000us
                 .fetch_add(1, AtomicOrdering::Relaxed);
         }
+    }
+
+    pub fn connection_opened(&self) {
+        self.metrics
+            .active_connections
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    pub fn connection_closed(&self) {
+        let _ = self.metrics.active_connections.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+    }
+
+    pub fn http_request_opened(&self) {
+        self.metrics
+            .active_http_requests
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.connection_opened();
+    }
+
+    pub fn http_request_closed(&self) {
+        let _ = self.metrics.active_http_requests.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+        self.connection_closed();
+    }
+
+    pub fn flight_stream_opened(&self) {
+        self.metrics
+            .active_flight_streams
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.connection_opened();
+    }
+
+    pub fn flight_stream_closed(&self) {
+        let _ = self.metrics.active_flight_streams.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+        self.connection_closed();
     }
 
     pub fn audit_event_best_effort(
@@ -801,6 +873,7 @@ impl ProductionState {
             self.estimate_hnsw_bytes_per_vector(),
             AtomicOrdering::Relaxed,
         );
+        self.update_hot_window_from_created_range(vector_id, vector_id.saturating_add(1));
     }
 
     pub fn ingest_vector(
@@ -918,9 +991,9 @@ impl ProductionState {
                 .hot_shards
                 .get(shard)
                 .unwrap_or_else(|| panic!("data integrity fault: missing hot shard {}", shard));
+            let mut shard_guard = shard_lock.write();
+            let HotShard { vectors, index } = &mut *shard_guard;
             for item in items {
-                let mut shard_guard = shard_lock.write();
-                let HotShard { vectors, index } = &mut *shard_guard;
                 if vectors.contains_key(&item.vector_id) {
                     // Replay/idempotency overlap: skip full insert, but keep
                     // graph consistent if this ID was missing from HNSW.
@@ -965,7 +1038,12 @@ impl ProductionState {
         if created_count > 0 {
             let mut metadata_bytes_delta = 0u64;
             let mut vector_bytes = 0u64;
+            let mut min_created_id = usize::MAX;
+            let mut max_created_id_exclusive = 0usize;
             for (vector_id, metadata, vec_len) in metadata_updates {
+                min_created_id = min_created_id.min(vector_id);
+                max_created_id_exclusive =
+                    max_created_id_exclusive.max(vector_id.saturating_add(1));
                 metadata_bytes_delta = metadata_bytes_delta
                     .saturating_add(Self::estimate_cached_metadata_bytes(&metadata));
                 vector_bytes = vector_bytes.saturating_add(
@@ -998,6 +1076,7 @@ impl ProductionState {
                 .ingest_total
                 .fetch_add(created_count as u64, AtomicOrdering::Relaxed);
             self.bump_filter_cache_epoch();
+            self.update_hot_window_from_created_range(min_created_id, max_created_id_exclusive);
         }
 
         // 5. Build output
@@ -1026,19 +1105,12 @@ impl ProductionState {
         });
 
         let mut best: FastIdMap<f32> = FastIdMap::default();
-        let selective_allow = allow_bitmap
-            .as_ref()
-            .map(|bm| bm.cardinality() <= 5_000)
-            .unwrap_or(false);
         let hot_shard_ef = effective_hot_shard_ef(request.k, request.ef, self.hot_shards.len());
-        let inline_hot_scan = allow_bitmap.is_none() && request.ef <= 64;
 
         if !matches!(request.search_tier, SearchTier::Archive) {
-            let hot_results = if selective_allow || inline_hot_scan {
-                // For selective filters and low-ef hot queries, per-shard work is
-                // small enough that Rayon dispatch overhead dominates.
+            let hot_results = self.query_pool.install(|| {
                 self.hot_shards
-                    .iter()
+                    .par_iter()
                     .enumerate()
                     .map(|(shard, shard_lock)| {
                         let shard_guard = shard_lock.read();
@@ -1065,36 +1137,7 @@ impl ProductionState {
                         )
                     })
                     .collect::<Vec<_>>()
-            } else {
-                self.query_pool.install(|| {
-                    self.hot_shards
-                        .par_iter()
-                        .enumerate()
-                        .map(|(shard, shard_lock)| {
-                            let shard_guard = shard_lock.read();
-                            let HotShard { vectors, index } = &*shard_guard;
-                            let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                                let vector = vectors.get(&id).unwrap_or_else(|| {
-                                    panic!("data integrity fault: hot shard missing id={id} shard={shard}")
-                                });
-                                sink(vector.as_slice());
-                            };
-                            search_index_with_dynamic_fallback(
-                                index,
-                                &request.vector,
-                                request.k,
-                                hot_shard_ef,
-                                allow_bitmap.as_deref(),
-                                Some(FlatScanHint::HotShard {
-                                    shard,
-                                    shard_mask: self.shard_mask,
-                                }),
-                                Some(&accessor),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-            };
+            });
             for results in hot_results {
                 for (id, score) in results {
                     merge_best(&mut best, id, score);
@@ -1260,29 +1303,12 @@ impl ProductionState {
         };
 
         if !matches!(request.search_tier, SearchTier::Archive) {
-            let hot_snapshot = {
-                let mut min_id = usize::MAX;
-                let mut max_id = 0usize;
-                let mut ids = HashSet::new();
-
-                for shard_lock in &self.hot_shards {
-                    let shard_guard = shard_lock.read();
-                    for id in shard_guard.vectors.keys() {
-                        min_id = min_id.min(*id);
-                        max_id = max_id.max(*id);
-                        ids.insert(*id);
-                    }
-                }
-
-                if ids.is_empty() {
-                    None
-                } else {
-                    Some((min_id, max_id, Arc::new(ids)))
-                }
-            };
-
-            if let Some((min_id, max_id, hot_ids)) = hot_snapshot {
-                let total_vectors = max_id.saturating_add(1);
+            let hot_min_id = self.hot_min_id.load(AtomicOrdering::Relaxed);
+            let hot_max_id_exclusive = self.hot_max_id_exclusive.load(AtomicOrdering::Relaxed);
+            let metadata_cache = self.metadata_cache.clone();
+            if hot_max_id_exclusive > hot_min_id
+                && seq_len <= hot_max_id_exclusive.saturating_sub(hot_min_id)
+            {
                 let results = self.query_pool.install(|| {
                     self.hot_shards
                         .par_iter()
@@ -1290,21 +1316,36 @@ impl ProductionState {
                         .map(|(shard_idx, shard_lock)| {
                             let shard_guard = shard_lock.read();
                             let HotShard { vectors, index } = &*shard_guard;
+                            let metadata_cache = metadata_cache.clone();
                             let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                                let vector = vectors.get(&id).unwrap_or_else(|| {
+                                let target_shard = id & self.shard_mask;
+                                if target_shard == shard_idx {
+                                    let vector = vectors.get(&id).unwrap_or_else(|| {
+                                        panic!(
+                                            "data integrity fault: hot shard missing id={id} shard={shard_idx}"
+                                        )
+                                    });
+                                    sink(vector.as_slice());
+                                    return;
+                                }
+                                let other_guard = self.hot_shards[target_shard].read();
+                                let vector = other_guard.vectors.get(&id).unwrap_or_else(|| {
                                     panic!(
-                                        "data integrity fault: hot shard missing id={id} shard={shard_idx}"
+                                        "data integrity fault: hot shard missing id={id} shard={target_shard}"
                                     )
                                 });
                                 sink(vector.as_slice());
                             };
-                            let hot_ids = hot_ids.clone();
                             index.search_subsequence_with_predicate_and_accessor(
                                 &request.vectors,
                                 request.k,
                                 request.ef.max(request.k),
-                                total_vectors,
-                                move |id| hot_ids.contains(&id),
+                                hot_max_id_exclusive,
+                                move |id| {
+                                    id >= hot_min_id
+                                        && id < hot_max_id_exclusive
+                                        && metadata_cache.contains(&id)
+                                },
                                 &accessor,
                             )
                         })
@@ -1312,10 +1353,17 @@ impl ProductionState {
                 });
                 for shard_results in results {
                     for (start_id, score) in shard_results {
-                        if start_id < min_id || start_id.saturating_add(seq_len) > total_vectors {
+                        if start_id < hot_min_id
+                            || start_id.saturating_add(seq_len) > hot_max_id_exclusive
+                        {
                             continue;
                         }
-                        if (0..seq_len).any(|offset| !hot_ids.contains(&(start_id + offset))) {
+                        if (0..seq_len).any(|offset| {
+                            let id = start_id + offset;
+                            id < hot_min_id
+                                || id >= hot_max_id_exclusive
+                                || !metadata_cache.contains(&id)
+                        }) {
                             continue;
                         }
                         merge_best(&mut best, start_id, score);
@@ -1643,100 +1691,148 @@ impl ProductionState {
 
         let b10 = self
             .metrics
-            .query_latency_us_le_10
+            .query_latency_seconds_le_10us
             .load(AtomicOrdering::Relaxed);
         let b25 = b10
             + self
                 .metrics
-                .query_latency_us_le_25
+                .query_latency_seconds_le_25us
                 .load(AtomicOrdering::Relaxed);
         let b50 = b25
             + self
                 .metrics
-                .query_latency_us_le_50
+                .query_latency_seconds_le_50us
                 .load(AtomicOrdering::Relaxed);
         let b100 = b50
             + self
                 .metrics
-                .query_latency_us_le_100
+                .query_latency_seconds_le_100us
                 .load(AtomicOrdering::Relaxed);
-        let b250 = b100
+        let b500 = b100
             + self
                 .metrics
-                .query_latency_us_le_250
-                .load(AtomicOrdering::Relaxed);
-        let b500 = b250
-            + self
-                .metrics
-                .query_latency_us_le_500
+                .query_latency_seconds_le_500us
                 .load(AtomicOrdering::Relaxed);
         let b1000 = b500
             + self
                 .metrics
-                .query_latency_us_le_1000
-                .load(AtomicOrdering::Relaxed);
-        let b2500 = b1000
-            + self
-                .metrics
-                .query_latency_us_le_2500
-                .load(AtomicOrdering::Relaxed);
-        let b5000 = b2500
-            + self
-                .metrics
-                .query_latency_us_le_5000
+                .query_latency_seconds_le_1000us
                 .load(AtomicOrdering::Relaxed);
         let h_count = self
             .metrics
             .query_latency_count
             .load(AtomicOrdering::Relaxed);
-        let h_sum = self
+        let h_sum_us = self
             .metrics
-            .query_latency_us_sum
+            .query_latency_seconds_sum
             .load(AtomicOrdering::Relaxed);
+        let h_sum_seconds = h_sum_us as f64 / 1_000_000.0;
 
-        out.push_str("# TYPE vibrato_query_latency_us histogram\n");
+        out.push_str("# TYPE vibrato_query_latency_seconds histogram\n");
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"10\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.00001\"}} {}\n",
             b10
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"25\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.000025\"}} {}\n",
             b25
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"50\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.00005\"}} {}\n",
             b50
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"100\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.0001\"}} {}\n",
             b100
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"250\"}} {}\n",
-            b250
-        ));
-        out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"500\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.0005\"}} {}\n",
             b500
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"1000\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"0.001\"}} {}\n",
             b1000
         ));
         out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"2500\"}} {}\n",
-            b2500
-        ));
-        out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"5000\"}} {}\n",
-            b5000
-        ));
-        out.push_str(&format!(
-            "vibrato_query_latency_us_bucket{{le=\"+Inf\"}} {}\n",
+            "vibrato_query_latency_seconds_bucket{{le=\"+Inf\"}} {}\n",
             h_count
         ));
-        out.push_str(&format!("vibrato_query_latency_us_sum {}\n", h_sum));
-        out.push_str(&format!("vibrato_query_latency_us_count {}\n", h_count));
+        out.push_str(&format!(
+            "vibrato_query_latency_seconds_sum {}\n",
+            h_sum_seconds
+        ));
+        out.push_str(&format!(
+            "vibrato_query_latency_seconds_count {}\n",
+            h_count
+        ));
+
+        let metadata_hits = self
+            .metrics
+            .metadata_cache_hits_total
+            .load(AtomicOrdering::Relaxed);
+        let metadata_misses = self
+            .metrics
+            .metadata_cache_misses_total
+            .load(AtomicOrdering::Relaxed);
+        let filter_hits = self
+            .metrics
+            .filter_allow_cache_hits_total
+            .load(AtomicOrdering::Relaxed);
+        let filter_misses = self
+            .metrics
+            .filter_allow_cache_misses_total
+            .load(AtomicOrdering::Relaxed);
+        let cache_hits = metadata_hits.saturating_add(filter_hits);
+        let cache_misses = metadata_misses.saturating_add(filter_misses);
+        let cache_total = cache_hits.saturating_add(cache_misses);
+        let cache_hit_ratio = if cache_total == 0 {
+            1.0
+        } else {
+            cache_hits as f64 / cache_total as f64
+        };
+        out.push_str("# TYPE vibrato_cache_hit_ratio gauge\n");
+        out.push_str(&format!("vibrato_cache_hit_ratio {}\n", cache_hit_ratio));
+        out.push_str("# TYPE vibrato_metadata_cache_hits_total counter\n");
+        out.push_str(&format!(
+            "vibrato_metadata_cache_hits_total {}\n",
+            metadata_hits
+        ));
+        out.push_str("# TYPE vibrato_metadata_cache_misses_total counter\n");
+        out.push_str(&format!(
+            "vibrato_metadata_cache_misses_total {}\n",
+            metadata_misses
+        ));
+        out.push_str("# TYPE vibrato_filter_allow_cache_hits_total counter\n");
+        out.push_str(&format!(
+            "vibrato_filter_allow_cache_hits_total {}\n",
+            filter_hits
+        ));
+        out.push_str("# TYPE vibrato_filter_allow_cache_misses_total counter\n");
+        out.push_str(&format!(
+            "vibrato_filter_allow_cache_misses_total {}\n",
+            filter_misses
+        ));
+        out.push_str("# TYPE vibrato_active_connections gauge\n");
+        out.push_str(&format!(
+            "vibrato_active_connections {}\n",
+            self.metrics
+                .active_connections
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_active_http_requests gauge\n");
+        out.push_str(&format!(
+            "vibrato_active_http_requests {}\n",
+            self.metrics
+                .active_http_requests
+                .load(AtomicOrdering::Relaxed)
+        ));
+        out.push_str("# TYPE vibrato_active_flight_streams gauge\n");
+        out.push_str(&format!(
+            "vibrato_active_flight_streams {}\n",
+            self.metrics
+                .active_flight_streams
+                .load(AtomicOrdering::Relaxed)
+        ));
 
         out.push_str("# TYPE vibrato_active_segments gauge\n");
         out.push_str(&format!(
@@ -1757,6 +1853,8 @@ impl ProductionState {
         out.push_str(&format!("vibrato_hot_vectors {}\n", stats.hot_vectors));
         out.push_str("# TYPE vibrato_wal_pending gauge\n");
         out.push_str(&format!("vibrato_wal_pending {}\n", stats.wal_pending));
+        out.push_str("# TYPE vibrato_wal_pending_rows gauge\n");
+        out.push_str(&format!("vibrato_wal_pending_rows {}\n", stats.wal_pending));
         out.push_str("# TYPE vibrato_total_vectors gauge\n");
         out.push_str(&format!("vibrato_total_vectors {}\n", stats.total_vectors));
         out.push_str("# TYPE vibrato_checkpoint_jobs_inflight gauge\n");
@@ -1809,17 +1907,33 @@ impl ProductionState {
             "vibrato_memory_budget_bytes {}\n",
             stats.memory_budget_bytes
         ));
+        out.push_str("# TYPE vibrato_ingest_ops_total counter\n");
+        out.push_str(&format!(
+            "vibrato_ingest_ops_total {}\n",
+            self.metrics.ingest_total.load(AtomicOrdering::Relaxed)
+        ));
 
         Ok(out)
     }
 
     pub fn checkpoint_once(&self) -> Result<JobResponseV2> {
+        self.checkpoint_once_with_trigger(CheckpointTrigger::Admin)
+    }
+
+    pub fn checkpoint_once_with_trigger(
+        &self,
+        trigger: CheckpointTrigger,
+    ) -> Result<JobResponseV2> {
         const ADMIN_CHECKPOINT_COOLDOWN_SECS: u64 = 30;
 
-        let _admin_guard = self
-            .admin_ops_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _admin_guard = match trigger {
+            CheckpointTrigger::Admin => Some(
+                self.admin_ops_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ),
+            CheckpointTrigger::Background => None,
+        };
         let _guard = self
             .checkpoint_lock
             .lock()
@@ -1835,22 +1949,24 @@ impl ProductionState {
                 details: Some(json!({"reason": "no_pending_wal"})),
             });
         }
-        let now = current_unix_ts();
-        let last = self
-            .last_checkpoint_started_unix
-            .load(AtomicOrdering::Relaxed);
-        if last > 0 && now.saturating_sub(last) < ADMIN_CHECKPOINT_COOLDOWN_SECS {
-            return Ok(JobResponseV2 {
-                job_id,
-                state: "idle".to_string(),
-                details: Some(json!({
-                    "reason": "checkpoint_cooldown",
-                    "cooldown_secs": ADMIN_CHECKPOINT_COOLDOWN_SECS,
-                })),
-            });
+        if matches!(trigger, CheckpointTrigger::Admin) {
+            let now = current_unix_ts();
+            let last = self
+                .last_checkpoint_started_unix
+                .load(AtomicOrdering::Relaxed);
+            if last > 0 && now.saturating_sub(last) < ADMIN_CHECKPOINT_COOLDOWN_SECS {
+                return Ok(JobResponseV2 {
+                    job_id,
+                    state: "idle".to_string(),
+                    details: Some(json!({
+                        "reason": "checkpoint_cooldown",
+                        "cooldown_secs": ADMIN_CHECKPOINT_COOLDOWN_SECS,
+                    })),
+                });
+            }
+            self.last_checkpoint_started_unix
+                .store(now, AtomicOrdering::Relaxed);
         }
-        self.last_checkpoint_started_unix
-            .store(now, AtomicOrdering::Relaxed);
 
         let start_lsn = pending.first().map(|e| e.lsn).unwrap_or(0);
         let end_lsn = pending.last().map(|e| e.lsn).unwrap_or(start_lsn);
@@ -2432,13 +2548,7 @@ impl ProductionState {
         pending_catchup.sort_by_key(|e| e.lsn);
 
         let mut catchup_by_shard: Vec<Vec<WalEntry>> = vec![Vec::new(); shard_count];
-        let mut catchup_vector_bytes = 0u64;
-        let mut catchup_count = 0u64;
         for entry in pending_catchup {
-            catchup_vector_bytes = catchup_vector_bytes.saturating_add(
-                (entry.vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
-            );
-            catchup_count = catchup_count.saturating_add(1);
             let shard = entry.vector_id & self.shard_mask;
             if let Some(bucket) = catchup_by_shard.get_mut(shard) {
                 bucket.push(entry);
@@ -2450,9 +2560,9 @@ impl ProductionState {
                 continue;
             }
             let shard_lock = &self.hot_shards[shard_idx];
+            let mut shard_guard = shard_lock.write();
+            let HotShard { vectors, index } = &mut *shard_guard;
             for entry in entries {
-                let mut shard_guard = shard_lock.write();
-                let HotShard { vectors, index } = &mut *shard_guard;
                 if vectors.contains_key(&entry.vector_id) {
                     if !index.contains_id(entry.vector_id) {
                         let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
@@ -2480,12 +2590,35 @@ impl ProductionState {
             }
         }
 
+        let mut hot_vector_count = 0u64;
+        let mut hot_vector_bytes = 0u64;
+        let mut hot_min_id = usize::MAX;
+        let mut hot_max_id_exclusive = 0usize;
+        for shard_lock in &self.hot_shards {
+            let shard_guard = shard_lock.read();
+            for (id, vector) in &shard_guard.vectors {
+                hot_vector_count = hot_vector_count.saturating_add(1);
+                hot_vector_bytes = hot_vector_bytes.saturating_add(
+                    (vector.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
+                );
+                hot_min_id = hot_min_id.min(*id);
+                hot_max_id_exclusive = hot_max_id_exclusive.max(id.saturating_add(1));
+            }
+        }
         self.hot_vectors_bytes
-            .store(catchup_vector_bytes, AtomicOrdering::Relaxed);
+            .store(hot_vector_bytes, AtomicOrdering::Relaxed);
         self.hnsw_graph_bytes.store(
-            catchup_count.saturating_mul(self.estimate_hnsw_bytes_per_vector()),
+            hot_vector_count.saturating_mul(self.estimate_hnsw_bytes_per_vector()),
             AtomicOrdering::Relaxed,
         );
+        if hot_min_id == usize::MAX {
+            self.hot_min_id.store(0, AtomicOrdering::Relaxed);
+            self.hot_max_id_exclusive.store(0, AtomicOrdering::Relaxed);
+        } else {
+            self.hot_min_id.store(hot_min_id, AtomicOrdering::Relaxed);
+            self.hot_max_id_exclusive
+                .store(hot_max_id_exclusive, AtomicOrdering::Relaxed);
+        }
 
         Ok(())
     }
@@ -2532,9 +2665,15 @@ impl ProductionState {
         let mut missing = Vec::new();
         for id in ids {
             if let Some(meta) = self.metadata_cache.read(id, |_, meta| meta.clone()) {
+                self.metrics
+                    .metadata_cache_hits_total
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 out.insert(*id, meta);
                 continue;
             }
+            self.metrics
+                .metadata_cache_misses_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
             missing.push(*id);
         }
 
@@ -2706,8 +2845,14 @@ impl ProductionState {
             })
             .flatten()
         {
+            self.metrics
+                .filter_allow_cache_hits_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
             return Some(hit);
         }
+        self.metrics
+            .filter_allow_cache_misses_total
+            .fetch_add(1, AtomicOrdering::Relaxed);
 
         let bitmap = Arc::new(self.build_allow_set(filter)?);
         if self.filter_allow_cache.len() >= 512 {
@@ -3319,14 +3464,24 @@ fn salient_anchor_offsets(query_sequence: &[Vec<f32>]) -> Vec<usize> {
         .iter()
         .enumerate()
         .map(|(i, v)| {
-            let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+            let norm_sq: f32 = dot_product(v, v);
             (i, norm_sq)
         })
         .collect::<Vec<_>>();
-    salience.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let top_partition = (probe_count.saturating_mul(8))
+        .min(salience.len())
+        .max(probe_count);
+    let cmp_desc =
+        |a: &(usize, f32), b: &(usize, f32)| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal);
+    if top_partition < salience.len() {
+        let (top, _, _) = salience.select_nth_unstable_by(top_partition - 1, cmp_desc);
+        top.sort_by(cmp_desc);
+    } else {
+        salience.sort_by(cmp_desc);
+    }
 
     let mut anchors = Vec::with_capacity(probe_count);
-    for (idx, _) in salience {
+    for (idx, _) in salience.iter().take(top_partition).copied() {
         if anchors
             .iter()
             .all(|selected: &usize| selected.abs_diff(idx) >= min_anchor_gap)
@@ -3336,6 +3491,27 @@ fn salient_anchor_offsets(query_sequence: &[Vec<f32>]) -> Vec<usize> {
                 break;
             }
         }
+    }
+    while anchors.len() < probe_count {
+        let mut best_candidate = None;
+        let mut best_salience = f32::NEG_INFINITY;
+        for (idx, score) in salience.iter().copied() {
+            if anchors.contains(&idx) {
+                continue;
+            }
+            if anchors
+                .iter()
+                .all(|selected: &usize| selected.abs_diff(idx) >= min_anchor_gap)
+                && score > best_salience
+            {
+                best_salience = score;
+                best_candidate = Some(idx);
+            }
+        }
+        let Some(idx) = best_candidate else {
+            break;
+        };
+        anchors.push(idx);
     }
     if anchors.is_empty() {
         anchors.push(0);
@@ -3741,16 +3917,36 @@ enum FlatScanHint {
 }
 
 fn checkpoint_loop(state: Arc<ProductionState>, cancel: CancellationToken) {
+    const RAPID_DRAIN_WAL_PENDING_THRESHOLD: usize = 50_000;
+    const RAPID_DRAIN_SLEEP: Duration = Duration::from_millis(100);
+    const RAPID_DRAIN_ERROR_BACKOFF: Duration = Duration::from_secs(5);
+
     loop {
         if cancel.is_cancelled() {
             break;
         }
-        std::thread::sleep(state.config.checkpoint_interval);
+        let pending = match state.catalog.count_wal_pending(&state.collection.id) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!("background checkpoint pending-count failed: {err}");
+                std::thread::sleep(state.config.checkpoint_interval);
+                continue;
+            }
+        };
+        let rapid_mode = pending >= RAPID_DRAIN_WAL_PENDING_THRESHOLD;
+        if rapid_mode {
+            std::thread::sleep(RAPID_DRAIN_SLEEP);
+        } else {
+            std::thread::sleep(state.config.checkpoint_interval);
+        }
         if cancel.is_cancelled() {
             break;
         }
-        if let Err(err) = state.checkpoint_once() {
+        if let Err(err) = state.checkpoint_once_with_trigger(CheckpointTrigger::Background) {
             tracing::warn!("background checkpoint failed: {err}");
+            if rapid_mode {
+                std::thread::sleep(RAPID_DRAIN_ERROR_BACKOFF);
+            }
         }
     }
 }

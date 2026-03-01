@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -15,6 +16,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{Barrier, Semaphore};
 use tokio::time::sleep;
+use vibrato_db::prod::model::encode_payload_base64;
 
 const DIM: usize = 16;
 const DEFAULT_TOTAL_OPS: usize = 1_000_000;
@@ -24,17 +26,31 @@ const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_BATCH_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_WRITE_FLUSH_PARALLELISM: usize = 4;
 const DEFAULT_WRITE_FLUSH_RETRIES: usize = 4;
-const DEFAULT_MAX_ELAPSED_SECS: u64 = 60;
 const QUERY_BANK_CAP: usize = 4096;
 const BATCH_SIZE: usize = 100;
-const VERIFY_SAMPLE_CAP: usize = 1024;
+const VERIFY_SAMPLE_CAP: usize = 20_000;
+const DEFAULT_VERIFY_SAMPLES: usize = 1_000;
+const RECENT_READ_WRITE_WINDOW: usize = 100;
+const DURABILITY_VERIFY_COUNT: usize = 5_000;
+const DEFAULT_DURABILITY_VERIFY_SAMPLES: usize = DURABILITY_VERIFY_COUNT;
 const WARMUP_VECTORS: usize = 128;
+const STRICT_EF: usize = 1024;
+
+#[derive(Serialize, Clone)]
+struct IngestMetadataPayload {
+    entity_id: u64,
+    sequence_ts: u64,
+    tags: Vec<String>,
+    payload_base64: String,
+}
 
 #[derive(Serialize, Clone)]
 struct IngestRequest {
     vector: Vec<f32>,
-    metadata: serde_json::Value,
+    metadata: IngestMetadataPayload,
     idempotency_key: Option<String>,
+    #[serde(skip)]
+    payload: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -70,6 +86,41 @@ struct QueryResponseData {
 #[derive(Debug, Deserialize)]
 struct QueryResult {
     id: usize,
+    score: f32,
+    metadata: Option<MetadataEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentifyResponseEnvelope {
+    data: IdentifyResponseData,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentifyResponseData {
+    results: Vec<IdentifyResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentifyResult {
+    id: usize,
+    score: f32,
+    metadata: Option<MetadataEnvelope>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct MetadataEnvelope {
+    entity_id: u64,
+    sequence_ts: u64,
+    payload_base64: String,
+}
+
+#[derive(Clone)]
+struct StrictSample {
+    id: usize,
+    vector: Vec<f32>,
+    entity_id: u64,
+    sequence_ts: u64,
+    payload: Vec<u8>,
 }
 
 fn reserve_local_port() -> Option<u16> {
@@ -187,12 +238,19 @@ fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
 }
 
 fn normalized_vector(seed: u64, worker_id: usize, op_idx: usize) -> Vec<f32> {
-    let stream_seed =
-        seed ^ ((worker_id as u64) << 32) ^ ((op_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let key = ((worker_id as u64) << 32) | (op_idx as u64);
+    let stream_seed = seed.wrapping_add(key.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let mut rng = StdRng::seed_from_u64(stream_seed);
     let mut v = Vec::with_capacity(DIM);
     for _ in 0..DIM {
         v.push(rng.gen::<f32>() * 2.0 - 1.0);
+    }
+    let signature_u64 = key ^ key.rotate_left(17) ^ 0xD6E8_FD9B_56A9_6C37;
+    let sig_a = ((signature_u64 & 0xFFFF) as f32 / 65535.0) * 2.0 - 1.0;
+    let sig_b = (((signature_u64 >> 16) & 0xFFFF) as f32 / 65535.0) * 2.0 - 1.0;
+    v[0] += sig_a * 0.5;
+    if DIM > 1 {
+        v[1] += sig_b * 0.5;
     }
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
     for x in &mut v {
@@ -263,6 +321,170 @@ fn record_failure(first_error: &Mutex<Option<String>>, stop: &AtomicBool, msg: S
     stop.store(true, Ordering::SeqCst);
 }
 
+fn strict_search_tier(enable_admin_chaos: bool) -> &'static str {
+    if enable_admin_chaos {
+        "all"
+    } else {
+        "active"
+    }
+}
+
+async fn verify_strict_query_http(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    sample: &StrictSample,
+    search_tier: &str,
+) -> Result<(), String> {
+    let body = serde_json::json!({
+        "vector": sample.vector.clone(),
+        "k": 1,
+        "ef": STRICT_EF,
+        "include_metadata": true,
+        "search_tier": search_tier
+    });
+    let resp = client
+        .post(format!("{}/v3/query", base_url))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("strict query request failed: {e}"))?;
+    if resp.status() != StatusCode::OK {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "strict query status failed: status={} body={}",
+            status,
+            &body[..body.len().min(500)]
+        ));
+    }
+    let parsed: QueryResponseEnvelope = resp
+        .json()
+        .await
+        .map_err(|e| format!("strict query payload parse failed: {e}"))?;
+    let best = parsed
+        .data
+        .results
+        .first()
+        .ok_or_else(|| "strict query returned empty results".to_string())?;
+    if best.id != sample.id {
+        return Err(format!(
+            "strict query top-1 mismatch: expected_id={} got_id={}",
+            sample.id, best.id
+        ));
+    }
+    if best.score <= 0.999 {
+        return Err(format!(
+            "strict query score too low: id={} score={}",
+            best.id, best.score
+        ));
+    }
+    let metadata = best
+        .metadata
+        .as_ref()
+        .ok_or_else(|| "strict query missing metadata".to_string())?;
+    if metadata.entity_id != sample.entity_id {
+        return Err(format!(
+            "strict query entity mismatch: expected={} got={}",
+            sample.entity_id, metadata.entity_id
+        ));
+    }
+    if metadata.sequence_ts != sample.sequence_ts {
+        return Err(format!(
+            "strict query sequence mismatch: expected={} got={}",
+            sample.sequence_ts, metadata.sequence_ts
+        ));
+    }
+    let expected_payload = encode_payload_base64(&sample.payload);
+    if metadata.payload_base64 != expected_payload {
+        return Err(format!(
+            "strict query payload mismatch: expected_len={} got_len={}",
+            expected_payload.len(),
+            metadata.payload_base64.len()
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_strict_identify_http(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    sample: &StrictSample,
+    search_tier: &str,
+) -> Result<(), String> {
+    let body = serde_json::json!({
+        "vectors": [sample.vector.clone()],
+        "k": 1,
+        "ef": STRICT_EF,
+        "include_metadata": true,
+        "search_tier": search_tier
+    });
+    let resp = client
+        .post(format!("{}/v3/identify", base_url))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("strict identify request failed: {e}"))?;
+    if resp.status() != StatusCode::OK {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "strict identify status failed: status={} body={}",
+            status,
+            &body[..body.len().min(500)]
+        ));
+    }
+    let parsed: IdentifyResponseEnvelope = resp
+        .json()
+        .await
+        .map_err(|e| format!("strict identify payload parse failed: {e}"))?;
+    let best = parsed
+        .data
+        .results
+        .first()
+        .ok_or_else(|| "strict identify returned empty results".to_string())?;
+    if best.id != sample.id {
+        return Err(format!(
+            "strict identify top-1 mismatch: expected_id={} got_id={}",
+            sample.id, best.id
+        ));
+    }
+    if best.score <= 0.999 {
+        return Err(format!(
+            "strict identify score too low: id={} score={}",
+            best.id, best.score
+        ));
+    }
+    let metadata = best
+        .metadata
+        .as_ref()
+        .ok_or_else(|| "strict identify missing metadata".to_string())?;
+    if metadata.entity_id != sample.entity_id {
+        return Err(format!(
+            "strict identify entity mismatch: expected={} got={}",
+            sample.entity_id, metadata.entity_id
+        ));
+    }
+    if metadata.sequence_ts != sample.sequence_ts {
+        return Err(format!(
+            "strict identify sequence mismatch: expected={} got={}",
+            sample.sequence_ts, metadata.sequence_ts
+        ));
+    }
+    let expected_payload = encode_payload_base64(&sample.payload);
+    if metadata.payload_base64 != expected_payload {
+        return Err(format!(
+            "strict identify payload mismatch: expected_len={} got_len={}",
+            expected_payload.len(),
+            metadata.payload_base64.len()
+        ));
+    }
+    Ok(())
+}
+
 fn is_retryable_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -284,13 +506,15 @@ async fn flush_write_buffer(
     batch_timeout: Duration,
     max_retries: usize,
     query_bank: &Arc<RwLock<Vec<Vec<f32>>>>,
-    verification_samples: &Arc<Mutex<Vec<(usize, Vec<f32>)>>>,
+    verification_samples: &Arc<Mutex<Vec<StrictSample>>>,
+    recent_read_your_writes: &mut VecDeque<StrictSample>,
     max_seen_id: &Arc<AtomicUsize>,
     counters: &Arc<Counters>,
     rng: &mut StdRng,
     worker_id: usize,
     op_idx: usize,
     seed: u64,
+    verify_sample_cap: usize,
 ) -> Result<(), String> {
     if buffer.is_empty() {
         return Ok(());
@@ -391,8 +615,22 @@ async fn flush_write_buffer(
                 let slot = rng.gen_range(0..QUERY_BANK_CAP);
                 bank[slot] = request.vector.clone();
             }
-            if sample_pool.len() < VERIFY_SAMPLE_CAP {
-                sample_pool.push((result.id, request.vector.clone()));
+            let sample = StrictSample {
+                id: result.id,
+                vector: request.vector.clone(),
+                entity_id: request.metadata.entity_id,
+                sequence_ts: request.metadata.sequence_ts,
+                payload: request.payload.clone(),
+            };
+            if sample_pool.len() < verify_sample_cap {
+                sample_pool.push(sample.clone());
+            } else {
+                let slot = rng.gen_range(0..sample_pool.len());
+                sample_pool[slot] = sample.clone();
+            }
+            recent_read_your_writes.push_back(sample);
+            if recent_read_your_writes.len() > RECENT_READ_WRITE_WINDOW {
+                recent_read_your_writes.pop_front();
             }
         }
     }
@@ -429,7 +667,14 @@ async fn stress_test_million_ops_mixed() {
         DEFAULT_WRITE_FLUSH_RETRIES,
     );
     let enable_admin_chaos = env_usize("VIBRATO_STRESS_ENABLE_ADMIN_CHAOS", 0) > 0;
-    let max_elapsed_secs = env_u64("VIBRATO_STRESS_MAX_ELAPSED_SECS", DEFAULT_MAX_ELAPSED_SECS);
+    let verify_samples_target = env_usize("VIBRATO_STRESS_VERIFY_SAMPLES", DEFAULT_VERIFY_SAMPLES);
+    let durability_verify_target = env_usize(
+        "VIBRATO_STRESS_DURABILITY_VERIFY_SAMPLES",
+        DEFAULT_DURABILITY_VERIFY_SAMPLES,
+    );
+    let verify_sample_cap = env_usize("VIBRATO_STRESS_VERIFY_SAMPLE_CAP", VERIFY_SAMPLE_CAP)
+        .max(1)
+        .max(verify_samples_target.max(durability_verify_target));
     if cfg!(debug_assertions) {
         eprintln!(
             "warning: stress test running in debug profile; use --release for realistic contention/latency behavior"
@@ -493,7 +738,7 @@ async fn stress_test_million_ops_mixed() {
     let write_flush_sem = Arc::new(Semaphore::new(write_flush_parallelism));
     let admin_in_flight = Arc::new(AtomicBool::new(false));
     let max_seen_id = Arc::new(AtomicUsize::new(WARMUP_VECTORS.saturating_sub(1)));
-    let verification_samples = Arc::new(Mutex::new(Vec::<(usize, Vec<f32>)>::new()));
+    let verification_samples = Arc::new(Mutex::new(Vec::<StrictSample>::new()));
     let started = Instant::now();
 
     let mut tasks = Vec::with_capacity(concurrency);
@@ -520,6 +765,7 @@ async fn stress_test_million_ops_mixed() {
         tasks.push(tokio::spawn(async move {
             let mut rng = StdRng::seed_from_u64(seed ^ ((worker_id as u64) << 32));
             let mut buffered_writes = Vec::with_capacity(BATCH_SIZE);
+            let mut recent_read_your_writes = VecDeque::with_capacity(RECENT_READ_WRITE_WINDOW);
             barrier.wait().await;
 
             let mut local_idx = 0usize;
@@ -530,68 +776,110 @@ async fn stress_test_million_ops_mixed() {
 
                 let op_roll = rng.gen_range(0..100usize);
                 if op_roll < 60 {
-                    // Read
-                    let query_vec = {
-                        let bank = query_bank.read();
-                        if bank.is_empty() {
-                            normalized_vector(seed, worker_id, local_idx)
-                        } else {
-                            bank[rng.gen_range(0..bank.len())].clone()
+                    if let Some(sample) = recent_read_your_writes.pop_front() {
+                        let strict_tier = strict_search_tier(enable_admin_chaos);
+                        let strict_result =
+                            match verify_strict_query_http(
+                                &client,
+                                &base_url,
+                                &token,
+                                &sample,
+                                strict_tier,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    verify_strict_identify_http(
+                                        &client,
+                                        &base_url,
+                                        &token,
+                                        &sample,
+                                        strict_tier,
+                                    )
+                                    .await
+                                }
+                                Err(err) => Err(err),
+                            };
+                        match strict_result {
+                            Ok(()) => {
+                                counters.read_ok.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(msg) => {
+                                record_failure(
+                                    &first_error,
+                                    &stop,
+                                    format!(
+                                        "{} worker={} op={} seed={}",
+                                        msg, worker_id, local_idx, seed
+                                    ),
+                                );
+                            }
                         }
-                    };
-                    let body = serde_json::json!({
-                        "vector": query_vec,
-                        "k": 10,
-                        "ef": 40,
-                        "include_metadata": false
-                    });
-                    match client
-                        .post(format!("{}/v3/query", base_url))
-                        .bearer_auth(&token)
-                        .json(&body)
-                        .send()
-                        .await
-                    {
-                        Ok(resp) if resp.status() == StatusCode::OK => {
-                            counters.read_ok.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(resp) => {
-                            record_failure(
-                                &first_error,
-                                &stop,
-                                format!(
-                                    "read failed: status={} worker={} op={} seed={}",
-                                    resp.status(),
-                                    worker_id,
-                                    local_idx,
-                                    seed
-                                ),
-                            );
-                        }
-                        Err(e) => {
-                            record_failure(
-                                &first_error,
-                                &stop,
-                                format!(
-                                    "read request error: {} worker={} op={} seed={}",
-                                    e, worker_id, local_idx, seed
-                                ),
-                            );
+                    } else {
+                        let query_vec = {
+                            let bank = query_bank.read();
+                            if bank.is_empty() {
+                                normalized_vector(seed, worker_id, local_idx)
+                            } else {
+                                bank[rng.gen_range(0..bank.len())].clone()
+                            }
+                        };
+                        let body = serde_json::json!({
+                            "vector": query_vec,
+                            "k": 10,
+                            "ef": 40,
+                            "include_metadata": false
+                        });
+                        match client
+                            .post(format!("{}/v3/query", base_url))
+                            .bearer_auth(&token)
+                            .json(&body)
+                            .send()
+                            .await
+                        {
+                            Ok(resp) if resp.status() == StatusCode::OK => {
+                                counters.read_ok.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(resp) => {
+                                record_failure(
+                                    &first_error,
+                                    &stop,
+                                    format!(
+                                        "read failed: status={} worker={} op={} seed={}",
+                                        resp.status(),
+                                        worker_id,
+                                        local_idx,
+                                        seed
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                record_failure(
+                                    &first_error,
+                                    &stop,
+                                    format!(
+                                        "read request error: {} worker={} op={} seed={}",
+                                        e, worker_id, local_idx, seed
+                                    ),
+                                );
+                            }
                         }
                     }
                     local_idx += 1;
                 } else if op_roll < write_threshold {
                     // Write path (buffered and flushed to /v3/vectors/batch).
                     let vec = normalized_vector(seed, worker_id, local_idx + 1_000_000);
+                    let payload = format!("stress_w{worker_id}_o{local_idx}.wav").into_bytes();
                     buffered_writes.push(IngestRequest {
                         vector: vec,
-                        metadata: serde_json::json!({
-                            "entity_id": ((worker_id as u64) << 32) | (local_idx as u64),
-                            "sequence_ts": local_idx as u64,
-                            "tags": ["stress", format!("worker-{worker_id}")],
-                            "payload_base64": ""
-                        }),
+                        metadata: IngestMetadataPayload {
+                            entity_id: ((worker_id as u64) << 32) | (local_idx as u64),
+                            sequence_ts: local_idx as u64,
+                            tags: vec!["stress".to_string(), format!("worker-{worker_id}")],
+                            payload_base64: encode_payload_base64(&payload),
+                        },
                         idempotency_key: Some(format!("stress-{seed}-{worker_id}-{local_idx}")),
+                        payload,
                     });
                     local_idx += 1;
 
@@ -606,14 +894,16 @@ async fn stress_test_million_ops_mixed() {
                             write_flush_retries,
                             &query_bank,
                             &verification_samples,
+                            &mut recent_read_your_writes,
                             &max_seen_id,
                             &counters,
                             &mut rng,
-                            worker_id,
-                            local_idx,
-                            seed,
-                        )
-                        .await
+                                worker_id,
+                                local_idx,
+                                seed,
+                                verify_sample_cap,
+                            )
+                            .await
                         {
                             record_failure(&first_error, &stop, msg);
                             break;
@@ -631,14 +921,16 @@ async fn stress_test_million_ops_mixed() {
                         write_flush_retries,
                         &query_bank,
                         &verification_samples,
+                        &mut recent_read_your_writes,
                         &max_seen_id,
                         &counters,
                         &mut rng,
-                        worker_id,
-                        local_idx,
-                        seed,
-                    )
-                    .await
+                            worker_id,
+                            local_idx,
+                            seed,
+                            verify_sample_cap,
+                        )
+                        .await
                     {
                         record_failure(&first_error, &stop, msg);
                         break;
@@ -718,15 +1010,17 @@ async fn stress_test_million_ops_mixed() {
                     write_flush_retries,
                     &query_bank,
                     &verification_samples,
+                    &mut recent_read_your_writes,
                     &max_seen_id,
                     &counters,
                     &mut rng,
                     worker_id,
                     local_idx,
                     seed,
+                    verify_sample_cap,
                 )
                 .await
-                {
+            {
                     record_failure(&first_error, &stop, msg);
                 }
             }
@@ -817,7 +1111,7 @@ async fn stress_test_million_ops_mixed() {
 
     let samples = verification_samples.lock().clone();
     let verify_count = if writes > 0 {
-        samples.len().min(200)
+        samples.len().min(verify_samples_target)
     } else {
         0
     };
@@ -826,59 +1120,22 @@ async fn stress_test_million_ops_mixed() {
             verify_count > 0,
             "no verification samples were captured from batch writes"
         );
-        for (idx, (expected_id, vector)) in samples.iter().take(verify_count).enumerate() {
-            let body = serde_json::json!({
-                "vector": vector,
-                "k": 20,
-                "ef": 256,
-                "include_metadata": false,
-                "search_tier": if enable_admin_chaos { "all" } else { "active" }
-            });
-            let resp = client
-                .post(format!("{}/v3/query", base_url))
-                .bearer_auth(&token)
-                .json(&body)
-                .send()
+        let strict_tier = strict_search_tier(enable_admin_chaos);
+        for (idx, sample) in samples.iter().take(verify_count).enumerate() {
+            verify_strict_query_http(&client, &base_url, &token, sample, strict_tier)
                 .await
-                .expect("verification query request");
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "verification query status failed for sample={} expected_id={}",
-                idx,
-                expected_id
-            );
-            let parsed: QueryResponseEnvelope =
-                resp.json().await.expect("verification query payload");
-            let found = parsed.data.results.iter().any(|r| r.id == *expected_id);
-            assert!(
-                found,
-                "verification query missing expected id: sample={} expected_id={} top_ids={:?}",
-                idx,
-                expected_id,
-                parsed
-                    .data
-                    .results
-                    .iter()
-                    .take(5)
-                    .map(|r| r.id)
-                    .collect::<Vec<_>>()
-            );
+                .unwrap_or_else(|msg| {
+                    panic!("strict query verification failed sample={idx}: {msg}")
+                });
+            verify_strict_identify_http(&client, &base_url, &token, sample, strict_tier)
+                .await
+                .unwrap_or_else(|msg| {
+                    panic!("strict identify verification failed sample={idx}: {msg}")
+                });
         }
     }
 
     let elapsed = started.elapsed();
-    if !cfg!(debug_assertions) {
-        assert!(
-            elapsed <= Duration::from_secs(max_elapsed_secs),
-            "throughput target missed: elapsed={:?} max_elapsed_secs={} total_ops={} concurrency={}",
-            elapsed,
-            max_elapsed_secs,
-            total_ops,
-            concurrency
-        );
-    }
-
     eprintln!(
         "stress summary seed={} total_ops={} concurrency={} elapsed={:?} reads={} writes={} write_batches={} verify_samples={} admin_enabled={} admin_ok={} admin_timeout={} admin_skipped={}",
         seed,
@@ -895,5 +1152,34 @@ async fn stress_test_million_ops_mixed() {
         counters.admin_skipped.load(Ordering::Relaxed),
     );
 
-    stop_server_silent(&mut server).await;
+    // Cold-start durability validation against the same data directory.
+    let durability_count = if writes > 0 {
+        samples.len().min(durability_verify_target)
+    } else {
+        0
+    };
+    if durability_count > 0 {
+        stop_server_silent(&mut server).await;
+        let (mut restarted_server, restarted_port) =
+            start_ready_server_with_retry(&data_dir, startup_retries)
+                .await
+                .expect("restart server for durability validation");
+        let restarted_base_url = format!("http://127.0.0.1:{}", restarted_port);
+        let strict_tier = strict_search_tier(enable_admin_chaos);
+        for (idx, sample) in samples.iter().take(durability_count).enumerate() {
+            verify_strict_query_http(&client, &restarted_base_url, &token, sample, strict_tier)
+                .await
+                .unwrap_or_else(|msg| {
+                    panic!("durability strict query verification failed sample={idx}: {msg}")
+                });
+            verify_strict_identify_http(&client, &restarted_base_url, &token, sample, strict_tier)
+                .await
+                .unwrap_or_else(|msg| {
+                    panic!("durability strict identify verification failed sample={idx}: {msg}")
+                });
+        }
+        stop_server_silent(&mut restarted_server).await;
+    } else {
+        stop_server_silent(&mut server).await;
+    }
 }

@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::PyAny;
 
 use vibrato_core::hnsw::HNSW;
 use vibrato_core::store::VectorStore;
@@ -17,6 +18,35 @@ pub struct VibratoIndex {
     // a reference to the store alive here too.
     index: Arc<RwLock<HNSW>>,
     store: Arc<VectorStore>,
+}
+
+struct ReadOnlyF32Buffer {
+    buffer: PyBuffer<f32>,
+}
+
+impl ReadOnlyF32Buffer {
+    fn try_from_object(query: &Bound<'_, PyAny>) -> PyResult<Option<Self>> {
+        let Ok(buffer) = PyBuffer::<f32>::get_bound(query) else {
+            return Ok(None);
+        };
+        if !buffer.readonly() || buffer.dimensions() != 1 || !buffer.is_c_contiguous() {
+            return Ok(None);
+        }
+        if buffer.buf_ptr().is_null() {
+            return Ok(None);
+        }
+        Ok(Some(Self { buffer }))
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[f32] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.buffer.buf_ptr() as *const f32,
+                self.buffer.item_count(),
+            )
+        }
+    }
 }
 
 #[pymethods]
@@ -68,26 +98,48 @@ impl VibratoIndex {
     pub fn search(
         &self,
         py: Python<'_>,
-        query: Vec<f32>,
+        query: &Bound<'_, PyAny>,
         k: usize,
         ef: usize,
     ) -> PyResult<Vec<(usize, f32)>> {
-        // Validate dimensions
-        if query.len() != self.store.dim {
+        let index = self.index.clone();
+
+        // Prefer zero-copy for read-only contiguous f32 buffers. Writable buffers
+        // are copied before releasing the GIL to avoid data races with Python threads.
+        if let Some(buf) = ReadOnlyF32Buffer::try_from_object(query)? {
+            if buf.as_slice().len() != self.store.dim {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Dimension mismatch: expected {}, got {}",
+                    self.store.dim,
+                    buf.as_slice().len()
+                )));
+            }
+            let owner = query.clone().unbind();
+            let slice = buf.as_slice();
+            let results = py.allow_threads(|| {
+                let index_guard = index.read();
+                index_guard.search(slice, k, ef)
+            });
+            // Drop Python-owned resources only after allow_threads() has returned,
+            // which guarantees the GIL is re-acquired.
+            drop(buf);
+            drop(owner);
+            return Ok(results);
+        }
+
+        let query_vec: Vec<f32> = query.extract::<Vec<f32>>()?;
+        if query_vec.len() != self.store.dim {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "Dimension mismatch: expected {}, got {}",
                 self.store.dim,
-                query.len()
+                query_vec.len()
             )));
         }
 
-        let index = self.index.clone();
-        let query_clone = query; // Move into thread
-
-        // Release GIL for potentially long-running search
+        // Release GIL for potentially long-running search.
         let results = py.allow_threads(move || {
             let index_guard = index.read();
-            index_guard.search(&query_clone, k, ef)
+            index_guard.search(&query_vec, k, ef)
         });
 
         Ok(results)
@@ -118,4 +170,68 @@ impl VibratoIndex {
 fn vibrato_ffi(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VibratoIndex>()?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "python"))]
+mod tests {
+    use super::*;
+    use pyo3::types::PyDict;
+
+    #[test]
+    fn readonly_f32_buffer_is_detected() {
+        Python::with_gil(|py| {
+            let locals = PyDict::new_bound(py);
+            py.run_bound(
+                "import array\n\
+                 a = array.array('f', [1.0, 2.0, 3.0])\n\
+                 m = memoryview(a).toreadonly()",
+                None,
+                Some(&locals),
+            )?;
+            let m = locals
+                .get_item("m")?
+                .expect("memoryview object should exist");
+            let maybe = ReadOnlyF32Buffer::try_from_object(&m)?;
+            let ro = maybe.expect("readonly contiguous f32 buffer should be detected");
+            assert_eq!(ro.as_slice().len(), 3);
+            assert!((ro.as_slice()[0] - 1.0).abs() < f32::EPSILON);
+            Ok::<(), PyErr>(())
+        })
+        .expect("python readonly buffer test");
+    }
+
+    #[test]
+    fn writable_f32_buffer_is_rejected_for_zero_copy() {
+        Python::with_gil(|py| {
+            let locals = PyDict::new_bound(py);
+            py.run_bound(
+                "import array\n\
+                 a = array.array('f', [1.0, 2.0, 3.0])\n\
+                 m = memoryview(a)",
+                None,
+                Some(&locals),
+            )?;
+            let m = locals
+                .get_item("m")?
+                .expect("memoryview object should exist");
+            let maybe = ReadOnlyF32Buffer::try_from_object(&m)?;
+            assert!(
+                maybe.is_none(),
+                "writable buffer must fall back to copy path"
+            );
+            Ok::<(), PyErr>(())
+        })
+        .expect("python writable buffer test");
+    }
+
+    #[test]
+    fn non_buffer_input_does_not_use_zero_copy() {
+        Python::with_gil(|py| {
+            let list_obj = pyo3::types::PyList::new_bound(py, [1.0f32, 2.0, 3.0]);
+            let maybe = ReadOnlyF32Buffer::try_from_object(list_obj.as_any())?;
+            assert!(maybe.is_none(), "non-buffer input should not be accepted");
+            Ok::<(), PyErr>(())
+        })
+        .expect("python non-buffer test");
+    }
 }

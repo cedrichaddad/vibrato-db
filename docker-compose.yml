@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  vibrato:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vibrato-db:latest
+    command:
+      - serve-v3
+      - --data-dir
+      - /var/lib/vibrato
+      - --collection
+      - default
+      - --dim
+      - "128"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --flight-host
+      - 0.0.0.0
+      - --flight-port
+      - "8815"
+    environment:
+      VIBRATO_API_PEPPER: ${VIBRATO_API_PEPPER:?set VIBRATO_API_PEPPER}
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+      - "8815:8815"
+    volumes:
+      - vibrato_data:/var/lib/vibrato
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/v3/health/ready >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  vibrato_data:

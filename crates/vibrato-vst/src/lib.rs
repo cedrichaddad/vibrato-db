@@ -7,12 +7,17 @@ use nih_plug_egui::EguiState;
 use crossbeam_channel::{Receiver, Sender};
 
 mod commands;
+mod dsp_state;
 mod editor;
 mod worker;
 
 use commands::{GuiCommand, SearchResult, WorkerResponse};
-use rtrb::{Producer, RingBuffer};
+use dsp_state::{DspState, RealtimeDspState};
+use rtrb::{Consumer, Producer, RingBuffer};
 use worker::VibratoWorker;
+
+const GUI_CMD_QUEUE_CAPACITY: usize = 64;
+const WORKER_RESULT_QUEUE_CAPACITY: usize = 256;
 
 pub struct VibratoPlugin {
     params: Arc<VibratoParams>,
@@ -23,6 +28,9 @@ pub struct VibratoPlugin {
 
     // Audio Capture
     audio_producer: Option<Producer<f32>>,
+    dsp_state_consumer: Option<Consumer<DspState>>,
+    dsp_state: RealtimeDspState,
+    sample_rate_hz: f32,
 
     // UI State (Cached for immediate rendering)
     current_results: Arc<RwLock<Vec<SearchResult>>>,
@@ -47,8 +55,8 @@ impl Default for VibratoParams {
 
 impl Default for VibratoPlugin {
     fn default() -> Self {
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let (_res_tx, res_rx) = crossbeam_channel::unbounded();
+        let (tx, _rx) = crossbeam_channel::bounded(GUI_CMD_QUEUE_CAPACITY);
+        let (_res_tx, res_rx) = crossbeam_channel::bounded(WORKER_RESULT_QUEUE_CAPACITY);
 
         // Default impl just creates dummy channels or holds them until init?
         // Ideally we don't spawn here.
@@ -58,6 +66,9 @@ impl Default for VibratoPlugin {
             job_sender: tx,
             result_receiver: res_rx,
             audio_producer: None,
+            dsp_state_consumer: None,
+            dsp_state: RealtimeDspState::default(),
+            sample_rate_hz: 48_000.0,
             current_results: Arc::new(RwLock::new(Vec::new())),
             status_msg: Arc::new(RwLock::new("Initializing...".to_string())),
             progress: Arc::new(RwLock::new(0.0)),
@@ -101,7 +112,7 @@ impl Plugin for VibratoPlugin {
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
-        _buffer_config: &BufferConfig,
+        buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         // Spawn the worker thread ONCE when plugin loads
@@ -111,19 +122,23 @@ impl Plugin for VibratoPlugin {
         // But `default()` returns `VibratoPlugin` which holds `Sender<GuiCommand>` and `Receiver<WorkerResponse>`.
         // So we need to store the *other ends* temporarily? Or just recreate channels here.
 
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let (res_tx, res_rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crossbeam_channel::bounded(GUI_CMD_QUEUE_CAPACITY);
+        let (res_tx, res_rx) = crossbeam_channel::bounded(WORKER_RESULT_QUEUE_CAPACITY);
 
         // Ring Buffer (e.g., 2 seconds of mono audio at 48kHz for analysis)
         // 48000 * 2 = 96000
         let (prod, cons) = RingBuffer::new(96000);
+        // Worker -> audio thread DSP state updates.
+        let (dsp_prod, dsp_cons) = RingBuffer::new(256);
 
-        let worker = VibratoWorker::new(rx, res_tx, cons);
+        let worker = VibratoWorker::new(rx, res_tx, cons, dsp_prod);
         worker.spawn();
 
         self.job_sender = tx;
         self.result_receiver = res_rx;
         self.audio_producer = Some(prod);
+        self.dsp_state_consumer = Some(dsp_cons);
+        self.sample_rate_hz = buffer_config.sample_rate;
 
         true
     }
@@ -134,13 +149,18 @@ impl Plugin for VibratoPlugin {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        // AUDIO THREAD - KEEP EMPTY (Passthrough)
-        // We strictly do NOT touch the vector DB here.
-
-        // Simple passthrough since we are an instrument/effect but mostly a Librarian.
-        // Actually, if we are an instrument we output silence?
-        // If effect, we pass input to output.
-        // For now, let's just make it silent/pass-through.
+        // AUDIO THREAD: lock-free and allocation-free.
+        // Pull latest worker DSP update and crossfade to it.
+        if let Some(state_consumer) = &mut self.dsp_state_consumer {
+            let mut latest = None;
+            while let Ok(state) = state_consumer.pop() {
+                latest = Some(state);
+            }
+            if let Some(state) = latest {
+                self.dsp_state
+                    .schedule_transition(state, self.sample_rate_hz, 3.0);
+            }
+        }
 
         // Audio Capture for Search
         if let Some(producer) = &mut self.audio_producer {
@@ -171,6 +191,13 @@ impl Plugin for VibratoPlugin {
                     // For analysis, one channel is usually enough for rhythm/timbre.
                     break; // Only capture first channel
                 }
+            }
+        }
+
+        // Apply last-known-good DSP state; never snap back to dry signal.
+        for channel in buffer.as_slice() {
+            for sample in channel.iter_mut() {
+                *sample = self.dsp_state.process_sample(*sample);
             }
         }
 

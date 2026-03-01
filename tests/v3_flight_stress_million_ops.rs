@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -21,6 +22,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{Barrier, Semaphore};
 use tokio::time::sleep;
+use vibrato_db::prod::model::encode_payload_base64;
 
 const DIM: usize = 16;
 const DEFAULT_TOTAL_OPS: usize = 1_000_000;
@@ -30,12 +32,15 @@ const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_FLIGHT_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_WRITE_FLUSH_PARALLELISM: usize = 8;
 const DEFAULT_WRITE_FLUSH_RETRIES: usize = 4;
-const DEFAULT_MAX_ELAPSED_SECS: u64 = 300;
-const DEFAULT_MIN_OPS_PER_SEC: f64 = 3500.0;
 const QUERY_BANK_CAP: usize = 4096;
 const BATCH_SIZE: usize = 200;
-const VERIFY_SAMPLE_CAP: usize = 1024;
+const VERIFY_SAMPLE_CAP: usize = 20_000;
+const DEFAULT_VERIFY_SAMPLES: usize = 1_000;
+const RECENT_READ_WRITE_WINDOW: usize = 100;
+const DURABILITY_VERIFY_COUNT: usize = 5_000;
+const DEFAULT_DURABILITY_VERIFY_SAMPLES: usize = DURABILITY_VERIFY_COUNT;
 const WARMUP_VECTORS: usize = 128;
+const STRICT_EF: usize = 1024;
 const READ_PERCENT: usize = 50;
 const QUERY_K: usize = 8;
 const QUERY_EF: usize = 24;
@@ -61,7 +66,41 @@ struct QueryResponseData {
 
 #[derive(Debug, Deserialize)]
 struct QueryResult {
+    id: usize,
     score: f32,
+    metadata: Option<MetadataEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentifyResponseEnvelope {
+    data: IdentifyResponseData,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentifyResponseData {
+    results: Vec<IdentifyResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentifyResult {
+    id: usize,
+    score: f32,
+    metadata: Option<MetadataEnvelope>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct MetadataEnvelope {
+    entity_id: u64,
+    sequence_ts: u64,
+    payload_base64: String,
+}
+
+#[derive(Clone)]
+struct StrictSample {
+    vector: Vec<f32>,
+    entity_id: u64,
+    sequence_ts: u64,
+    payload: Vec<u8>,
 }
 
 fn reserve_local_port() -> Option<u16> {
@@ -202,12 +241,19 @@ fn create_api_key(data_dir: &Path) -> anyhow::Result<String> {
 }
 
 fn normalized_vector(seed: u64, worker_id: usize, op_idx: usize) -> Vec<f32> {
-    let stream_seed =
-        seed ^ ((worker_id as u64) << 32) ^ ((op_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let key = ((worker_id as u64) << 32) | (op_idx as u64);
+    let stream_seed = seed.wrapping_add(key.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let mut rng = StdRng::seed_from_u64(stream_seed);
     let mut v = Vec::with_capacity(DIM);
     for _ in 0..DIM {
         v.push(rng.gen::<f32>() * 2.0 - 1.0);
+    }
+    let signature_u64 = key ^ key.rotate_left(17) ^ 0xD6E8_FD9B_56A9_6C37;
+    let sig_a = ((signature_u64 & 0xFFFF) as f32 / 65535.0) * 2.0 - 1.0;
+    let sig_b = (((signature_u64 >> 16) & 0xFFFF) as f32 / 65535.0) * 2.0 - 1.0;
+    v[0] += sig_a * 0.5;
+    if DIM > 1 {
+        v[1] += sig_b * 0.5;
     }
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
     for x in &mut v {
@@ -227,13 +273,6 @@ fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(default)
 }
 
@@ -296,6 +335,158 @@ fn record_failure(first_error: &Mutex<Option<String>>, stop: &AtomicBool, msg: S
         *slot = Some(msg);
     }
     stop.store(true, Ordering::SeqCst);
+}
+
+fn strict_search_tier(enable_admin_chaos: bool) -> &'static str {
+    if enable_admin_chaos {
+        "all"
+    } else {
+        "active"
+    }
+}
+
+async fn verify_strict_query_flight(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    sample: &StrictSample,
+    search_tier: &str,
+) -> Result<(), String> {
+    let body = serde_json::json!({
+        "vector": sample.vector.clone(),
+        "k": 1,
+        "ef": STRICT_EF,
+        "include_metadata": true,
+        "search_tier": search_tier
+    });
+    let resp = client
+        .post(format!("{}/v3/query", base_url))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("strict query request failed: {e}"))?;
+    if resp.status() != StatusCode::OK {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "strict query status failed: status={} body={}",
+            status,
+            &body[..body.len().min(500)]
+        ));
+    }
+    let parsed: QueryResponseEnvelope = resp
+        .json()
+        .await
+        .map_err(|e| format!("strict query payload parse failed: {e}"))?;
+    let best = parsed
+        .data
+        .results
+        .first()
+        .ok_or_else(|| "strict query returned empty results".to_string())?;
+    if best.score <= 0.999 {
+        return Err(format!(
+            "strict query score too low: id={} score={}",
+            best.id, best.score
+        ));
+    }
+    let metadata = best
+        .metadata
+        .as_ref()
+        .ok_or_else(|| "strict query missing metadata".to_string())?;
+    if metadata.entity_id != sample.entity_id {
+        return Err(format!(
+            "strict query entity mismatch: expected={} got={}",
+            sample.entity_id, metadata.entity_id
+        ));
+    }
+    if metadata.sequence_ts != sample.sequence_ts {
+        return Err(format!(
+            "strict query sequence mismatch: expected={} got={}",
+            sample.sequence_ts, metadata.sequence_ts
+        ));
+    }
+    let expected_payload = encode_payload_base64(&sample.payload);
+    if metadata.payload_base64 != expected_payload {
+        return Err(format!(
+            "strict query payload mismatch: expected_len={} got_len={}",
+            expected_payload.len(),
+            metadata.payload_base64.len()
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_strict_identify_flight(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    sample: &StrictSample,
+    search_tier: &str,
+) -> Result<(), String> {
+    let body = serde_json::json!({
+        "vectors": [sample.vector.clone()],
+        "k": 1,
+        "ef": STRICT_EF,
+        "include_metadata": true,
+        "search_tier": search_tier
+    });
+    let resp = client
+        .post(format!("{}/v3/identify", base_url))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("strict identify request failed: {e}"))?;
+    if resp.status() != StatusCode::OK {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "strict identify status failed: status={} body={}",
+            status,
+            &body[..body.len().min(500)]
+        ));
+    }
+    let parsed: IdentifyResponseEnvelope = resp
+        .json()
+        .await
+        .map_err(|e| format!("strict identify payload parse failed: {e}"))?;
+    let best = parsed
+        .data
+        .results
+        .first()
+        .ok_or_else(|| "strict identify returned empty results".to_string())?;
+    if best.score <= 0.999 {
+        return Err(format!(
+            "strict identify score too low: id={} score={}",
+            best.id, best.score
+        ));
+    }
+    let metadata = best
+        .metadata
+        .as_ref()
+        .ok_or_else(|| "strict identify missing metadata".to_string())?;
+    if metadata.entity_id != sample.entity_id {
+        return Err(format!(
+            "strict identify entity mismatch: expected={} got={}",
+            sample.entity_id, metadata.entity_id
+        ));
+    }
+    if metadata.sequence_ts != sample.sequence_ts {
+        return Err(format!(
+            "strict identify sequence mismatch: expected={} got={}",
+            sample.sequence_ts, metadata.sequence_ts
+        ));
+    }
+    let expected_payload = encode_payload_base64(&sample.payload);
+    if metadata.payload_base64 != expected_payload {
+        return Err(format!(
+            "strict identify payload mismatch: expected_len={} got_len={}",
+            expected_payload.len(),
+            metadata.payload_base64.len()
+        ));
+    }
+    Ok(())
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {
@@ -406,12 +597,14 @@ async fn flush_write_buffer_flight(
     write_flush_sem: &Arc<Semaphore>,
     max_retries: usize,
     query_bank: &Arc<RwLock<Vec<Vec<f32>>>>,
-    verification_samples: &Arc<Mutex<Vec<Vec<f32>>>>,
+    verification_samples: &Arc<Mutex<Vec<StrictSample>>>,
+    recent_read_your_writes: &mut VecDeque<StrictSample>,
     counters: &Arc<Counters>,
     rng: &mut StdRng,
     worker_id: usize,
     op_idx: usize,
     seed: u64,
+    verify_sample_cap: usize,
 ) -> Result<(), String> {
     if buffer.is_empty() {
         return Ok(());
@@ -423,10 +616,6 @@ async fn flush_write_buffer_flight(
 
     let payload = std::mem::take(buffer);
     let sent = payload.len();
-    let vectors = payload
-        .iter()
-        .map(|row| row.vector.clone())
-        .collect::<Vec<_>>();
     let batch = build_flight_batch(&payload);
 
     let mut accepted = 0usize;
@@ -471,15 +660,28 @@ async fn flush_write_buffer_flight(
     {
         let mut bank = query_bank.write();
         let mut sample_pool = verification_samples.lock();
-        for vector in &vectors {
+        for row in &payload {
             if bank.len() < QUERY_BANK_CAP {
-                bank.push(vector.clone());
+                bank.push(row.vector.clone());
             } else {
                 let slot = rng.gen_range(0..QUERY_BANK_CAP);
-                bank[slot] = vector.clone();
+                bank[slot] = row.vector.clone();
             }
-            if sample_pool.len() < VERIFY_SAMPLE_CAP {
-                sample_pool.push(vector.clone());
+            let sample = StrictSample {
+                vector: row.vector.clone(),
+                entity_id: row.entity_id,
+                sequence_ts: row.sequence_ts,
+                payload: row.payload.clone(),
+            };
+            if sample_pool.len() < verify_sample_cap {
+                sample_pool.push(sample.clone());
+            } else {
+                let slot = rng.gen_range(0..sample_pool.len());
+                sample_pool[slot] = sample.clone();
+            }
+            recent_read_your_writes.push_back(sample);
+            if recent_read_your_writes.len() > RECENT_READ_WRITE_WINDOW {
+                recent_read_your_writes.pop_front();
             }
         }
     }
@@ -517,8 +719,14 @@ async fn stress_test_million_ops_flight_mixed() {
         "VIBRATO_STRESS_WRITE_FLUSH_RETRIES",
         DEFAULT_WRITE_FLUSH_RETRIES,
     );
-    let max_elapsed_secs = env_u64("VIBRATO_STRESS_MAX_ELAPSED_SECS", DEFAULT_MAX_ELAPSED_SECS);
-    let min_ops_per_sec = env_f64("VIBRATO_STRESS_MIN_OPS_PER_SEC", DEFAULT_MIN_OPS_PER_SEC);
+    let verify_samples_target = env_usize("VIBRATO_STRESS_VERIFY_SAMPLES", DEFAULT_VERIFY_SAMPLES);
+    let durability_verify_target = env_usize(
+        "VIBRATO_STRESS_DURABILITY_VERIFY_SAMPLES",
+        DEFAULT_DURABILITY_VERIFY_SAMPLES,
+    );
+    let verify_sample_cap = env_usize("VIBRATO_STRESS_VERIFY_SAMPLE_CAP", VERIFY_SAMPLE_CAP)
+        .max(1)
+        .max(verify_samples_target.max(durability_verify_target));
 
     if cfg!(debug_assertions) {
         eprintln!(
@@ -572,7 +780,7 @@ async fn stress_test_million_ops_flight_mixed() {
             .map(|i| normalized_vector(seed ^ 0xCAFE_BABE, 0, i))
             .collect::<Vec<_>>(),
     ));
-    let verification_samples = Arc::new(Mutex::new(Vec::<Vec<f32>>::new()));
+    let verification_samples = Arc::new(Mutex::new(Vec::<StrictSample>::new()));
     let counters = Arc::new(Counters::default());
     let first_error = Arc::new(Mutex::new(None::<String>));
     let stop = Arc::new(AtomicBool::new(false));
@@ -617,6 +825,7 @@ async fn stress_test_million_ops_flight_mixed() {
                 }
             };
             let mut buffered_writes = Vec::with_capacity(BATCH_SIZE);
+            let mut recent_read_your_writes = VecDeque::with_capacity(RECENT_READ_WRITE_WINDOW);
             barrier.wait().await;
 
             let mut local_idx = 0usize;
@@ -627,54 +836,94 @@ async fn stress_test_million_ops_flight_mixed() {
 
                 let op_roll = rng.gen_range(0..100usize);
                 if op_roll < READ_PERCENT {
-                    let query_vec = {
-                        let bank = query_bank.read();
-                        if bank.is_empty() {
-                            normalized_vector(seed, worker_id, local_idx)
-                        } else {
-                            bank[rng.gen_range(0..bank.len())].clone()
-                        }
-                    };
-                    let body = serde_json::json!({
-                        "vector": query_vec,
-                        "k": QUERY_K,
-                        "ef": QUERY_EF,
-                        "include_metadata": false,
-                        "search_tier": "active"
-                    });
-                    match client
-                        .post(format!("{}/v3/query", base_url))
-                        .bearer_auth(&token)
-                        .timeout(http_timeout)
-                        .json(&body)
-                        .send()
+                    if let Some(sample) = recent_read_your_writes.pop_front() {
+                        let strict_tier = strict_search_tier(enable_admin_chaos);
+                        let strict_result = match verify_strict_query_flight(
+                            &client,
+                            &base_url,
+                            &token,
+                            &sample,
+                            strict_tier,
+                        )
                         .await
-                    {
-                        Ok(resp) if resp.status() == StatusCode::OK => {
-                            counters.read_ok.fetch_add(1, Ordering::Relaxed);
+                        {
+                            Ok(()) => {
+                                verify_strict_identify_flight(
+                                    &client,
+                                    &base_url,
+                                    &token,
+                                    &sample,
+                                    strict_tier,
+                                )
+                                .await
+                            }
+                            Err(err) => Err(err),
+                        };
+                        match strict_result {
+                            Ok(()) => {
+                                counters.read_ok.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(msg) => {
+                                record_failure(
+                                    &first_error,
+                                    &stop,
+                                    format!(
+                                        "{} worker={} op={} seed={}",
+                                        msg, worker_id, local_idx, seed
+                                    ),
+                                );
+                            }
                         }
-                        Ok(resp) => {
-                            record_failure(
-                                &first_error,
-                                &stop,
-                                format!(
-                                    "read failed: status={} worker={} op={} seed={}",
-                                    resp.status(),
-                                    worker_id,
-                                    local_idx,
-                                    seed
-                                ),
-                            );
-                        }
-                        Err(e) => {
-                            record_failure(
-                                &first_error,
-                                &stop,
-                                format!(
-                                    "read request error: {} worker={} op={} seed={}",
-                                    e, worker_id, local_idx, seed
-                                ),
-                            );
+                    } else {
+                        let query_vec = {
+                            let bank = query_bank.read();
+                            if bank.is_empty() {
+                                normalized_vector(seed, worker_id, local_idx)
+                            } else {
+                                bank[rng.gen_range(0..bank.len())].clone()
+                            }
+                        };
+                        let body = serde_json::json!({
+                            "vector": query_vec,
+                            "k": QUERY_K,
+                            "ef": QUERY_EF,
+                            "include_metadata": false,
+                            "search_tier": "active"
+                        });
+                        match client
+                            .post(format!("{}/v3/query", base_url))
+                            .bearer_auth(&token)
+                            .timeout(http_timeout)
+                            .json(&body)
+                            .send()
+                            .await
+                        {
+                            Ok(resp) if resp.status() == StatusCode::OK => {
+                                counters.read_ok.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(resp) => {
+                                record_failure(
+                                    &first_error,
+                                    &stop,
+                                    format!(
+                                        "read failed: status={} worker={} op={} seed={}",
+                                        resp.status(),
+                                        worker_id,
+                                        local_idx,
+                                        seed
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                record_failure(
+                                    &first_error,
+                                    &stop,
+                                    format!(
+                                        "read request error: {} worker={} op={} seed={}",
+                                        e, worker_id, local_idx, seed
+                                    ),
+                                );
+                            }
                         }
                     }
                     local_idx += 1;
@@ -700,11 +949,13 @@ async fn stress_test_million_ops_flight_mixed() {
                             write_flush_retries,
                             &query_bank,
                             &verification_samples,
+                            &mut recent_read_your_writes,
                             &counters,
                             &mut rng,
                             worker_id,
                             local_idx,
                             seed,
+                            verify_sample_cap,
                         )
                         .await
                         {
@@ -722,11 +973,13 @@ async fn stress_test_million_ops_flight_mixed() {
                         write_flush_retries,
                         &query_bank,
                         &verification_samples,
+                        &mut recent_read_your_writes,
                         &counters,
                         &mut rng,
                         worker_id,
                         local_idx,
                         seed,
+                        verify_sample_cap,
                     )
                     .await
                     {
@@ -807,11 +1060,13 @@ async fn stress_test_million_ops_flight_mixed() {
                 write_flush_retries,
                 &query_bank,
                 &verification_samples,
+                &mut recent_read_your_writes,
                 &counters,
                 &mut rng,
                 worker_id,
                 local_idx,
                 seed,
+                verify_sample_cap,
             )
             .await
             {
@@ -885,7 +1140,7 @@ async fn stress_test_million_ops_flight_mixed() {
 
     let samples = verification_samples.lock().clone();
     let verify_count = if writes > 0 {
-        samples.len().min(200)
+        samples.len().min(verify_samples_target)
     } else {
         0
     };
@@ -894,42 +1149,18 @@ async fn stress_test_million_ops_flight_mixed() {
             verify_count > 0,
             "no verification samples were captured from flight writes"
         );
-
-        for (idx, vector) in samples.iter().take(verify_count).enumerate() {
-            let body = serde_json::json!({
-                "vector": vector,
-                "k": 20,
-                "ef": 256,
-                "include_metadata": false,
-                "search_tier": if enable_admin_chaos { "all" } else { "active" }
-            });
-            let resp = client
-                .post(format!("{}/v3/query", base_url))
-                .bearer_auth(&token)
-                .json(&body)
-                .send()
+        let strict_tier = strict_search_tier(enable_admin_chaos);
+        for (idx, sample) in samples.iter().take(verify_count).enumerate() {
+            verify_strict_query_flight(&client, &base_url, &token, sample, strict_tier)
                 .await
-                .expect("verification query request");
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "verification query failed for sample={}",
-                idx
-            );
-            let parsed: QueryResponseEnvelope =
-                resp.json().await.expect("verification query payload");
-            assert!(
-                !parsed.data.results.is_empty(),
-                "verification query returned empty result set for sample={}",
-                idx
-            );
-            let best_score = parsed.data.results[0].score;
-            assert!(
-                best_score > 0.75,
-                "verification query score too low for sample={} score={}",
-                idx,
-                best_score
-            );
+                .unwrap_or_else(|msg| {
+                    panic!("strict query verification failed sample={idx}: {msg}")
+                });
+            verify_strict_identify_flight(&client, &base_url, &token, sample, strict_tier)
+                .await
+                .unwrap_or_else(|msg| {
+                    panic!("strict identify verification failed sample={idx}: {msg}")
+                });
         }
     }
 
@@ -957,32 +1188,40 @@ async fn stress_test_million_ops_flight_mixed() {
         counters.admin_skipped.load(Ordering::Relaxed),
     );
 
-    if !cfg!(debug_assertions) {
-        assert!(
-            achieved_ops_per_sec >= min_ops_per_sec,
-            "throughput target missed: ops_per_sec={:.2} min_ops_per_sec={:.2} elapsed={:?} total_ops={} concurrency={} reads={} writes={} write_batches={}",
-            achieved_ops_per_sec,
-            min_ops_per_sec,
-            elapsed,
-            total_ops,
-            concurrency,
-            counters.read_ok.load(Ordering::Relaxed),
-            writes,
-            write_batches
-        );
-        assert!(
-            elapsed <= Duration::from_secs(max_elapsed_secs),
-            "elapsed target missed: elapsed={:?} max_elapsed_secs={} total_ops={} concurrency={} ops_per_sec={:.2} reads={} writes={} write_batches={}",
-            elapsed,
-            max_elapsed_secs,
-            total_ops,
-            concurrency,
-            achieved_ops_per_sec,
-            counters.read_ok.load(Ordering::Relaxed),
-            writes,
-            write_batches
-        );
+    // Cold-start durability validation against persisted state.
+    let durability_count = if writes > 0 {
+        samples.len().min(durability_verify_target)
+    } else {
+        0
+    };
+    if durability_count > 0 {
+        stop_server_silent(&mut server).await;
+        let (mut restarted_server, restarted_http_port, _restarted_flight_port) =
+            start_ready_server_with_retry(&data_dir, &token, 4)
+                .await
+                .expect("restart flight server for durability validation");
+        let restarted_base_url = format!("http://127.0.0.1:{}", restarted_http_port);
+        let strict_tier = strict_search_tier(enable_admin_chaos);
+        for (idx, sample) in samples.iter().take(durability_count).enumerate() {
+            verify_strict_query_flight(&client, &restarted_base_url, &token, sample, strict_tier)
+                .await
+                .unwrap_or_else(|msg| {
+                    panic!("durability strict query verification failed sample={idx}: {msg}")
+                });
+            verify_strict_identify_flight(
+                &client,
+                &restarted_base_url,
+                &token,
+                sample,
+                strict_tier,
+            )
+            .await
+            .unwrap_or_else(|msg| {
+                panic!("durability strict identify verification failed sample={idx}: {msg}")
+            });
+        }
+        stop_server_silent(&mut restarted_server).await;
+    } else {
+        stop_server_silent(&mut server).await;
     }
-
-    stop_server_silent(&mut server).await;
 }

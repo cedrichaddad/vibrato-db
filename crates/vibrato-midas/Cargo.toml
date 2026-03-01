@@ -7,3 +7,4 @@ license = "MIT"
 
 [dependencies]
 thiserror = "1.0"
+vibrato-core = { path = "../vibrato-core" }

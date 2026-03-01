@@ -18,7 +18,7 @@ RUN cargo build --release --bin vibrato-db
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates libsqlite3-0 \
+  && apt-get install -y --no-install-recommends ca-certificates libsqlite3-0 curl \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -28,6 +28,7 @@ COPY --from=builder /app/target/release/vibrato-db /usr/local/bin/vibrato-db
 
 ENV RUST_LOG=info
 EXPOSE 8080
+EXPOSE 8815
 
 ENTRYPOINT ["vibrato-db"]
-CMD ["serve-v2", "--data-dir", "/var/lib/vibrato", "--collection", "default", "--dim", "128", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["serve-v3", "--data-dir", "/var/lib/vibrato", "--collection", "default", "--dim", "128", "--host", "0.0.0.0", "--port", "8080", "--flight-host", "0.0.0.0", "--flight-port", "8815"]

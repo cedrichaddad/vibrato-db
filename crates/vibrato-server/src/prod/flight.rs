@@ -30,11 +30,32 @@ use tonic::{Request, Response, Status};
 
 type TonicStream<T> = Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send + 'static>>;
 const FLIGHT_DECODE_CHUNK_ROWS: usize = 2048;
+const FLIGHT_MAX_DECODING_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+const FLIGHT_MAX_ENCODING_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+struct ConnectionGaugeGuard {
+    state: Arc<ProductionState>,
+}
+
+impl ConnectionGaugeGuard {
+    fn new(state: Arc<ProductionState>) -> Self {
+        state.flight_stream_opened();
+        Self { state }
+    }
+}
+
+impl Drop for ConnectionGaugeGuard {
+    fn drop(&mut self) {
+        self.state.flight_stream_closed();
+    }
+}
 
 pub async fn start_flight_server(state: Arc<ProductionState>, addr: SocketAddr) -> Result<()> {
-    let service = VibratoFlightService { state };
+    let service = FlightServiceServer::new(VibratoFlightService { state })
+        .max_decoding_message_size(FLIGHT_MAX_DECODING_MESSAGE_BYTES)
+        .max_encoding_message_size(FLIGHT_MAX_ENCODING_MESSAGE_BYTES);
     tonic::transport::Server::builder()
-        .add_service(FlightServiceServer::new(service))
+        .add_service(service)
         .serve(addr)
         .await
         .map_err(|e| anyhow!("arrow flight server failed on {addr}: {e}"))
@@ -610,6 +631,7 @@ impl FlightService for VibratoFlightService {
         &self,
         request: Request<tonic::Streaming<FlightData>>,
     ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
+        let _connection_guard = ConnectionGaugeGuard::new(self.state.clone());
         let api_key_id = authorize_flight_ingest(&self.state, request.metadata())?;
 
         let mut batch_stream =
@@ -752,7 +774,10 @@ mod tests {
     use arrow_array::{BinaryArray, FixedSizeListArray, RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::{estimate_batch_ingest_bytes, extract_batch_entries};
+    use super::{
+        estimate_batch_ingest_bytes, extract_batch_entries, FLIGHT_MAX_DECODING_MESSAGE_BYTES,
+        FLIGHT_MAX_ENCODING_MESSAGE_BYTES,
+    };
 
     fn make_batch() -> RecordBatch {
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
@@ -834,5 +859,11 @@ mod tests {
             estimated > raw_vector_bytes,
             "expected metadata-aware estimate to exceed raw vector payload"
         );
+    }
+
+    #[test]
+    fn flight_message_size_limits_match_contract() {
+        assert_eq!(FLIGHT_MAX_DECODING_MESSAGE_BYTES, 256 * 1024 * 1024);
+        assert_eq!(FLIGHT_MAX_ENCODING_MESSAGE_BYTES, 64 * 1024 * 1024);
     }
 }

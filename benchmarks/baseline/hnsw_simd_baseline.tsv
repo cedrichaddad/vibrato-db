@@ -1,0 +1,15 @@
+# benchmark_name	median_ns
+hnsw_insert/100	7201200
+hnsw_insert/500	70548000
+hnsw_insert/1000	173940000
+hnsw_search/20	16293
+hnsw_search/50	32338
+hnsw_search/100	52652
+dot_product/dim_64	4.5276
+dot_product/dim_128	8.3125
+dot_product/dim_256	16.407
+dot_product/dim_512	33.143
+l2_distance_squared/dim_64	4.6539
+l2_distance_squared/dim_128	8.4533
+l2_distance_squared/dim_256	17.192
+l2_distance_squared/dim_512	34.323
