@@ -40,29 +40,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          ffi_py_ver="$(python3 - <<'PY'
-import tomllib
-with open("crates/vibrato-ffi/pyproject.toml", "rb") as f:
-    print(tomllib.load(f)["project"]["version"])
-PY
-)"
-
-          sdk_py_ver="$(python3 - <<'PY'
-import tomllib
-with open("python/pyproject.toml", "rb") as f:
-    print(tomllib.load(f)["project"]["version"])
-PY
-)"
-
-          ffi_cargo_ver="$(python3 - <<'PY'
-import re
-text = open("crates/vibrato-ffi/Cargo.toml", "r", encoding="utf-8").read()
-m = re.search(r'^version\\s*=\\s*"([^"]+)"', text, flags=re.M)
-if not m:
-    raise SystemExit("missing version in crates/vibrato-ffi/Cargo.toml")
-print(m.group(1))
-PY
-)"
+          ffi_py_ver="$(python3 -c 'import tomllib; print(tomllib.load(open("crates/vibrato-ffi/pyproject.toml", "rb"))["project"]["version"])')"
+          sdk_py_ver="$(python3 -c 'import tomllib; print(tomllib.load(open("python/pyproject.toml", "rb"))["project"]["version"])')"
+          ffi_cargo_ver="$(python3 -c 'import pathlib,re,sys; text=pathlib.Path("crates/vibrato-ffi/Cargo.toml").read_text(encoding="utf-8"); m=re.search(r"^version\\s*=\\s*\"([^\"]+)\"", text, flags=re.M); print(m.group(1)) if m else sys.exit("missing version in crates/vibrato-ffi/Cargo.toml")')"
 
           echo "Resolved versions:"
           echo "  crates/vibrato-ffi/pyproject.toml: ${ffi_py_ver}"
