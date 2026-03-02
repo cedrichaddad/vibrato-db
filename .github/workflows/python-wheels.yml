@@ -22,8 +22,86 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  validate-version:
+    name: Validate package version/tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.versions.outputs.version }}
+      publish_version: ${{ steps.versions.outputs.publish_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: versions
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          ffi_py_ver="$(python3 - <<'PY'
+import tomllib
+with open("crates/vibrato-ffi/pyproject.toml", "rb") as f:
+    print(tomllib.load(f)["project"]["version"])
+PY
+)"
+
+          sdk_py_ver="$(python3 - <<'PY'
+import tomllib
+with open("python/pyproject.toml", "rb") as f:
+    print(tomllib.load(f)["project"]["version"])
+PY
+)"
+
+          ffi_cargo_ver="$(python3 - <<'PY'
+import re
+text = open("crates/vibrato-ffi/Cargo.toml", "r", encoding="utf-8").read()
+m = re.search(r'^version\\s*=\\s*"([^"]+)"', text, flags=re.M)
+if not m:
+    raise SystemExit("missing version in crates/vibrato-ffi/Cargo.toml")
+print(m.group(1))
+PY
+)"
+
+          echo "Resolved versions:"
+          echo "  crates/vibrato-ffi/pyproject.toml: ${ffi_py_ver}"
+          echo "  python/pyproject.toml:             ${sdk_py_ver}"
+          echo "  crates/vibrato-ffi/Cargo.toml:     ${ffi_cargo_ver}"
+
+          if [[ "${ffi_py_ver}" != "${sdk_py_ver}" ]]; then
+            echo "::error::Version mismatch: crates/vibrato-ffi/pyproject.toml=${ffi_py_ver} vs python/pyproject.toml=${sdk_py_ver}"
+            exit 1
+          fi
+          if [[ "${ffi_py_ver}" != "${ffi_cargo_ver}" ]]; then
+            echo "::error::Version mismatch: crates/vibrato-ffi/pyproject.toml=${ffi_py_ver} vs crates/vibrato-ffi/Cargo.toml=${ffi_cargo_ver}"
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            tag_ver="${GITHUB_REF#refs/tags/v}"
+            if [[ "${tag_ver}" != "${ffi_py_ver}" ]]; then
+              echo "::error::Tag/version mismatch: git tag=v${tag_ver}, package version=${ffi_py_ver}"
+              exit 1
+            fi
+          fi
+
+          publish_version="${ffi_py_ver}"
+          if [[ "${GITHUB_EVENT_NAME:-}" == "pull_request" ]]; then
+            if [[ ! "${ffi_py_ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::PR publish expects base version in X.Y.Z form, found '${ffi_py_ver}'"
+              exit 1
+            fi
+            publish_version="${ffi_py_ver}.dev${PR_NUMBER}${RUN_NUMBER}${RUN_ATTEMPT}"
+          fi
+
+          echo "version=${ffi_py_ver}" >> "${GITHUB_OUTPUT}"
+          echo "publish_version=${publish_version}" >> "${GITHUB_OUTPUT}"
+          echo "publish_version=${publish_version}"
+
   build-wheels:
     name: wheel-${{ matrix.os }}-${{ matrix.target }}
+    needs: validate-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -41,6 +119,36 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Stamp PR publish version in Python manifests
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          PUBLISH_VERSION: ${{ needs.validate-version.outputs.publish_version }}
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          import os
+
+          version = os.environ["PUBLISH_VERSION"]
+          targets = [
+              Path("crates/vibrato-ffi/pyproject.toml"),
+              Path("python/pyproject.toml"),
+          ]
+          for path in targets:
+              text = path.read_text(encoding="utf-8")
+              new = re.sub(
+                  r'(?m)^version\s*=\s*"[^"]+"',
+                  f'version = "{version}"',
+                  text,
+                  count=1,
+              )
+              if new == text:
+                  raise SystemExit(f"failed to rewrite version in {path}")
+              path.write_text(new, encoding="utf-8")
+              print(f"stamped {path} -> {version}")
+          PY
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -86,9 +194,40 @@ jobs:
 
   build-sdist:
     name: sdist
+    needs: validate-version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Stamp PR publish version in Python manifests
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          PUBLISH_VERSION: ${{ needs.validate-version.outputs.publish_version }}
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          import os
+
+          version = os.environ["PUBLISH_VERSION"]
+          targets = [
+              Path("crates/vibrato-ffi/pyproject.toml"),
+              Path("python/pyproject.toml"),
+          ]
+          for path in targets:
+              text = path.read_text(encoding="utf-8")
+              new = re.sub(
+                  r'(?m)^version\s*=\s*"[^"]+"',
+                  f'version = "{version}"',
+                  text,
+                  count=1,
+              )
+              if new == text:
+                  raise SystemExit(f"failed to rewrite version in {path}")
+              path.write_text(new, encoding="utf-8")
+              print(f"stamped {path} -> {version}")
+          PY
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -109,9 +248,41 @@ jobs:
           path: crates/vibrato-ffi/dist/*.tar.gz
           if-no-files-found: error
 
-  publish:
+  publish-pr-pypi:
+    name: Publish to PyPI (PR)
+    needs:
+      - validate-version
+      - build-wheels
+      - build-sdist
+    if: github.event_name == 'pull_request' && github.base_ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          mkdir -p release-dist
+          find dist -type f \( -name "*.whl" -o -name "*.tar.gz" \) -exec cp {} release-dist/ \;
+          ls -lah release-dist
+
+      - name: Publish artifacts to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: release-dist
+          skip-existing: true
+
+  publish-pypi:
     name: Publish to PyPI
     needs:
+      - validate-version
       - build-wheels
       - build-sdist
     if: startsWith(github.ref, 'refs/tags/v')
