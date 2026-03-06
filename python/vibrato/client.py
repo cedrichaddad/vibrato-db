@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover
     pl = None
 
 
-DEFAULT_FLIGHT_CHUNK_ROWS = 4096
+DEFAULT_FLIGHT_CHUNK_ROWS = 50_000
 DEFAULT_FLIGHT_CHUNK_BYTES = 64 * 1024 * 1024
 
 
@@ -53,6 +53,7 @@ class VibratoClient:
         self.flight_chunk_rows = max(1, int(flight_chunk_rows))
         self.flight_chunk_bytes = max(1, int(flight_chunk_bytes))
         self._session = requests.Session()
+        self._flight_client: "paf.FlightClient | None" = None
 
     def query(
         self,
@@ -124,6 +125,89 @@ class VibratoClient:
             tags=tags,
             idempotency_keys=idempotency_keys,
         )
+
+    def ingest_stream(
+        self,
+        batches: Iterable[dict[str, Any]],
+        *,
+        prefer_flight: bool = True,
+    ) -> IngestResult:
+        """Stream multiple batches over a single Flight ``do_put`` call.
+
+        Each element yielded by *batches* must be a dict with at least a
+        ``data`` key (numpy array of shape ``(N, D)``).  Optional keys:
+        ``entity_ids``, ``sequence_ts``, ``payloads``, ``tags``,
+        ``idempotency_keys`` — matching the signature of :meth:`ingest`.
+        """
+        if not (prefer_flight and self.flight_url is not None):
+            total = IngestResult(accepted=0, created=0)
+            for b in batches:
+                r = self.ingest(
+                    b["data"],
+                    entity_ids=b.get("entity_ids"),
+                    sequence_ts=b.get("sequence_ts"),
+                    payloads=b.get("payloads"),
+                    tags=b.get("tags"),
+                    idempotency_keys=b.get("idempotency_keys"),
+                    prefer_flight=False,
+                )
+                total.accepted += r.accepted
+                total.created += r.created
+            return total
+
+        if paf is None:
+            raise RuntimeError("pyarrow is required for Flight ingest")
+
+        client = self._get_flight_client()
+        options = paf.FlightCallOptions(
+            headers=[(b"authorization", f"Bearer {self.api_key}".encode("utf-8"))]
+        )
+
+        accepted = 0
+        created = 0
+        first_schema: "pa.Schema | None" = None
+        pending_chunks: list["pa.RecordBatch"] = []
+
+        def _chunk_iter():
+            nonlocal first_schema
+            for b in batches:
+                table = self._as_arrow_table(
+                    b["data"],
+                    entity_ids=b.get("entity_ids"),
+                    sequence_ts=b.get("sequence_ts"),
+                    payloads=b.get("payloads"),
+                    tags=b.get("tags"),
+                    idempotency_keys=b.get("idempotency_keys"),
+                )
+                if first_schema is None:
+                    first_schema = table.schema
+                for chunk in self._iter_table_chunks(table):
+                    yield chunk
+
+        gen = _chunk_iter()
+        try:
+            first_chunk = next(gen)
+        except StopIteration:
+            return IngestResult(accepted=0, created=0)
+
+        assert first_schema is not None
+        descriptor = paf.FlightDescriptor.for_path("v3", "vectors")
+        writer, reader = client.do_put(descriptor, first_schema, options=options)
+        try:
+            writer.write_batch(first_chunk)
+            for chunk in gen:
+                writer.write_batch(chunk)
+        finally:
+            writer.done_writing()
+
+        while True:
+            metadata = reader.read()
+            if metadata is None:
+                break
+            payload = json.loads(metadata.to_pybytes().decode("utf-8"))
+            accepted += int(payload.get("accepted", 0))
+            created += int(payload.get("created", 0))
+        return IngestResult(accepted=accepted, created=created)
 
     def _headers(self) -> dict[str, str]:
         return {"authorization": f"Bearer {self.api_key}"}
@@ -345,15 +429,21 @@ class VibratoClient:
             yield batch
             start += rows
 
-    def _ingest_via_flight(self, table: "pa.Table") -> IngestResult:
+    def _get_flight_client(self) -> "paf.FlightClient":
+        """Return a cached Flight client, creating one on first use."""
         if paf is None:
             raise RuntimeError("pyarrow.flight is required for Flight ingest")
         if self.flight_url is None:
             raise RuntimeError("flight_url is required for Flight ingest")
+        if self._flight_client is None:
+            self._flight_client = paf.FlightClient(self.flight_url)
+        return self._flight_client
+
+    def _ingest_via_flight(self, table: "pa.Table") -> IngestResult:
         if table.num_rows == 0:
             return IngestResult(accepted=0, created=0)
 
-        client = paf.FlightClient(self.flight_url)
+        client = self._get_flight_client()
         options = paf.FlightCallOptions(
             headers=[(b"authorization", f"Bearer {self.api_key}".encode("utf-8"))]
         )
@@ -366,7 +456,6 @@ class VibratoClient:
             for batch in self._iter_table_chunks(table):
                 writer.write_batch(batch)
         finally:
-            # Ensure the stream is closed even when write_batch() raises.
             writer.done_writing()
 
         while True:

@@ -29,7 +29,7 @@ use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
 type TonicStream<T> = Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send + 'static>>;
-const FLIGHT_DECODE_CHUNK_ROWS: usize = 2048;
+const FLIGHT_DECODE_CHUNK_ROWS: usize = 10_000;
 const FLIGHT_MAX_DECODING_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 const FLIGHT_MAX_ENCODING_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -479,15 +479,23 @@ fn ingest_flight_batch_streaming(
     let cols = parse_flight_batch_columns(&batch, dim)?;
     let mut results = Vec::with_capacity(cols.num_rows);
     let chunk_capacity = FLIGHT_DECODE_CHUNK_ROWS.min(cols.num_rows.max(1));
-    let mut chunk = Vec::with_capacity(chunk_capacity);
     let mut decode_us = 0u64;
     let mut commit_us = 0u64;
     let mut row = 0usize;
+
+    // Pipeline: decode chunk N+1 while chunk N commits via ingest_batch_owned.
+    // The channel depth of 1 keeps memory bounded while still overlapping work.
+    let mut pending_commit: Option<(
+        std::sync::mpsc::Receiver<Result<Vec<(usize, bool)>>>,
+        std::time::Instant,
+        usize, // row count for error messages
+    )> = None;
 
     while row < cols.num_rows {
         let end = (row + FLIGHT_DECODE_CHUNK_ROWS).min(cols.num_rows);
         let decode_started = Instant::now();
         let mut tag_cache = TagNormalizationCache::default();
+        let mut chunk = Vec::with_capacity(chunk_capacity);
         for idx in row..end {
             chunk.push(decode_entry_at_row(
                 &cols,
@@ -514,13 +522,33 @@ fn ingest_flight_batch_streaming(
             std::thread::yield_now();
         }
 
+        // Collect the previous commit result before starting the next one.
+        if let Some((rx, commit_started, _prev_count)) = pending_commit.take() {
+            let mut batch_results = rx
+                .recv()
+                .map_err(|_| Status::internal("pipeline commit channel dropped"))?
+                .map_err(map_ingest_error)?;
+            commit_us = commit_us.saturating_add(elapsed_micros_u64(commit_started.elapsed()));
+            results.append(&mut batch_results);
+        }
+
+        // Dispatch this chunk's commit without blocking decode of the next chunk.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let commit_started = Instant::now();
-        let mut batch_results = state
-            .ingest_batch_owned(std::mem::take(&mut chunk))
+        let _ = tx.send(state.ingest_batch_owned(chunk));
+        pending_commit = Some((rx, commit_started, end - row));
+
+        row = end;
+    }
+
+    // Drain the final pending commit.
+    if let Some((rx, commit_started, _count)) = pending_commit.take() {
+        let mut batch_results = rx
+            .recv()
+            .map_err(|_| Status::internal("pipeline commit channel dropped"))?
             .map_err(map_ingest_error)?;
         commit_us = commit_us.saturating_add(elapsed_micros_u64(commit_started.elapsed()));
         results.append(&mut batch_results);
-        row = end;
     }
 
     Ok(FlightBatchIngestResult {
