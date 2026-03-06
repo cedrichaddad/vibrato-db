@@ -414,11 +414,16 @@ def run_native_c_abi_queries(data_dir, dim, num_queries, k, ef):
     # Pre-generate query vectors as contiguous float32 numpy arrays 
     # This triggers the zero-copy ReadOnlyF32Buffer path in Rust
     queries = np.random.rand(num_queries, dim).astype(np.float32)
+    queries.flags.writeable = False  # <--- UNLOCKS ZERO-COPY
 
-    # 4. Warmup (Loads mmap pages into L1/L2 cache)
-    print(f"  Warmup: 5 queries")
-    for i in range(5):
-        _ = index.search(queries[i], k, ef)
+    # 4. Warmup (Forces OS Page Faults to resolve before timing)
+    warmup_count = 10_000 
+    print(f"  Warmup: {warmup_count:,} queries to pre-fault mmap pages...")
+    warmup_queries = np.random.rand(warmup_count, dim).astype(np.float32)
+    warmup_queries.flags.writeable = False  # Must also be zero-copy
+    
+    for i in range(warmup_count):
+        _ = index.search(warmup_queries[i], k, ef)
 
     # 5. The Hot Loop
     latencies = []
@@ -503,6 +508,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=50_000, help="Vectors per batch")
     parser.add_argument("--dim", type=int, default=10, help="Vector dimensions (matches TDengine's 10 float columns)")
     parser.add_argument("--num-queries", type=int, default=1000, help="Number of query latency samples")
+    parser.add_argument("--query-k", type=int, default=10, help="k nearest neighbors to return")
     parser.add_argument("--query-ef", type=int, default=50, help="ef for HNSW search")
     parser.add_argument("--skip-tdengine", action="store_true", help="Skip TDengine benchmark")
     parser.add_argument("--skip-vibrato", action="store_true", help="Skip Vibrato Flight benchmark")
@@ -567,7 +573,7 @@ def main():
             ingest_results.append(c_abi_ingest)
             
             c_abi_queries = run_native_c_abi_queries(
-                args.data_dir, args.dim, args.num_queries, k=10, ef=args.query_ef
+                args.data_dir, args.dim, args.num_queries, k=args.query_k, ef=args.query_ef
             )
             if c_abi_queries:
                 query_results.append(c_abi_queries)
