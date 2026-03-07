@@ -19,20 +19,19 @@ impl BitmapSet {
     pub fn grow(&mut self, _new_len: usize) {}
 
     #[inline]
-    fn id_to_bitmap(id: usize) -> Option<u32> {
-        u32::try_from(id).ok()
+    fn id_to_bitmap(id: usize) -> u32 {
+        u32::try_from(id)
+            .unwrap_or_else(|_| panic!("data integrity fault: bitmap id overflow id={id}"))
     }
 
     pub fn insert(&mut self, id: usize) {
-        if let Some(id32) = Self::id_to_bitmap(id) {
-            self.inner.insert(id32);
-        }
+        let id32 = Self::id_to_bitmap(id);
+        self.inner.insert(id32);
     }
 
     pub fn contains(&self, id: usize) -> bool {
-        Self::id_to_bitmap(id)
-            .map(|id32| self.inner.contains(id32))
-            .unwrap_or(false)
+        let id32 = Self::id_to_bitmap(id);
+        self.inner.contains(id32)
     }
 
     pub fn count_ones<R>(&self, range: R) -> usize

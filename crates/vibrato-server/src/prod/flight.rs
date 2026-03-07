@@ -413,6 +413,7 @@ fn decode_entry_at_row(
     row: usize,
     max_tags: usize,
     max_tag_len: usize,
+    max_idempotency_key_len: usize,
     tag_cache: &mut TagNormalizationCache,
 ) -> std::result::Result<(Vec<f32>, IngestMetadataV3Input, Option<String>), Status> {
     if cols.vectors.is_null(row) {
@@ -443,6 +444,15 @@ fn decode_entry_at_row(
             Some(col.value(row).to_string())
         }
     });
+    if let Some(key) = idempotency.as_ref() {
+        if key.len() > max_idempotency_key_len {
+            return Err(Status::invalid_argument(format!(
+                "idempotency key too long: max={} actual={}",
+                max_idempotency_key_len,
+                key.len()
+            )));
+        }
+    }
 
     Ok((
         vector,
@@ -465,7 +475,14 @@ fn extract_batch_entries(
     let mut entries = Vec::with_capacity(cols.num_rows);
     let mut tag_cache = TagNormalizationCache::default();
     for row in 0..cols.num_rows {
-        entries.push(decode_entry_at_row(&cols, row, 64, 64, &mut tag_cache)?);
+        entries.push(decode_entry_at_row(
+            &cols,
+            row,
+            64,
+            64,
+            64,
+            &mut tag_cache,
+        )?);
     }
 
     Ok(entries)
@@ -502,6 +519,7 @@ fn ingest_flight_batch_streaming(
                 idx,
                 state.config.max_tags_per_vector,
                 state.config.max_tag_len,
+                state.config.max_idempotency_key_len,
                 &mut tag_cache,
             )?);
         }
@@ -592,6 +610,9 @@ fn estimate_batch_ingest_bytes(
 fn map_ingest_error(err: anyhow::Error) -> Status {
     let msg = err.to_string();
     if msg.contains("dimension mismatch") {
+        return Status::invalid_argument(msg);
+    }
+    if msg.contains("idempotency key too long") {
         return Status::invalid_argument(msg);
     }
     if msg.contains("tag_registry_overflow") {
@@ -857,6 +878,55 @@ mod tests {
         .expect("record batch")
     }
 
+    fn make_batch_with_idempotency(idempotency: Option<&str>) -> RecordBatch {
+        let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            vec![Some(vec![
+                Some(1.0f32),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+            ])],
+            4,
+        );
+        let entity_id = UInt64Array::from(vec![Some(42)]);
+        let sequence_ts = UInt64Array::from(vec![Some(10)]);
+        let payload = BinaryArray::from(vec![Some(b"abc".as_slice())]);
+        let mut tags_builder = ListBuilder::new(StringBuilder::new());
+        tags_builder.append(false);
+        let tags = tags_builder.finish();
+        let idempotency_key = StringArray::from(vec![idempotency]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                false,
+            ),
+            Field::new("entity_id", DataType::UInt64, true),
+            Field::new("sequence_ts", DataType::UInt64, true),
+            Field::new("payload", DataType::Binary, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new("idempotency_key", DataType::Utf8, true),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(vectors),
+                Arc::new(entity_id),
+                Arc::new(sequence_ts),
+                Arc::new(payload),
+                Arc::new(tags),
+                Arc::new(idempotency_key),
+            ],
+        )
+        .expect("record batch")
+    }
+
     #[test]
     fn extract_batch_entries_parses_rows() {
         let batch = make_batch();
@@ -876,6 +946,19 @@ mod tests {
         let batch = make_batch();
         let err = extract_batch_entries(&batch, 8).expect_err("dim mismatch");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn extract_batch_entries_rejects_oversized_idempotency_key() {
+        let long_key = "x".repeat(65);
+        let batch = make_batch_with_idempotency(Some(&long_key));
+        let err = extract_batch_entries(&batch, 4).expect_err("oversized idempotency key");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("idempotency key too long"),
+            "unexpected error: {}",
+            err.message()
+        );
     }
 
     #[test]

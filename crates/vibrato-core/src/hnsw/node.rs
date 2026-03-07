@@ -8,18 +8,20 @@ use serde::{Deserialize, Serialize};
 /// Higher layers contain progressively fewer nodes for "express" navigation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
-    /// Index into the VectorStore (not the vector itself - zero-copy)
-    pub id: usize,
+    /// External/global vector ID
+    pub id: u64,
 
     /// Neighbors at each layer
     /// - `layers[0]` = neighbors at layer 0 (base, everyone)
     /// - `layers[n]` = neighbors at layer n (express, fewer nodes)
-    pub layers: Vec<Vec<usize>>,
+    ///
+    /// Stored as dense node indices (u32) for compact, cache-friendly traversal.
+    pub layers: Vec<Vec<u32>>,
 }
 
 impl Node {
     /// Create a new node with the given ID and number of layers
-    pub fn new(id: usize, max_layer: usize) -> Self {
+    pub fn new(id: u64, max_layer: usize) -> Self {
         Self {
             id,
             layers: vec![Vec::new(); max_layer + 1],
@@ -32,38 +34,38 @@ impl Node {
     }
 
     /// Get neighbors at a specific layer
-    pub fn neighbors(&self, layer: usize) -> &[usize] {
+    pub fn neighbors(&self, layer: usize) -> &[u32] {
         self.layers.get(layer).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Get mutable neighbors at a specific layer
-    pub fn neighbors_mut(&mut self, layer: usize) -> Option<&mut Vec<usize>> {
+    pub fn neighbors_mut(&mut self, layer: usize) -> Option<&mut Vec<u32>> {
         self.layers.get_mut(layer)
     }
 
     /// Add a neighbor at a specific layer
-    pub fn add_neighbor(&mut self, layer: usize, neighbor_id: usize) {
+    pub fn add_neighbor(&mut self, layer: usize, neighbor_idx: u32) {
         if let Some(neighbors) = self.layers.get_mut(layer) {
-            if !neighbors.contains(&neighbor_id) {
-                neighbors.push(neighbor_id);
+            if !neighbors.contains(&neighbor_idx) {
+                neighbors.push(neighbor_idx);
             }
         }
     }
 
     /// Add a neighbor without duplicate checks.
     ///
-    /// Caller must guarantee `neighbor_id` does not already exist in the layer.
+    /// Caller must guarantee `neighbor_idx` does not already exist in the layer.
     #[inline(always)]
-    pub fn add_neighbor_unchecked(&mut self, layer: usize, neighbor_id: usize) {
+    pub fn add_neighbor_unchecked(&mut self, layer: usize, neighbor_idx: u32) {
         if let Some(neighbors) = self.layers.get_mut(layer) {
-            neighbors.push(neighbor_id);
+            neighbors.push(neighbor_idx);
         }
     }
 
     /// Remove a neighbor at a specific layer
-    pub fn remove_neighbor(&mut self, layer: usize, neighbor_id: usize) {
+    pub fn remove_neighbor(&mut self, layer: usize, neighbor_idx: u32) {
         if let Some(neighbors) = self.layers.get_mut(layer) {
-            neighbors.retain(|&n| n != neighbor_id);
+            neighbors.retain(|&n| n != neighbor_idx);
         }
     }
 }
@@ -89,7 +91,7 @@ mod tests {
 
         assert_eq!(node.neighbors(0), &[1, 2]);
         assert_eq!(node.neighbors(1), &[3]);
-        assert_eq!(node.neighbors(2), &[] as &[usize]);
+        assert_eq!(node.neighbors(2), &[] as &[u32]);
     }
 
     #[test]

@@ -173,6 +173,7 @@ pub struct ProductionConfig {
     pub max_tag_registry_size: usize,
     pub max_tags_per_vector: usize,
     pub max_tag_len: usize,
+    pub max_idempotency_key_len: usize,
     pub flight_decode_warn_ms: u64,
     pub vector_madvise_mode: VectorMadviseMode,
     pub api_pepper: String,
@@ -317,6 +318,7 @@ impl ProductionConfig {
             max_tag_registry_size: 500_000,
             max_tags_per_vector: 64,
             max_tag_len: 64,
+            max_idempotency_key_len: 64,
             flight_decode_warn_ms: 20,
             vector_madvise_mode: VectorMadviseMode::Normal,
             api_pepper: std::env::var("VIBRATO_API_PEPPER")
@@ -934,6 +936,18 @@ impl ProductionState {
                     self.collection.dim,
                     vector.len()
                 ));
+            }
+        }
+        for (i, (_, _, key)) in entries.iter().enumerate() {
+            if let Some(key) = key {
+                if key.len() > self.config.max_idempotency_key_len {
+                    return Err(anyhow!(
+                        "idempotency key too long at index {}: max={} actual={}",
+                        i,
+                        self.config.max_idempotency_key_len,
+                        key.len()
+                    ));
+                }
             }
         }
 
@@ -1998,15 +2012,6 @@ impl ProductionState {
 
         let result = (|| -> Result<JobResponseV2> {
             let (ids_raw, vectors_raw, metadata_raw) = wal_to_arrays(&pending);
-            for pair in ids_raw.windows(2) {
-                if pair[1] > pair[0].saturating_add(1) {
-                    tracing::warn!(
-                        "checkpoint sparse id gap detected between vector_id {} and {}; operation will fail to protect integrity",
-                        pair[0],
-                        pair[1]
-                    );
-                }
-            }
             let (ids, vectors, metadata) = densify_id_space(ids_raw, vectors_raw, metadata_raw)?;
             let hnsw = build_index_from_pairs(
                 self.config.hnsw_m,

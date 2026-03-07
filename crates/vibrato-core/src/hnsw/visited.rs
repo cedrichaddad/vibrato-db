@@ -77,7 +77,7 @@ impl EpochVisited {
 impl VisitedSet for EpochVisited {
     #[inline(always)]
     fn prepare_for(&mut self, max_id: usize) {
-        self.ensure_len(max_id.saturating_add(1));
+        self.ensure_len(max_id.saturating_add(1).max(1));
         self.clear_epoch();
     }
 
@@ -113,7 +113,7 @@ pub struct HashVisitedSet {
 impl VisitedSet for HashVisitedSet {
     #[inline(always)]
     fn prepare_for(&mut self, max_id: usize) {
-        let reserve = max_id.saturating_add(1).min(4096);
+        let reserve = max_id.saturating_add(1).max(1).min(4096);
         self.visited.clear();
         if self.visited.capacity() < reserve {
             self.visited.reserve(reserve - self.visited.capacity());
@@ -211,6 +211,18 @@ impl VisitedPool {
             let mut set = if let Some(idx) = pool.sets.iter().position(|s| s.len() >= required_len)
             {
                 pool.sets.swap_remove(idx)
+            } else if !pool.sets.is_empty() {
+                // Grow and reuse the largest pooled buffer instead of allocating a new one.
+                let largest_idx = pool
+                    .sets
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, s)| s.len())
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0);
+                let mut existing = pool.sets.swap_remove(largest_idx);
+                existing.ensure_len(required_len);
+                existing
             } else {
                 EpochVisited::with_capacity(required_len)
             };

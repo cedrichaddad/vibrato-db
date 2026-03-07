@@ -29,7 +29,7 @@ use crate::simd::dot_product;
 /// Candidate for search (min-heap)
 #[derive(Clone, Copy)]
 struct Candidate {
-    id: usize,
+    idx: usize,
     distance: f32,
 }
 
@@ -60,7 +60,7 @@ impl PartialOrd for Candidate {
 /// Result from search (max-heap for keeping top-k worst)
 #[derive(Clone, Copy)]
 struct SearchResult {
-    id: usize,
+    idx: usize,
     distance: f32,
 }
 
@@ -137,10 +137,10 @@ struct InsertScratch {
     query: Vec<f32>,
     search: SearchScratch,
     layer_candidates: Vec<(usize, f32)>,
-    reverse_edges: Vec<(usize, usize, usize)>,
-    prune_ops: Vec<(usize, usize, Vec<usize>)>,
+    reverse_edges: Vec<(usize, usize, u32)>,
+    prune_ops: Vec<(usize, usize, Vec<u32>)>,
     neighbor_vec: Vec<f32>,
-    all_neighbors: Vec<usize>,
+    all_neighbors: Vec<u32>,
     neighbor_candidates: Vec<(usize, f32)>,
 }
 
@@ -172,13 +172,10 @@ pub struct HNSW {
     /// All nodes in the graph
     pub nodes: Vec<Node>,
 
-    /// Map from node ID to index in nodes vector (O(1) lookup)
-    id_to_index: FxHashMap<usize, usize>,
+    /// Map from external/global ID to dense node index.
+    id_to_index: FxHashMap<u64, usize>,
 
-    /// Highest node ID currently present in the graph.
-    max_node_id: usize,
-
-    /// Entry point node ID (node on the highest layer)
+    /// Entry point node index (node on the highest layer)
     pub entry_point: Option<usize>,
 
     /// Maximum layer currently in the graph
@@ -232,7 +229,7 @@ impl HNSW {
             m,
             ef_construction,
             move |id, sink| {
-                let v = vector_fn(id);
+                let v = vector_fn(id as usize);
                 sink(&v);
             },
             seed,
@@ -260,14 +257,13 @@ impl HNSW {
         Self {
             nodes: Vec::new(),
             id_to_index: FxHashMap::default(),
-            max_node_id: 0,
             entry_point: None,
             max_layer: 0,
             m,
             m0: m * 2,
             ml: 1.0 / (m as f64).ln(),
             ef_construction,
-            vectors: Box::new(vector_fn),
+            vectors: Box::new(move |id, sink| vector_fn(id as usize, sink)),
             rng: StdRng::seed_from_u64(seed),
         }
     }
@@ -287,38 +283,24 @@ impl HNSW {
         F: Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static,
     {
         // Build id_to_index map from existing nodes
-        let id_to_index: FxHashMap<usize, usize> = nodes
+        let id_to_index: FxHashMap<u64, usize> = nodes
             .iter()
             .enumerate()
             .map(|(idx, node)| (node.id, idx))
             .collect();
-        let max_node_id = nodes.iter().map(|n| n.id).max().unwrap_or(0);
 
         Self {
             nodes,
             id_to_index,
-            max_node_id,
             entry_point,
             max_layer,
             m,
             m0,
             ml,
             ef_construction,
-            vectors: Box::new(vector_fn),
+            vectors: Box::new(move |id, sink| vector_fn(id as usize, sink)),
             rng: StdRng::seed_from_u64(rand::random()),
         }
-    }
-
-    /// Get node index by ID (O(1) lookup)
-    #[inline]
-    fn get_node_index(&self, id: usize) -> Option<usize> {
-        self.id_to_index.get(&id).copied()
-    }
-
-    /// Get node by ID (O(1) lookup)
-    #[inline]
-    fn get_node(&self, id: usize) -> Option<&Node> {
-        self.id_to_index.get(&id).map(|&idx| &self.nodes[idx])
     }
 
     #[inline]
@@ -338,7 +320,7 @@ impl HNSW {
     /// Returns true if `id` is present in the graph.
     #[inline]
     pub fn contains_id(&self, id: usize) -> bool {
-        self.id_to_index.contains_key(&id)
+        self.id_to_index.contains_key(&(id as u64))
     }
 
     /// Score a node ID against a query vector if that node exists.
@@ -364,7 +346,8 @@ impl HNSW {
         id: usize,
         accessor: Option<VectorAccessorRef<'_>>,
     ) -> Option<f32> {
-        if !self.contains_id(id) {
+        let id64 = id as u64;
+        if !self.id_to_index.contains_key(&id64) {
             return None;
         }
         let mut score = 0.0f32;
@@ -396,9 +379,17 @@ impl HNSW {
     fn distance_with_optional_accessor(
         &self,
         query: &[f32],
-        node_id: usize,
+        node_idx: usize,
         accessor: Option<VectorAccessorRef<'_>>,
     ) -> f32 {
+        let node_id = self
+            .nodes
+            .get(node_idx)
+            .map(|n| n.id)
+            .unwrap_or_else(|| panic!("data integrity fault: missing node index {node_idx}"));
+        let node_id = usize::try_from(node_id).unwrap_or_else(|_| {
+            panic!("data integrity fault: vector id {node_id} does not fit usize accessor")
+        });
         let mut dist = 0.0f32;
         self.with_vector_from(node_id, accessor, &mut |node_vec| {
             dist = -dot_product(query, node_vec);
@@ -429,9 +420,16 @@ impl HNSW {
         id: usize,
         accessor: Option<VectorAccessorRef<'_>>,
     ) {
+        let id64 = id as u64;
         // Idempotent insert guard for checkpoint catch-up/replay paths.
-        if self.contains_id(id) {
+        if self.id_to_index.contains_key(&id64) {
             return;
+        }
+        if self.nodes.len() >= u32::MAX as usize {
+            panic!(
+                "data integrity fault: hnsw node index overflow (len={} exceeds u32::MAX)",
+                self.nodes.len()
+            );
         }
 
         INSERT_SCRATCH.with(|slot| {
@@ -455,23 +453,25 @@ impl HNSW {
             neighbor_candidates.clear();
 
             let node_layer = self.random_layer();
-            self.max_node_id = self.max_node_id.max(id);
+            let new_node_idx = self.nodes.len();
+            let new_node_idx_u32 = u32::try_from(new_node_idx)
+                .expect("data integrity fault: node index conversion overflow");
 
             // Create node
-            let mut node = Node::new(id, node_layer);
+            let mut node = Node::new(id64, node_layer);
 
             // First node becomes entry point
             if self.entry_point.is_none() {
-                self.entry_point = Some(id);
+                self.entry_point = Some(0);
                 self.max_layer = node_layer;
-                self.id_to_index.insert(id, 0); // First node always at index 0
+                self.id_to_index.insert(id64, 0); // First node always at index 0
                 self.nodes.push(node);
                 return;
             }
 
             let entry_point = self.entry_point.unwrap();
             let mut current_node = entry_point;
-            let mut visited = VisitedGuard::new(self.max_node_id);
+            let mut visited = VisitedGuard::new(self.nodes.len().saturating_add(1));
 
             // Phase 1: Zoom in from top layer to node_layer + 1
             // Greedy search, single best neighbor per layer
@@ -486,8 +486,8 @@ impl HNSW {
                     layer_candidates,
                     accessor,
                 );
-                if let Some((nearest_id, _)) = layer_candidates.first() {
-                    current_node = *nearest_id;
+                if let Some((nearest_idx, _)) = layer_candidates.first() {
+                    current_node = *nearest_idx;
                 }
             }
 
@@ -516,59 +516,97 @@ impl HNSW {
                     layer_candidates,
                     m_layer,
                     accessor,
+                    None,
                 );
 
                 // Add forward edges to new node.
-                for &(neighbor_id, _) in &neighbors {
+                for &(neighbor_idx, _) in &neighbors {
                     // `select_neighbors` returns unique IDs, so this is duplicate-safe.
-                    node.add_neighbor_unchecked(layer, neighbor_id);
+                    let neighbor_idx_u32 = u32::try_from(neighbor_idx)
+                        .expect("data integrity fault: neighbor index overflow");
+                    node.add_neighbor_unchecked(layer, neighbor_idx_u32);
 
-                    // Find the node index for this neighbor using O(1) HashMap.
-                    if let Some(node_idx) = self.get_node_index(neighbor_id) {
-                        reverse_edges.push((node_idx, layer, id));
+                    reverse_edges.push((neighbor_idx, layer, new_node_idx_u32));
 
-                        // Check if pruning will be needed.
-                        let current_neighbors = self.nodes[node_idx].neighbors(layer);
-                        if current_neighbors.len() >= m_layer {
-                            // Will need pruning after adding new edge.
-                            all_neighbors.clear();
-                            all_neighbors.extend_from_slice(current_neighbors);
-                            all_neighbors.push(id);
+                    // Check if pruning will be needed.
+                    let current_neighbors = self.nodes[neighbor_idx].neighbors(layer);
+                    if current_neighbors.len() >= m_layer {
+                        // Will need pruning after adding new edge.
+                        all_neighbors.clear();
+                        all_neighbors.extend_from_slice(current_neighbors);
+                        all_neighbors.push(new_node_idx_u32);
 
-                            // Compute distances and select.
-                            neighbor_candidates.clear();
-                            if neighbor_candidates.capacity() < all_neighbors.len() {
-                                neighbor_candidates
-                                    .reserve(all_neighbors.len() - neighbor_candidates.capacity());
-                            }
-                            self.copy_vector_into_with_optional_accessor(
-                                neighbor_id,
-                                neighbor_vec,
-                                accessor,
-                            );
-                            for &n in all_neighbors.iter() {
-                                let mut dist = 0.0f32;
-                                self.with_vector_from(n, accessor, &mut |v| {
-                                    dist = -dot_product(neighbor_vec.as_slice(), v);
-                                });
-                                neighbor_candidates.push((n, dist));
-                            }
-
-                            let pruned = self.select_neighbors_with_accessor(
-                                &[],
-                                neighbor_candidates,
-                                m_layer,
-                                accessor,
-                            );
-                            let pruned_ids: Vec<usize> = pruned.iter().map(|(id, _)| *id).collect();
-                            prune_ops.push((node_idx, layer, pruned_ids));
+                        // Compute distances and select.
+                        neighbor_candidates.clear();
+                        if neighbor_candidates.capacity() < all_neighbors.len() {
+                            neighbor_candidates
+                                .reserve(all_neighbors.len() - neighbor_candidates.capacity());
                         }
+                        let neighbor_id = self
+                            .nodes
+                            .get(neighbor_idx)
+                            .map(|n| n.id)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "data integrity fault: missing neighbor node_idx={neighbor_idx}"
+                                )
+                            });
+                        let neighbor_id = usize::try_from(neighbor_id).unwrap_or_else(|_| {
+                            panic!(
+                                "data integrity fault: neighbor id does not fit usize accessor"
+                            )
+                        });
+                        self.copy_vector_into_with_optional_accessor(
+                            neighbor_id,
+                            neighbor_vec,
+                            accessor,
+                        );
+                        for &n in all_neighbors.iter() {
+                            let n_idx = n as usize;
+                            let n_id = if n_idx == new_node_idx {
+                                id
+                            } else {
+                                let external = self.nodes
+                                    .get(n_idx)
+                                    .map(|node| node.id)
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "data integrity fault: missing prune node_idx={n_idx}"
+                                        )
+                                    });
+                                usize::try_from(external).unwrap_or_else(|_| {
+                                    panic!(
+                                        "data integrity fault: prune id does not fit usize accessor"
+                                    )
+                                })
+                            };
+                            let mut dist = 0.0f32;
+                            self.with_vector_from(n_id, accessor, &mut |v| {
+                                dist = -dot_product(neighbor_vec.as_slice(), v);
+                            });
+                            neighbor_candidates.push((n_idx, dist));
+                        }
+
+                        let pruned = self.select_neighbors_with_accessor(
+                            &[],
+                            neighbor_candidates,
+                            m_layer,
+                            accessor,
+                            Some((new_node_idx, query.as_slice())),
+                        );
+                        let pruned_ids: Vec<u32> = pruned
+                            .iter()
+                            .map(|(idx, _)| {
+                                u32::try_from(*idx).expect("data integrity fault: prune idx overflow")
+                            })
+                            .collect();
+                        prune_ops.push((neighbor_idx, layer, pruned_ids));
                     }
                 }
 
                 // Use first candidate as entry for next layer.
-                if let Some((first_id, _)) = layer_candidates.first() {
-                    current_node = *first_id;
+                if let Some((first_idx, _)) = layer_candidates.first() {
+                    current_node = *first_idx;
                 }
             }
 
@@ -596,12 +634,11 @@ impl HNSW {
             // Update entry point if new node has higher layer.
             if node_layer > self.max_layer {
                 self.max_layer = node_layer;
-                self.entry_point = Some(id);
+                self.entry_point = Some(new_node_idx);
             }
 
             // Add to id_to_index map before pushing.
-            let node_idx = self.nodes.len();
-            self.id_to_index.insert(id, node_idx);
+            self.id_to_index.insert(id64, new_node_idx);
             self.nodes.push(node);
         });
     }
@@ -633,11 +670,11 @@ impl HNSW {
                 visited.visit(ep);
                 let dist = self.distance_with_optional_accessor(query, ep, accessor);
                 candidates.push(Candidate {
-                    id: ep,
+                    idx: ep,
                     distance: dist,
                 });
                 results.push(SearchResult {
-                    id: ep,
+                    idx: ep,
                     distance: dist,
                 });
                 worst_distance = results.peek().map(|r| r.distance).unwrap_or(f32::INFINITY);
@@ -651,29 +688,30 @@ impl HNSW {
                 break;
             }
 
-            // Explore neighbors using O(1) HashMap lookup
-            if let Some(node) = self.get_node(current.id) {
+            // Explore neighbors via dense node-index adjacency.
+            if let Some(node) = self.nodes.get(current.idx) {
                 // PERF NOTE: prefetching Node structs here is ineffective because
-                // Node contains Vec<Vec<usize>> — the actual neighbor data lives
+                // Node contains Vec<Vec<u32>> — the actual neighbor data lives
                 // on the heap behind pointers, not inline in the struct.
                 // True fix: linearize the graph into a flat Vec<u32> (V3 scope).
-                for &neighbor_id in node.neighbors(layer) {
-                    if visited.is_visited(neighbor_id) {
+                for &neighbor in node.neighbors(layer) {
+                    let neighbor_idx = neighbor as usize;
+                    if visited.is_visited(neighbor_idx) {
                         continue;
                     }
-                    visited.visit(neighbor_id);
+                    visited.visit(neighbor_idx);
 
-                    let dist = self.distance_with_optional_accessor(query, neighbor_id, accessor);
+                    let dist = self.distance_with_optional_accessor(query, neighbor_idx, accessor);
 
                     // Add to candidates if promising
                     let dominated = results.len() >= ef && dist > worst_distance;
                     if !dominated {
                         candidates.push(Candidate {
-                            id: neighbor_id,
+                            idx: neighbor_idx,
                             distance: dist,
                         });
                         results.push(SearchResult {
-                            id: neighbor_id,
+                            idx: neighbor_idx,
                             distance: dist,
                         });
 
@@ -690,7 +728,7 @@ impl HNSW {
 
         // Convert to sorted vec while keeping heap allocations for reuse.
         out.clear();
-        out.extend(results.iter().map(|r| (r.id, r.distance)));
+        out.extend(results.iter().map(|r| (r.idx, r.distance)));
         out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     }
 
@@ -704,6 +742,7 @@ impl HNSW {
         candidates: &[(usize, f32)],
         m: usize,
         accessor: Option<VectorAccessorRef<'_>>,
+        virtual_candidate: Option<(usize, &[f32])>,
     ) -> Vec<(usize, f32)> {
         if candidates.is_empty() {
             return Vec::new();
@@ -713,48 +752,135 @@ impl HNSW {
         let mut sorted: Vec<_> = candidates.to_vec();
         sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
-        let mut result = Vec::with_capacity(m);
+        let mut result: Vec<(usize, f32)> = Vec::with_capacity(m);
         let mut candidate_vec_scratch = Vec::new();
-
-        for &(candidate_id, candidate_dist) in &sorted {
-            if result.len() >= m {
-                break;
-            }
-
-            // Check if candidate is closer to query than to any existing result
-            let mut is_diverse = true;
-            self.copy_vector_into_with_optional_accessor(
-                candidate_id,
-                &mut candidate_vec_scratch,
-                accessor,
-            );
-            for &(existing_id, _) in &result {
-                let mut dist_to_existing = 0.0f32;
-                self.with_vector_from(existing_id, accessor, &mut |existing_vec| {
-                    dist_to_existing = -dot_product(candidate_vec_scratch.as_slice(), existing_vec);
-                });
-
-                if dist_to_existing < candidate_dist {
-                    // Candidate is closer to existing neighbor than to query.
-                    // This means the existing neighbor "covers" this direction.
-                    is_diverse = false;
+        if let Some((virtual_idx, virtual_vec)) = virtual_candidate {
+            let mut existing_vec_scratch = Vec::new();
+            for &(candidate_idx, candidate_dist) in &sorted {
+                if result.len() >= m {
                     break;
                 }
-            }
 
-            if is_diverse {
-                result.push((candidate_id, candidate_dist));
+                // Check if candidate is closer to query than to any existing result
+                let mut is_diverse = true;
+                if candidate_idx == virtual_idx {
+                    candidate_vec_scratch.clear();
+                    candidate_vec_scratch.extend_from_slice(virtual_vec);
+                } else {
+                    let candidate_id = self
+                        .nodes
+                        .get(candidate_idx)
+                        .map(|n| n.id)
+                        .unwrap_or_else(|| {
+                            panic!("data integrity fault: missing candidate node_idx={candidate_idx}")
+                        });
+                    let candidate_id = usize::try_from(candidate_id).unwrap_or_else(|_| {
+                        panic!("data integrity fault: candidate id does not fit usize accessor")
+                    });
+                    self.copy_vector_into_with_optional_accessor(
+                        candidate_id,
+                        &mut candidate_vec_scratch,
+                        accessor,
+                    );
+                }
+
+                for &(existing_idx, _) in &result {
+                    let dist_to_existing: f32 = if existing_idx == virtual_idx {
+                        -dot_product(candidate_vec_scratch.as_slice(), virtual_vec)
+                    } else {
+                        let existing_id = self
+                            .nodes
+                            .get(existing_idx)
+                            .map(|n| n.id)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "data integrity fault: missing existing node_idx={existing_idx}"
+                                )
+                            });
+                        let existing_id = usize::try_from(existing_id).unwrap_or_else(|_| {
+                            panic!("data integrity fault: existing id does not fit usize accessor")
+                        });
+                        existing_vec_scratch.clear();
+                        self.copy_vector_into_with_optional_accessor(
+                            existing_id,
+                            &mut existing_vec_scratch,
+                            accessor,
+                        );
+                        -dot_product(
+                            candidate_vec_scratch.as_slice(),
+                            existing_vec_scratch.as_slice(),
+                        )
+                    };
+
+                    if dist_to_existing < candidate_dist {
+                        // Candidate is closer to existing neighbor than to query.
+                        // This means the existing neighbor "covers" this direction.
+                        is_diverse = false;
+                        break;
+                    }
+                }
+
+                if is_diverse {
+                    result.push((candidate_idx, candidate_dist));
+                }
+            }
+        } else {
+            for &(candidate_idx, candidate_dist) in &sorted {
+                if result.len() >= m {
+                    break;
+                }
+                let mut is_diverse = true;
+                let candidate_id = self
+                    .nodes
+                    .get(candidate_idx)
+                    .map(|n| n.id)
+                    .unwrap_or_else(|| {
+                        panic!("data integrity fault: missing candidate node_idx={candidate_idx}")
+                    });
+                let candidate_id = usize::try_from(candidate_id).unwrap_or_else(|_| {
+                    panic!("data integrity fault: candidate id does not fit usize accessor")
+                });
+                self.copy_vector_into_with_optional_accessor(
+                    candidate_id,
+                    &mut candidate_vec_scratch,
+                    accessor,
+                );
+                for &(existing_idx, _) in &result {
+                    let existing_id = self
+                        .nodes
+                        .get(existing_idx)
+                        .map(|n| n.id)
+                        .unwrap_or_else(|| {
+                            panic!("data integrity fault: missing existing node_idx={existing_idx}")
+                        });
+                    let existing_id = usize::try_from(existing_id).unwrap_or_else(|_| {
+                        panic!("data integrity fault: existing id does not fit usize accessor")
+                    });
+                    let mut dist_to_existing = 0.0f32;
+                    self.with_vector_from(existing_id, accessor, &mut |existing_vec| {
+                        dist_to_existing =
+                            -dot_product(candidate_vec_scratch.as_slice(), existing_vec);
+                    });
+
+                    if dist_to_existing < candidate_dist {
+                        is_diverse = false;
+                        break;
+                    }
+                }
+                if is_diverse {
+                    result.push((candidate_idx, candidate_dist));
+                }
             }
         }
 
         // If we don't have enough diverse neighbors, fill with closest
         if result.len() < m {
-            for &(candidate_id, candidate_dist) in &sorted {
+            for &(candidate_idx, candidate_dist) in &sorted {
                 if result.len() >= m {
                     break;
                 }
-                if !result.iter().any(|(id, _)| *id == candidate_id) {
-                    result.push((candidate_id, candidate_dist));
+                if !result.iter().any(|(idx, _)| *idx == candidate_idx) {
+                    result.push((candidate_idx, candidate_dist));
                 }
             }
         }
@@ -804,7 +930,7 @@ impl HNSW {
             } = &mut *slot;
             let entry_point = self.entry_point.unwrap();
             let mut current_node = entry_point;
-            let mut visited = VisitedGuard::new(self.max_node_id);
+            let mut visited = VisitedGuard::new(self.nodes.len());
 
             // Phase 1: Greedy descent from top layer to layer 1
             for layer in (1..=self.max_layer).rev() {
@@ -818,8 +944,8 @@ impl HNSW {
                     layer_candidates,
                     accessor,
                 );
-                if let Some((nearest_id, _)) = layer_candidates.first() {
-                    current_node = *nearest_id;
+                if let Some((nearest_idx, _)) = layer_candidates.first() {
+                    current_node = *nearest_idx;
                 }
             }
 
@@ -839,7 +965,11 @@ impl HNSW {
             layer_candidates
                 .iter()
                 .take(k)
-                .map(|(id, dist)| (*id, -*dist))
+                .filter_map(|(idx, dist)| {
+                    self.nodes.get(*idx).and_then(|node| {
+                        usize::try_from(node.id).ok().map(|id| (id, -*dist))
+                    })
+                })
                 .collect()
         })
     }
@@ -912,7 +1042,7 @@ impl HNSW {
             } = &mut *slot;
             let entry_point = self.entry_point.unwrap();
             let mut current_node = entry_point;
-            let mut visited = VisitedGuard::new(self.max_node_id);
+            let mut visited = VisitedGuard::new(self.nodes.len());
 
             // Phase 1: Greedy descent (unfiltered — we don't filter hub nodes)
             for layer in (1..=self.max_layer).rev() {
@@ -926,8 +1056,8 @@ impl HNSW {
                     layer_candidates,
                     accessor,
                 );
-                if let Some((nearest_id, _)) = layer_candidates.first() {
-                    current_node = *nearest_id;
+                if let Some((nearest_idx, _)) = layer_candidates.first() {
+                    current_node = *nearest_idx;
                 }
             }
 
@@ -952,6 +1082,11 @@ impl HNSW {
         // closures may safely perform re-entrant searches.
         candidates
             .into_iter()
+            .filter_map(|(idx, dist)| {
+                self.nodes
+                    .get(idx)
+                    .and_then(|node| usize::try_from(node.id).ok().map(|id| (id, dist)))
+            })
             .filter(|(id, _)| predicate(*id))
             .take(k)
             .map(|(id, dist)| (id, -dist))
@@ -1101,7 +1236,7 @@ impl HNSW {
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+                let norm_sq: f32 = dot_product(v, v);
                 (i, norm_sq)
             })
             .collect::<Vec<_>>();

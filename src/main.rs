@@ -278,6 +278,10 @@ enum Commands {
         #[arg(long, default_value = "64")]
         max_tag_len: usize,
 
+        /// Maximum bytes accepted for idempotency keys at ingest boundary
+        #[arg(long, default_value = "64")]
+        max_idempotency_key_len: usize,
+
         /// Flight decode chunk warning threshold in milliseconds
         #[arg(long, default_value = "20")]
         flight_decode_warn_ms: u64,
@@ -651,6 +655,7 @@ async fn main() -> anyhow::Result<()> {
             max_tag_registry_size,
             max_tags_per_vector,
             max_tag_len,
+            max_idempotency_key_len,
             flight_decode_warn_ms,
             vector_madvise_mode,
             flight_host,
@@ -681,6 +686,7 @@ async fn main() -> anyhow::Result<()> {
             config.max_tag_registry_size = max_tag_registry_size;
             config.max_tags_per_vector = max_tags_per_vector.max(1);
             config.max_tag_len = max_tag_len.max(1);
+            config.max_idempotency_key_len = max_idempotency_key_len.max(1);
             config.flight_decode_warn_ms = flight_decode_warn_ms.max(1);
             config.vector_madvise_mode = parse_vector_madvise_mode(&vector_madvise_mode)?;
 
@@ -858,18 +864,19 @@ where
 }
 
 fn validate_graph_bounds(hnsw: &HNSW, max_id_exclusive: usize) -> anyhow::Result<()> {
+    let node_count = hnsw.nodes.len();
     if let Some(entry) = hnsw.entry_point {
-        if entry >= max_id_exclusive {
+        if entry >= node_count {
             anyhow::bail!(
-                "entry_point {} out of bounds for {} vectors",
+                "entry_point idx {} out of bounds for {} nodes",
                 entry,
-                max_id_exclusive
+                node_count
             );
         }
     }
 
     for node in &hnsw.nodes {
-        if node.id >= max_id_exclusive {
+        if node.id >= max_id_exclusive as u64 {
             anyhow::bail!(
                 "node id {} out of bounds for {} vectors",
                 node.id,
@@ -879,11 +886,11 @@ fn validate_graph_bounds(hnsw: &HNSW, max_id_exclusive: usize) -> anyhow::Result
 
         for neighbors in &node.layers {
             for &neighbor in neighbors {
-                if neighbor >= max_id_exclusive {
+                if (neighbor as usize) >= node_count {
                     anyhow::bail!(
-                        "neighbor id {} out of bounds for {} vectors",
+                        "neighbor idx {} out of bounds for {} nodes",
                         neighbor,
-                        max_id_exclusive
+                        node_count
                     );
                 }
             }

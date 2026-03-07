@@ -95,7 +95,12 @@ async fn v2_ingest(
             );
         }
     };
-    let idempotency_key = body.idempotency_key.clone();
+    let idempotency_key = match validate_idempotency_key(&state, body.idempotency_key.clone()) {
+        Ok(v) => v,
+        Err(msg) => {
+            return error_response(StatusCode::BAD_REQUEST, &request_id, "bad_request", msg, None);
+        }
+    };
     let vector = body.vector.clone();
     let incoming_bytes = ProductionState::estimate_ingest_entry_bytes(
         &vector,
@@ -256,7 +261,8 @@ async fn v2_ingest_batch(
         .into_iter()
         .map(|req| -> std::result::Result<_, String> {
             let meta = ingest_metadata_to_input(&state, &req.metadata)?;
-            Ok((req.vector, meta, req.idempotency_key))
+            let idempotency_key = validate_idempotency_key(&state, req.idempotency_key)?;
+            Ok((req.vector, meta, idempotency_key))
         })
         .collect::<std::result::Result<Vec<_>, _>>();
     let entries = match entries {
@@ -1072,6 +1078,24 @@ fn is_valid_tag(tag: &str) -> bool {
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':'))
 }
 
+fn validate_idempotency_key(
+    state: &ProductionState,
+    key: Option<String>,
+) -> std::result::Result<Option<String>, String> {
+    if let Some(k) = key {
+        if k.len() > state.config.max_idempotency_key_len {
+            return Err(format!(
+                "idempotency key too long: max={} actual={}",
+                state.config.max_idempotency_key_len,
+                k.len()
+            ));
+        }
+        Ok(Some(k))
+    } else {
+        Ok(None)
+    }
+}
+
 fn classify_ingest_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
     let msg = err.to_string();
     let lower = msg.to_ascii_lowercase();
@@ -1084,8 +1108,18 @@ fn classify_ingest_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
     if lower.contains("dimension mismatch") {
         return (StatusCode::BAD_REQUEST, "bad_request");
     }
+    if lower.contains("idempotency key too long") {
+        return (StatusCode::BAD_REQUEST, "bad_request");
+    }
     if lower.contains("resource exhausted") || lower.contains("resource_exhausted") {
         return (StatusCode::TOO_MANY_REQUESTS, "resource_exhausted");
+    }
+    if lower.contains("join error")
+        || lower.contains("panic")
+        || lower.contains("data integrity fault")
+        || lower.contains("internal")
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
     }
     if lower.contains("unique constraint failed") || lower.contains("constraint failed") {
         return (StatusCode::CONFLICT, "conflict");
@@ -1093,7 +1127,7 @@ fn classify_ingest_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
     if lower.contains("sqlite query failed") || lower.contains("sqlite exec failed") {
         return (StatusCode::INTERNAL_SERVER_ERROR, "storage_error");
     }
-    (StatusCode::BAD_REQUEST, "bad_request")
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
 }
 
 fn classify_query_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
@@ -1105,10 +1139,17 @@ fn classify_query_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
     if lower.contains("dimension mismatch") {
         return (StatusCode::BAD_REQUEST, "bad_request");
     }
+    if lower.contains("join error")
+        || lower.contains("panic")
+        || lower.contains("data integrity fault")
+        || lower.contains("internal")
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+    }
     if lower.contains("sqlite query failed") || lower.contains("sqlite exec failed") {
         return (StatusCode::INTERNAL_SERVER_ERROR, "storage_error");
     }
-    (StatusCode::BAD_REQUEST, "bad_request")
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
 }
 
 fn classify_identify_error(err: &anyhow::Error) -> (StatusCode, &'static str) {

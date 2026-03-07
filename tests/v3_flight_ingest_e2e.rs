@@ -416,3 +416,68 @@ async fn flight_ingest_requires_auth_and_rejects_dim_mismatch() {
 
     stop_server(&mut server).await;
 }
+
+#[tokio::test]
+async fn flight_ingest_rejects_oversized_idempotency_key() {
+    let dir = tempdir().expect("tempdir");
+    let data_dir: PathBuf = dir.path().join("flight_idempotency_limit_data");
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+
+    if reserve_local_port().is_none() {
+        eprintln!("skipping flight idempotency e2e: localhost bind unavailable");
+        return;
+    }
+    let Some(http_port) = reserve_local_port() else {
+        eprintln!("skipping flight idempotency e2e: localhost http bind unavailable");
+        return;
+    };
+    let Some(flight_port) = reserve_local_port() else {
+        eprintln!("skipping flight idempotency e2e: localhost flight bind unavailable");
+        return;
+    };
+
+    let token = create_api_key(&data_dir).expect("create api key");
+    let base_url = format!("http://127.0.0.1:{http_port}");
+    let flight_endpoint = format!("http://127.0.0.1:{flight_port}");
+
+    let mut server = start_server(&data_dir, http_port, flight_port)
+        .await
+        .expect("start serve-v3");
+
+    if let Err(e) = wait_for_ready(&base_url, &token).await {
+        stop_server_with_logs(&mut server).await;
+        panic!("ready check failed: {e}");
+    }
+    if let Err(e) = wait_for_flight_ready(&flight_endpoint).await {
+        stop_server_with_logs(&mut server).await;
+        panic!("flight readiness check failed: {e}");
+    }
+
+    let long_key = "x".repeat(65);
+    let batch = build_batch(
+        &[FlightRow {
+            vector: vec![0.2; DIM],
+            entity_id: 1,
+            sequence_ts: 100,
+            payload: b"oversize-idempotency".to_vec(),
+            idempotency_key: Some(long_key),
+        }],
+        DIM,
+    );
+    let err = flight_do_put(&flight_endpoint, Some(&token), batch)
+        .await
+        .expect_err("expected oversized idempotency key rejection");
+    match err {
+        FlightError::Tonic(status) => {
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            assert!(
+                status.message().contains("idempotency key too long"),
+                "unexpected error message: {}",
+                status.message()
+            );
+        }
+        other => panic!("unexpected flight error: {other:?}"),
+    }
+
+    stop_server(&mut server).await;
+}
