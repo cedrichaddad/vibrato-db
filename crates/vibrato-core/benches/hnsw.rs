@@ -44,7 +44,7 @@ fn bench_insert(c: &mut Criterion) {
                         42,
                     );
                     for i in 0..n {
-                        hnsw.insert(i);
+                        hnsw.insert(i as u64, &vectors[i]);
                     }
                     black_box(hnsw.nodes.len())
                 })
@@ -68,7 +68,7 @@ fn bench_search(c: &mut Criterion) {
     let mut hnsw =
         HNSW::new_with_accessor_and_seed(16, 100, move |id, sink| sink(&vectors_clone[id]), 42);
     for i in 0..num_vectors {
-        hnsw.insert(i);
+        hnsw.insert(i as u64, &vectors[i]);
     }
 
     let mut group = c.benchmark_group("hnsw_search");

@@ -156,7 +156,7 @@ impl EdgeRuntime {
             42,
         );
         for id in 0..base_store.count {
-            base_hnsw.insert(id);
+            base_hnsw.insert(id as u64, base_store.get(id));
         }
         base_hnsw
     }
@@ -251,6 +251,9 @@ impl EdgeRuntime {
         };
 
         for (id, score) in self.base_hnsw.search(&normalized, k.max(32), ef.max(k)) {
+            let id = usize::try_from(id).unwrap_or_else(|_| {
+                panic!("data integrity fault: edge search id overflow id={id}")
+            });
             consider(id, score);
         }
         for ov in &self.overlay {
@@ -552,7 +555,7 @@ pub extern "C" fn vibrato_edge_build(
             42,
         );
         for id in 0..num_vectors {
-            hnsw.insert(id);
+            hnsw.insert(id as u64, &vectors[id]);
         }
 
         clear_last_error();
@@ -640,7 +643,10 @@ pub extern "C" fn vibrato_search_batch(
             let out_start = qi * k;
             let mut ri = 0usize;
             for (id, score) in &results {
-                out_ids[out_start + ri] = *id;
+                let id = usize::try_from(*id).unwrap_or_else(|_| {
+                    panic!("data integrity fault: edge ffi id overflow id={id}")
+                });
+                out_ids[out_start + ri] = id;
                 out_scores[out_start + ri] = *score;
                 ri += 1;
                 if ri >= k {

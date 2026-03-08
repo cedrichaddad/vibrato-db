@@ -75,7 +75,7 @@ fn rebuild_hnsw(store: Arc<VectorStore>) -> HNSW {
     let mut hnsw =
         HNSW::new_with_accessor_and_seed(16, 100, move |id, sink| sink(store_for_hnsw.get(id)), 42);
     for id in 0..store.count {
-        hnsw.insert(id);
+        hnsw.insert(id as u64, store.get(id));
     }
     hnsw
 }
@@ -225,7 +225,9 @@ pub unsafe extern "C" fn vibrato_search(
             if i >= k {
                 break;
             }
-            out_ids[i] = *id;
+            out_ids[i] = usize::try_from(*id).unwrap_or_else(|_| {
+                panic!("data integrity fault: ffi id overflow id={id}")
+            });
             out_scores[i] = *score;
             i += 1;
         }

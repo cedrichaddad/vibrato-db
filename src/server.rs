@@ -263,9 +263,12 @@ async fn search(
         results: results
             .into_iter()
             .map(|(id, score)| SearchResult {
-                id,
+                id: usize::try_from(id)
+                    .unwrap_or_else(|_| panic!("data integrity fault: search id overflow id={id}")),
                 score,
-                metadata: metadata_for_id(id),
+                metadata: metadata_for_id(usize::try_from(id).unwrap_or_else(|_| {
+                    panic!("data integrity fault: search id overflow id={id}")
+                })),
             })
             .collect(),
         query_time_ms,
@@ -384,13 +387,17 @@ async fn ingest(
     let current_dynamic_count = dynamic.len();
     let new_id = id_offset + current_dynamic_count;
     dynamic.push(vector); // move, no extra clone
+    let inserted_vector = dynamic
+        .last()
+        .cloned()
+        .unwrap_or_else(|| panic!("data integrity fault: dynamic vector missing after push"));
     dynamic_metadata.push(metadata);
     drop(dynamic_metadata);
     drop(dynamic); // Release lock quickly
 
     // 3. Insert into HNSW (write lock)
     let mut index = state.index.write();
-    index.insert(new_id); // This will call the closure
+    index.insert(new_id as u64, &inserted_vector); // This will call the closure
 
     (
         StatusCode::CREATED,
@@ -548,7 +555,14 @@ async fn run_flush_job(
                 });
 
             for id in 0..(current_store.count + snapshot_vectors.len()) {
-                rebuilt.insert(id);
+                if id < current_store.count {
+                    rebuilt.insert(id as u64, current_store.get(id));
+                } else {
+                    let offset = id - current_store.count;
+                    if let Some(v) = snapshot_vectors.get(offset) {
+                        rebuilt.insert(id as u64, v.as_slice());
+                    }
+                }
             }
 
             let mut merged_metadata =

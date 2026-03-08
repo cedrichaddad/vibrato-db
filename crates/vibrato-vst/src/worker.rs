@@ -156,7 +156,7 @@ impl VibratoWorker {
                                 sink(store_clone.get(id))
                             });
                             for i in 0..store.count {
-                                hnsw.insert(i);
+                                hnsw.insert(i as u64, store.get(i));
                             }
                             self.searcher = Some((store.clone(), hnsw));
                         }
@@ -272,13 +272,19 @@ impl VibratoWorker {
             vectors.push(embedding);
             vectors.len() - 1
         };
-        self.overlay_hnsw.insert(local_id);
+        let vectors = self.overlay_vectors.read();
+        let query = vectors.get(local_id).unwrap_or_else(|| {
+            panic!("data integrity fault: overlay vector missing local_id={local_id}")
+        });
+        self.overlay_hnsw.insert(local_id as u64, query);
         self.overlay_metadata.insert(local_id, path);
     }
 
-    fn map_base_results(&self, hits: Vec<(usize, f32)>) -> Vec<SearchResult> {
+    fn map_base_results(&self, hits: Vec<(u64, f32)>) -> Vec<SearchResult> {
         hits.into_iter()
             .map(|(id, score)| {
+                let id = usize::try_from(id)
+                    .unwrap_or_else(|_| panic!("data integrity fault: vst base id overflow id={id}"));
                 let path = self
                     .metadata
                     .get(&id)
@@ -289,10 +295,13 @@ impl VibratoWorker {
             .collect()
     }
 
-    fn map_overlay_results(&self, hits: Vec<(usize, f32)>) -> Vec<SearchResult> {
+    fn map_overlay_results(&self, hits: Vec<(u64, f32)>) -> Vec<SearchResult> {
         let base_id = self.overlay_base_id();
         hits.into_iter()
             .map(|(local_id, score)| {
+                let local_id = usize::try_from(local_id).unwrap_or_else(|_| {
+                    panic!("data integrity fault: vst overlay id overflow id={local_id}")
+                });
                 let path = self
                     .overlay_metadata
                     .get(&local_id)

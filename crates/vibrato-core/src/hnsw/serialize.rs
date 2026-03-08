@@ -318,23 +318,27 @@ mod tests {
 
     #[test]
     fn vibgrph2_roundtrip_preserves_ids_and_edges() {
-        let vectors: HashMap<usize, Vec<f32>> =
-            [(10usize, make_vec(0.2)), (42usize, make_vec(0.8))]
+        let vectors: HashMap<u64, Vec<f32>> =
+            [(10u64, make_vec(0.2)), (42u64, make_vec(0.8))]
                 .into_iter()
                 .collect();
+        let ordered_ids = [10u64, 42u64];
         let vectors_for_build = vectors.clone();
-        let mut hnsw = HNSW::new_with_accessor(8, 64, move |id, sink| {
+        let mut hnsw = HNSW::new_with_accessor(8, 64, move |node_idx, sink| {
+            let id = ordered_ids[node_idx];
             sink(vectors_for_build.get(&id).expect("missing vector"))
         });
-        hnsw.insert(10);
-        hnsw.insert(42);
+        hnsw.insert(10, vectors.get(&10).expect("missing vector 10"));
+        hnsw.insert(42, vectors.get(&42).expect("missing vector 42"));
 
         let mut bytes = Vec::new();
         hnsw.serialize(&mut bytes).expect("serialize vibgrph2");
 
+        let ordered_ids = [10u64, 42u64];
         let vectors_for_load = vectors.clone();
         let mut cursor = Cursor::new(bytes);
-        let loaded = HNSW::load_from_reader_with_accessor(&mut cursor, move |id, sink| {
+        let loaded = HNSW::load_from_reader_with_accessor(&mut cursor, move |node_idx, sink| {
+            let id = ordered_ids[node_idx];
             sink(vectors_for_load.get(&id).expect("missing vector"))
         })
         .expect("load vibgrph2");
@@ -370,13 +374,15 @@ mod tests {
         bytes.extend_from_slice(&(1u32).to_le_bytes()); // layer 0 neighbor count
         bytes.extend_from_slice(&(10u32).to_le_bytes()); // neighbor id
 
-        let vectors: HashMap<usize, Vec<f32>> =
-            [(10usize, make_vec(0.2)), (42usize, make_vec(0.8))]
+        let vectors: HashMap<u64, Vec<f32>> =
+            [(10u64, make_vec(0.2)), (42u64, make_vec(0.8))]
                 .into_iter()
                 .collect();
+        let ordered_ids = [10u64, 42u64];
         let vectors_for_load = vectors.clone();
         let mut cursor = Cursor::new(bytes);
-        let loaded = HNSW::load_from_reader_with_accessor(&mut cursor, move |id, sink| {
+        let loaded = HNSW::load_from_reader_with_accessor(&mut cursor, move |node_idx, sink| {
+            let id = ordered_ids[node_idx];
             sink(vectors_for_load.get(&id).expect("missing vector"))
         })
         .expect("load legacy vibgraph");

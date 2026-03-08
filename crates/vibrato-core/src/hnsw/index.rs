@@ -134,7 +134,6 @@ impl QueryScratch {
 }
 
 struct InsertScratch {
-    query: Vec<f32>,
     search: SearchScratch,
     layer_candidates: Vec<(usize, f32)>,
     reverse_edges: Vec<(usize, usize, u32)>,
@@ -148,7 +147,6 @@ impl InsertScratch {
     #[inline]
     fn new(initial_ef: usize) -> Self {
         Self {
-            query: Vec::with_capacity(64),
             search: SearchScratch::new(initial_ef.max(1)),
             layer_candidates: Vec::with_capacity(256),
             reverse_edges: Vec::with_capacity(256),
@@ -203,6 +201,7 @@ pub struct HNSW {
 /// Type-erased vector accessor.
 ///
 /// Callback style avoids allocating/cloning vectors on the hot search path.
+/// The accessor key is the dense internal `node_idx` (0..nodes.len()).
 type VectorAccessor = Box<dyn Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync>;
 type VectorAccessorRef<'a> = &'a (dyn Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync);
 
@@ -212,7 +211,7 @@ impl HNSW {
     /// # Parameters
     /// - `m`: Max neighbors per layer (typically 12-48)
     /// - `ef_construction`: Search depth during build (typically 100-200)
-    /// - `vector_fn`: Function to get vector by ID
+    /// - `vector_fn`: Function to get vector by dense node index
     pub fn new<F>(m: usize, ef_construction: usize, vector_fn: F) -> Self
     where
         F: Fn(usize) -> Vec<f32> + Send + Sync + 'static,
@@ -229,7 +228,7 @@ impl HNSW {
             m,
             ef_construction,
             move |id, sink| {
-                let v = vector_fn(id as usize);
+                let v = vector_fn(id);
                 sink(&v);
             },
             seed,
@@ -263,7 +262,7 @@ impl HNSW {
             m0: m * 2,
             ml: 1.0 / (m as f64).ln(),
             ef_construction,
-            vectors: Box::new(move |id, sink| vector_fn(id as usize, sink)),
+            vectors: Box::new(move |id, sink| vector_fn(id, sink)),
             rng: StdRng::seed_from_u64(seed),
         }
     }
@@ -298,34 +297,46 @@ impl HNSW {
             m0,
             ml,
             ef_construction,
-            vectors: Box::new(move |id, sink| vector_fn(id as usize, sink)),
+            vectors: Box::new(move |id, sink| vector_fn(id, sink)),
             rng: StdRng::seed_from_u64(rand::random()),
         }
     }
 
     #[inline]
-    fn with_vector_from(
+    fn with_vector_at_idx(
         &self,
-        id: usize,
+        node_idx: usize,
         accessor: Option<VectorAccessorRef<'_>>,
         sink: &mut dyn FnMut(&[f32]),
     ) {
         if let Some(accessor) = accessor {
-            accessor(id, sink);
+            accessor(node_idx, sink);
         } else {
-            (self.vectors)(id, sink);
+            (self.vectors)(node_idx, sink);
         }
     }
 
     /// Returns true if `id` is present in the graph.
     #[inline]
-    pub fn contains_id(&self, id: usize) -> bool {
-        self.id_to_index.contains_key(&(id as u64))
+    pub fn contains_id(&self, id: u64) -> bool {
+        self.id_to_index.contains_key(&id)
+    }
+
+    /// Resolve external/global ID to dense internal node index.
+    #[inline]
+    pub fn node_index_for_id(&self, id: u64) -> Option<usize> {
+        self.id_to_index.get(&id).copied()
+    }
+
+    /// Resolve dense internal node index to external/global ID.
+    #[inline]
+    pub fn id_for_node_idx(&self, node_idx: usize) -> Option<u64> {
+        self.nodes.get(node_idx).map(|n| n.id)
     }
 
     /// Score a node ID against a query vector if that node exists.
     #[inline]
-    pub fn score_for_id(&self, query: &[f32], id: usize) -> Option<f32> {
+    pub fn score_for_id(&self, query: &[f32], id: u64) -> Option<f32> {
         self.score_for_id_with_optional_accessor(query, id, None)
     }
 
@@ -333,7 +344,7 @@ impl HNSW {
     pub fn score_for_id_with_accessor(
         &self,
         query: &[f32],
-        id: usize,
+        id: u64,
         accessor: VectorAccessorRef<'_>,
     ) -> Option<f32> {
         self.score_for_id_with_optional_accessor(query, id, Some(accessor))
@@ -343,15 +354,45 @@ impl HNSW {
     fn score_for_id_with_optional_accessor(
         &self,
         query: &[f32],
-        id: usize,
+        id: u64,
         accessor: Option<VectorAccessorRef<'_>>,
     ) -> Option<f32> {
-        let id64 = id as u64;
-        if !self.id_to_index.contains_key(&id64) {
+        let node_idx = *self.id_to_index.get(&id)?;
+        let mut score = 0.0f32;
+        self.with_vector_at_idx(node_idx, accessor, &mut |node_vec| {
+            score = dot_product(query, node_vec);
+        });
+        Some(score)
+    }
+
+    /// Score a dense internal node index.
+    #[inline]
+    pub fn score_for_node_idx(&self, query: &[f32], node_idx: usize) -> Option<f32> {
+        self.score_for_node_idx_with_optional_accessor(query, node_idx, None)
+    }
+
+    #[inline]
+    pub fn score_for_node_idx_with_accessor(
+        &self,
+        query: &[f32],
+        node_idx: usize,
+        accessor: VectorAccessorRef<'_>,
+    ) -> Option<f32> {
+        self.score_for_node_idx_with_optional_accessor(query, node_idx, Some(accessor))
+    }
+
+    #[inline]
+    fn score_for_node_idx_with_optional_accessor(
+        &self,
+        query: &[f32],
+        node_idx: usize,
+        accessor: Option<VectorAccessorRef<'_>>,
+    ) -> Option<f32> {
+        if self.nodes.get(node_idx).is_none() {
             return None;
         }
         let mut score = 0.0f32;
-        self.with_vector_from(id, accessor, &mut |node_vec| {
+        self.with_vector_at_idx(node_idx, accessor, &mut |node_vec| {
             score = dot_product(query, node_vec);
         });
         Some(score)
@@ -360,12 +401,12 @@ impl HNSW {
     #[inline]
     fn copy_vector_into_with_optional_accessor(
         &self,
-        id: usize,
+        node_idx: usize,
         out: &mut Vec<f32>,
         accessor: Option<VectorAccessorRef<'_>>,
     ) {
         out.clear();
-        self.with_vector_from(id, accessor, &mut |v| {
+        self.with_vector_at_idx(node_idx, accessor, &mut |v| {
             if out.capacity() < v.len() {
                 out.reserve(v.len() - out.capacity());
             }
@@ -382,16 +423,8 @@ impl HNSW {
         node_idx: usize,
         accessor: Option<VectorAccessorRef<'_>>,
     ) -> f32 {
-        let node_id = self
-            .nodes
-            .get(node_idx)
-            .map(|n| n.id)
-            .unwrap_or_else(|| panic!("data integrity fault: missing node index {node_idx}"));
-        let node_id = usize::try_from(node_id).unwrap_or_else(|_| {
-            panic!("data integrity fault: vector id {node_id} does not fit usize accessor")
-        });
         let mut dist = 0.0f32;
-        self.with_vector_from(node_id, accessor, &mut |node_vec| {
+        self.with_vector_at_idx(node_idx, accessor, &mut |node_vec| {
             dist = -dot_product(query, node_vec);
         });
         dist
@@ -406,24 +439,30 @@ impl HNSW {
     /// Insert a vector into the index
     ///
     /// # Parameters
-    /// - `id`: Vector ID (index into VectorStore)
-    pub fn insert(&mut self, id: usize) {
-        self.insert_with_optional_accessor(id, None);
+    /// - `id`: External/global vector ID
+    /// - `query`: Vector payload for the inserted ID
+    pub fn insert(&mut self, id: u64, query: &[f32]) -> usize {
+        self.insert_with_optional_accessor(id, query, None)
     }
 
-    pub fn insert_with_accessor(&mut self, id: usize, accessor: VectorAccessorRef<'_>) {
-        self.insert_with_optional_accessor(id, Some(accessor));
+    pub fn insert_with_accessor(
+        &mut self,
+        id: u64,
+        query: &[f32],
+        accessor: VectorAccessorRef<'_>,
+    ) -> usize {
+        self.insert_with_optional_accessor(id, query, Some(accessor))
     }
 
     fn insert_with_optional_accessor(
         &mut self,
-        id: usize,
+        id: u64,
+        query: &[f32],
         accessor: Option<VectorAccessorRef<'_>>,
-    ) {
-        let id64 = id as u64;
+    ) -> usize {
         // Idempotent insert guard for checkpoint catch-up/replay paths.
-        if self.id_to_index.contains_key(&id64) {
-            return;
+        if let Some(existing_idx) = self.id_to_index.get(&id).copied() {
+            return existing_idx;
         }
         if self.nodes.len() >= u32::MAX as usize {
             panic!(
@@ -435,7 +474,6 @@ impl HNSW {
         INSERT_SCRATCH.with(|slot| {
             let mut slot = slot.borrow_mut();
             let InsertScratch {
-                query,
                 search,
                 layer_candidates,
                 reverse_edges,
@@ -445,7 +483,6 @@ impl HNSW {
                 neighbor_candidates,
             } = &mut *slot;
 
-            self.copy_vector_into_with_optional_accessor(id, query, accessor);
             layer_candidates.clear();
             reverse_edges.clear();
             prune_ops.clear();
@@ -458,15 +495,15 @@ impl HNSW {
                 .expect("data integrity fault: node index conversion overflow");
 
             // Create node
-            let mut node = Node::new(id64, node_layer);
+            let mut node = Node::new(id, node_layer);
 
             // First node becomes entry point
             if self.entry_point.is_none() {
                 self.entry_point = Some(0);
                 self.max_layer = node_layer;
-                self.id_to_index.insert(id64, 0); // First node always at index 0
+                self.id_to_index.insert(id, 0); // First node always at index 0
                 self.nodes.push(node);
-                return;
+                return 0;
             }
 
             let entry_point = self.entry_point.unwrap();
@@ -477,7 +514,7 @@ impl HNSW {
             // Greedy search, single best neighbor per layer
             for layer in (node_layer + 1..=self.max_layer).rev() {
                 self.search_layer_into_with_accessor(
-                    query.as_slice(),
+                    query,
                     &[current_node],
                     1,
                     layer,
@@ -500,7 +537,7 @@ impl HNSW {
 
                 // Find candidates for this layer.
                 self.search_layer_into_with_accessor(
-                    query.as_slice(),
+                    query,
                     &[current_node],
                     self.ef_construction,
                     layer,
@@ -512,7 +549,7 @@ impl HNSW {
 
                 // Select neighbors using the heuristic.
                 let neighbors = self.select_neighbors_with_accessor(
-                    query.as_slice(),
+                    query,
                     layer_candidates,
                     m_layer,
                     accessor,
@@ -542,48 +579,21 @@ impl HNSW {
                             neighbor_candidates
                                 .reserve(all_neighbors.len() - neighbor_candidates.capacity());
                         }
-                        let neighbor_id = self
-                            .nodes
-                            .get(neighbor_idx)
-                            .map(|n| n.id)
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "data integrity fault: missing neighbor node_idx={neighbor_idx}"
-                                )
-                            });
-                        let neighbor_id = usize::try_from(neighbor_id).unwrap_or_else(|_| {
-                            panic!(
-                                "data integrity fault: neighbor id does not fit usize accessor"
-                            )
-                        });
                         self.copy_vector_into_with_optional_accessor(
-                            neighbor_id,
+                            neighbor_idx,
                             neighbor_vec,
                             accessor,
                         );
                         for &n in all_neighbors.iter() {
                             let n_idx = n as usize;
-                            let n_id = if n_idx == new_node_idx {
-                                id
-                            } else {
-                                let external = self.nodes
-                                    .get(n_idx)
-                                    .map(|node| node.id)
-                                    .unwrap_or_else(|| {
-                                        panic!(
-                                            "data integrity fault: missing prune node_idx={n_idx}"
-                                        )
-                                    });
-                                usize::try_from(external).unwrap_or_else(|_| {
-                                    panic!(
-                                        "data integrity fault: prune id does not fit usize accessor"
-                                    )
-                                })
-                            };
                             let mut dist = 0.0f32;
-                            self.with_vector_from(n_id, accessor, &mut |v| {
-                                dist = -dot_product(neighbor_vec.as_slice(), v);
-                            });
+                            if n_idx == new_node_idx {
+                                dist = -dot_product(neighbor_vec.as_slice(), query);
+                            } else {
+                                self.with_vector_at_idx(n_idx, accessor, &mut |v| {
+                                    dist = -dot_product(neighbor_vec.as_slice(), v);
+                                });
+                            }
                             neighbor_candidates.push((n_idx, dist));
                         }
 
@@ -592,7 +602,7 @@ impl HNSW {
                             neighbor_candidates,
                             m_layer,
                             accessor,
-                            Some((new_node_idx, query.as_slice())),
+                            Some((new_node_idx, query)),
                         );
                         let pruned_ids: Vec<u32> = pruned
                             .iter()
@@ -638,9 +648,10 @@ impl HNSW {
             }
 
             // Add to id_to_index map before pushing.
-            self.id_to_index.insert(id64, new_node_idx);
+            self.id_to_index.insert(id, new_node_idx);
             self.nodes.push(node);
-        });
+            new_node_idx
+        })
     }
 
     /// Search for nearest neighbors on a single layer
@@ -753,9 +764,7 @@ impl HNSW {
         sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
         let mut result: Vec<(usize, f32)> = Vec::with_capacity(m);
-        let mut candidate_vec_scratch = Vec::new();
         if let Some((virtual_idx, virtual_vec)) = virtual_candidate {
-            let mut existing_vec_scratch = Vec::new();
             for &(candidate_idx, candidate_dist) in &sorted {
                 if result.len() >= m {
                     break;
@@ -764,60 +773,45 @@ impl HNSW {
                 // Check if candidate is closer to query than to any existing result
                 let mut is_diverse = true;
                 if candidate_idx == virtual_idx {
-                    candidate_vec_scratch.clear();
-                    candidate_vec_scratch.extend_from_slice(virtual_vec);
-                } else {
-                    let candidate_id = self
-                        .nodes
-                        .get(candidate_idx)
-                        .map(|n| n.id)
-                        .unwrap_or_else(|| {
-                            panic!("data integrity fault: missing candidate node_idx={candidate_idx}")
-                        });
-                    let candidate_id = usize::try_from(candidate_id).unwrap_or_else(|_| {
-                        panic!("data integrity fault: candidate id does not fit usize accessor")
-                    });
-                    self.copy_vector_into_with_optional_accessor(
-                        candidate_id,
-                        &mut candidate_vec_scratch,
-                        accessor,
-                    );
-                }
-
-                for &(existing_idx, _) in &result {
-                    let dist_to_existing: f32 = if existing_idx == virtual_idx {
-                        -dot_product(candidate_vec_scratch.as_slice(), virtual_vec)
-                    } else {
-                        let existing_id = self
-                            .nodes
-                            .get(existing_idx)
-                            .map(|n| n.id)
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "data integrity fault: missing existing node_idx={existing_idx}"
-                                )
+                    for &(existing_idx, _) in &result {
+                        let dist_to_existing: f32 = if existing_idx == virtual_idx {
+                            -dot_product(virtual_vec, virtual_vec)
+                        } else {
+                            let mut dist = 0.0f32;
+                            self.with_vector_at_idx(existing_idx, accessor, &mut |existing_vec| {
+                                dist = -dot_product(virtual_vec, existing_vec);
                             });
-                        let existing_id = usize::try_from(existing_id).unwrap_or_else(|_| {
-                            panic!("data integrity fault: existing id does not fit usize accessor")
-                        });
-                        existing_vec_scratch.clear();
-                        self.copy_vector_into_with_optional_accessor(
-                            existing_id,
-                            &mut existing_vec_scratch,
-                            accessor,
-                        );
-                        -dot_product(
-                            candidate_vec_scratch.as_slice(),
-                            existing_vec_scratch.as_slice(),
-                        )
-                    };
+                            dist
+                        };
 
-                    if dist_to_existing < candidate_dist {
-                        // Candidate is closer to existing neighbor than to query.
-                        // This means the existing neighbor "covers" this direction.
-                        is_diverse = false;
-                        break;
+                        if dist_to_existing < candidate_dist {
+                            // Candidate is closer to existing neighbor than to query.
+                            // This means the existing neighbor "covers" this direction.
+                            is_diverse = false;
+                            break;
+                        }
                     }
+                } else {
+                    self.with_vector_at_idx(candidate_idx, accessor, &mut |candidate_vec| {
+                        for &(existing_idx, _) in &result {
+                            let dist_to_existing: f32 = if existing_idx == virtual_idx {
+                                -dot_product(candidate_vec, virtual_vec)
+                            } else {
+                                let mut dist = 0.0f32;
+                                self.with_vector_at_idx(existing_idx, accessor, &mut |existing_vec| {
+                                    dist = -dot_product(candidate_vec, existing_vec);
+                                });
+                                dist
+                            };
+
+                            if dist_to_existing < candidate_dist {
+                                // Candidate is closer to existing neighbor than to query.
+                                // This means the existing neighbor "covers" this direction.
+                                is_diverse = false;
+                                break;
+                            }
+                        }
+                    });
                 }
 
                 if is_diverse {
@@ -830,43 +824,19 @@ impl HNSW {
                     break;
                 }
                 let mut is_diverse = true;
-                let candidate_id = self
-                    .nodes
-                    .get(candidate_idx)
-                    .map(|n| n.id)
-                    .unwrap_or_else(|| {
-                        panic!("data integrity fault: missing candidate node_idx={candidate_idx}")
-                    });
-                let candidate_id = usize::try_from(candidate_id).unwrap_or_else(|_| {
-                    panic!("data integrity fault: candidate id does not fit usize accessor")
-                });
-                self.copy_vector_into_with_optional_accessor(
-                    candidate_id,
-                    &mut candidate_vec_scratch,
-                    accessor,
-                );
-                for &(existing_idx, _) in &result {
-                    let existing_id = self
-                        .nodes
-                        .get(existing_idx)
-                        .map(|n| n.id)
-                        .unwrap_or_else(|| {
-                            panic!("data integrity fault: missing existing node_idx={existing_idx}")
+                self.with_vector_at_idx(candidate_idx, accessor, &mut |candidate_vec| {
+                    for &(existing_idx, _) in &result {
+                        let mut dist_to_existing = 0.0f32;
+                        self.with_vector_at_idx(existing_idx, accessor, &mut |existing_vec| {
+                            dist_to_existing = -dot_product(candidate_vec, existing_vec);
                         });
-                    let existing_id = usize::try_from(existing_id).unwrap_or_else(|_| {
-                        panic!("data integrity fault: existing id does not fit usize accessor")
-                    });
-                    let mut dist_to_existing = 0.0f32;
-                    self.with_vector_from(existing_id, accessor, &mut |existing_vec| {
-                        dist_to_existing =
-                            -dot_product(candidate_vec_scratch.as_slice(), existing_vec);
-                    });
 
-                    if dist_to_existing < candidate_dist {
-                        is_diverse = false;
-                        break;
+                        if dist_to_existing < candidate_dist {
+                            is_diverse = false;
+                            break;
+                        }
                     }
-                }
+                });
                 if is_diverse {
                     result.push((candidate_idx, candidate_dist));
                 }
@@ -897,7 +867,7 @@ impl HNSW {
     ///
     /// # Returns
     /// Vector of (id, score) pairs, sorted by score descending
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(usize, f32)> {
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         self.search_with_optional_accessor(query, k, ef, None)
     }
 
@@ -907,7 +877,7 @@ impl HNSW {
         k: usize,
         ef: usize,
         accessor: VectorAccessorRef<'_>,
-    ) -> Vec<(usize, f32)> {
+    ) -> Vec<(u64, f32)> {
         self.search_with_optional_accessor(query, k, ef, Some(accessor))
     }
 
@@ -917,7 +887,7 @@ impl HNSW {
         k: usize,
         ef: usize,
         accessor: Option<VectorAccessorRef<'_>>,
-    ) -> Vec<(usize, f32)> {
+    ) -> Vec<(u64, f32)> {
         if self.entry_point.is_none() {
             return Vec::new();
         }
@@ -965,11 +935,7 @@ impl HNSW {
             layer_candidates
                 .iter()
                 .take(k)
-                .filter_map(|(idx, dist)| {
-                    self.nodes.get(*idx).and_then(|node| {
-                        usize::try_from(node.id).ok().map(|id| (id, -*dist))
-                    })
-                })
+                .filter_map(|(idx, dist)| self.nodes.get(*idx).map(|node| (node.id, -*dist)))
                 .collect()
         })
     }
@@ -998,7 +964,7 @@ impl HNSW {
         k: usize,
         ef: usize,
         predicate: P,
-    ) -> Vec<(usize, f32)>
+    ) -> Vec<(u64, f32)>
     where
         P: Fn(usize) -> bool,
     {
@@ -1012,7 +978,7 @@ impl HNSW {
         ef: usize,
         predicate: P,
         accessor: VectorAccessorRef<'_>,
-    ) -> Vec<(usize, f32)>
+    ) -> Vec<(u64, f32)>
     where
         P: Fn(usize) -> bool,
     {
@@ -1026,7 +992,7 @@ impl HNSW {
         ef: usize,
         predicate: P,
         accessor: Option<VectorAccessorRef<'_>>,
-    ) -> Vec<(usize, f32)>
+    ) -> Vec<(u64, f32)>
     where
         P: Fn(usize) -> bool,
     {
@@ -1082,14 +1048,9 @@ impl HNSW {
         // closures may safely perform re-entrant searches.
         candidates
             .into_iter()
-            .filter_map(|(idx, dist)| {
-                self.nodes
-                    .get(idx)
-                    .and_then(|node| usize::try_from(node.id).ok().map(|id| (id, dist)))
-            })
-            .filter(|(id, _)| predicate(*id))
+            .filter(|(idx, _)| predicate(*idx))
             .take(k)
-            .map(|(id, dist)| (id, -dist))
+            .filter_map(|(idx, dist)| self.nodes.get(idx).map(|node| (node.id, -dist)))
             .collect()
     }
 
@@ -1129,7 +1090,7 @@ impl HNSW {
         k: usize,
         ef: usize,
         total_vectors: usize,
-    ) -> Vec<(usize, f32)> {
+    ) -> Vec<(u64, f32)> {
         self.search_subsequence_with_predicate_and_optional_accessor(
             query_sequence,
             k,
@@ -1147,7 +1108,7 @@ impl HNSW {
         ef: usize,
         total_vectors: usize,
         accessor: VectorAccessorRef<'_>,
-    ) -> Vec<(usize, f32)> {
+    ) -> Vec<(u64, f32)> {
         self.search_subsequence_with_predicate_and_optional_accessor(
             query_sequence,
             k,
@@ -1168,9 +1129,9 @@ impl HNSW {
         ef: usize,
         total_vectors: usize,
         is_valid_id: F,
-    ) -> Vec<(usize, f32)>
+    ) -> Vec<(u64, f32)>
     where
-        F: FnMut(usize) -> bool,
+        F: FnMut(u64) -> bool,
     {
         self.search_subsequence_with_predicate_and_optional_accessor(
             query_sequence,
@@ -1190,9 +1151,9 @@ impl HNSW {
         total_vectors: usize,
         is_valid_id: F,
         accessor: VectorAccessorRef<'_>,
-    ) -> Vec<(usize, f32)>
+    ) -> Vec<(u64, f32)>
     where
-        F: FnMut(usize) -> bool,
+        F: FnMut(u64) -> bool,
     {
         self.search_subsequence_with_predicate_and_optional_accessor(
             query_sequence,
@@ -1212,9 +1173,9 @@ impl HNSW {
         total_vectors: usize,
         mut is_valid_id: F,
         accessor: Option<VectorAccessorRef<'_>>,
-    ) -> Vec<(usize, f32)>
+    ) -> Vec<(u64, f32)>
     where
-        F: FnMut(usize) -> bool,
+        F: FnMut(u64) -> bool,
     {
         if query_sequence.is_empty() || self.entry_point.is_none() {
             return Vec::new();
@@ -1258,7 +1219,7 @@ impl HNSW {
             anchor_offsets.push(salience.first().map(|(i, _)| *i).unwrap_or(0));
         }
 
-        let mut best_by_start: FxHashMap<usize, f32> = FxHashMap::default();
+        let mut best_by_start: FxHashMap<u64, f32> = FxHashMap::default();
         let anchor_overfetch = (k.saturating_mul(6)).max(32);
 
         for salient_offset in anchor_offsets {
@@ -1267,25 +1228,28 @@ impl HNSW {
                 self.search_with_optional_accessor(salient_query, anchor_overfetch, ef, accessor);
 
             for (anchor_id, _anchor_score) in &anchor_candidates {
-                let start_id = if *anchor_id >= salient_offset {
-                    anchor_id - salient_offset
+                let start_id = if *anchor_id >= salient_offset as u64 {
+                    anchor_id - salient_offset as u64
                 } else {
                     continue;
                 };
 
-                if start_id + seq_len > total_vectors {
+                if start_id.saturating_add(seq_len as u64) > total_vectors as u64 {
                     continue;
                 }
 
                 let mut total_sim = 0.0f32;
                 let mut valid = true;
                 for (offset, query_vec) in query_sequence.iter().enumerate() {
-                    let vec_id = start_id + offset;
-                    if vec_id >= total_vectors || !is_valid_id(vec_id) {
+                    let vec_id = start_id.saturating_add(offset as u64);
+                    if vec_id >= total_vectors as u64 || !is_valid_id(vec_id) {
                         valid = false;
                         break;
                     }
-                    self.with_vector_from(vec_id, accessor, &mut |stored_vec| {
+                    let vec_idx = *self.id_to_index.get(&vec_id).unwrap_or_else(|| {
+                        panic!("data integrity fault: subsequence missing vector id={vec_id}")
+                    });
+                    self.with_vector_at_idx(vec_idx, accessor, &mut |stored_vec| {
                         total_sim += dot_product(query_vec, stored_vec);
                     });
                 }
@@ -1382,7 +1346,7 @@ mod tests {
         let vectors_clone = vectors.clone();
 
         let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
-        hnsw.insert(0);
+        hnsw.insert(0, &vectors[0]);
 
         assert_eq!(hnsw.nodes.len(), 1);
         assert_eq!(hnsw.entry_point, Some(0));
@@ -1396,7 +1360,7 @@ mod tests {
         let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
 
         for i in 0..100 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         assert_eq!(hnsw.nodes.len(), 100);
@@ -1412,7 +1376,7 @@ mod tests {
         let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
 
         for i in 0..100 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         let results = hnsw.search(&query, 5, 50);
@@ -1432,7 +1396,7 @@ mod tests {
         let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
 
         for i in 0..1000 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         // Test recall with 10 random queries
@@ -1450,12 +1414,12 @@ mod tests {
                 .map(|(id, v)| (id, dot_product(&query, v)))
                 .collect();
             ground_truth.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let ground_truth_ids: std::collections::HashSet<_> =
-                ground_truth.iter().take(k).map(|(id, _)| *id).collect();
+            let ground_truth_ids: std::collections::HashSet<u64> =
+                ground_truth.iter().take(k).map(|(id, _)| *id as u64).collect();
 
             // HNSW search
             let hnsw_results = hnsw.search(&query, k, 50);
-            let hnsw_ids: std::collections::HashSet<_> =
+            let hnsw_ids: std::collections::HashSet<u64> =
                 hnsw_results.iter().map(|(id, _)| *id).collect();
 
             // Calculate recall
@@ -1492,7 +1456,7 @@ mod tests {
 
         let mut hnsw = HNSW::new(8, 50, move |id| vectors_clone[id].clone());
         for i in 0..10 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         // Request more results than exist
@@ -1510,7 +1474,7 @@ mod tests {
 
         let mut hnsw = HNSW::new(8, 50, move |id| vectors_clone[id].clone());
         for i in 0..10 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         let query = random_vector(64);
@@ -1527,7 +1491,7 @@ mod tests {
 
         let mut hnsw = HNSW::new(8, 50, move |id| vectors_clone[id].clone());
         for i in 0..50 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         // Very large ef should not panic
@@ -1544,7 +1508,7 @@ mod tests {
 
         let mut hnsw = HNSW::new(16, 50, move |id| vectors_clone[id].clone());
         for i in 0..100 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         // Verify every node has correct id_to_index mapping
@@ -1567,7 +1531,7 @@ mod tests {
 
         let mut hnsw = HNSW::new(16, 50, move |id| vectors_clone[id].clone());
         for i in 0..100 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         let stats = hnsw.stats();
@@ -1585,7 +1549,7 @@ mod tests {
         let vectors_clone = vectors.clone();
 
         let mut hnsw = HNSW::new(8, 50, move |id| vectors_clone[id].clone());
-        hnsw.insert(0);
+        hnsw.insert(0, &vectors[0]);
 
         let results = hnsw.search(&query, 5, 50);
 
@@ -1602,7 +1566,7 @@ mod tests {
 
         let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
         for i in 0..20 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         // Each vector should be its own top-1 result
@@ -1610,7 +1574,7 @@ mod tests {
             let results = hnsw.search(&vectors[i], 1, 100);
             assert!(!results.is_empty(), "Should find at least one result");
             assert_eq!(
-                results[0].0, i,
+                results[0].0, i as u64,
                 "Vector {} should find itself as top result",
                 i
             );
@@ -1628,8 +1592,8 @@ mod tests {
         let mut hnsw2 = HNSW::new(16, 50, move |id| vectors2[id].clone());
 
         for i in 0..50 {
-            hnsw1.insert(i);
-            hnsw2.insert(i);
+            hnsw1.insert(i as u64, &vectors[i]);
+            hnsw2.insert(i as u64, &vectors[i]);
         }
 
         // Note: Due to RNG in layer assignment, graphs may differ
@@ -1650,7 +1614,7 @@ mod tests {
 
         let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
         for i in 0..100 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         // Filter to only even IDs
@@ -1677,7 +1641,7 @@ mod tests {
 
         let mut hnsw = HNSW::new(8, 50, move |id| vectors_clone[id].clone());
         for i in 0..50 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         // Filter that rejects everything
@@ -1697,7 +1661,7 @@ mod tests {
 
         let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
         for i in 0..50 {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         // Query with the exact sub-sequence at positions 10..15
@@ -1728,7 +1692,7 @@ mod tests {
         let vectors_clone = vectors.clone();
         let mut hnsw = HNSW::new(16, 100, move |id| vectors_clone[id].clone());
         for i in 0..vectors.len() {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         // Query length exceeds total vectors; function must return without panic.
@@ -1754,7 +1718,7 @@ mod tests {
 
         let mut hnsw = HNSW::new(16, 120, move |id| vectors_clone[id].clone());
         for i in 0..vectors.len() {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         let mut query_seq: Vec<Vec<f32>> = (40..52).map(|i| vectors[i].clone()).collect();
@@ -1772,7 +1736,7 @@ mod tests {
 
     #[test]
     fn test_search_with_sparse_ids_is_safe() {
-        let ids = [0usize, 1024, 1028, 2056];
+        let ids = [0u64, 1024, 1028, 2056];
         let mut map = HashMap::new();
         for id in ids {
             map.insert(id, random_vector(32));
@@ -1780,15 +1744,18 @@ mod tests {
 
         let map_for_accessor = map.clone();
         let zero = vec![0.0f32; 32];
-        let mut hnsw = HNSW::new_with_accessor(16, 100, move |id, sink| {
+        let ordered_ids = [0u64, 1024, 1028, 2056];
+        let mut hnsw = HNSW::new_with_accessor(16, 100, move |node_idx, sink| {
+            let id = ordered_ids[node_idx];
             if let Some(v) = map_for_accessor.get(&id) {
                 sink(v);
             } else {
                 sink(&zero);
             }
         });
-        for id in [0usize, 1024, 1028, 2056] {
-            hnsw.insert(id);
+        for id in ordered_ids {
+            let query = map.get(&id).expect("sparse id must exist");
+            hnsw.insert(id, query);
         }
 
         let query = map.get(&1028).unwrap().clone();
@@ -1815,7 +1782,7 @@ mod tests {
         let vectors_clone = vectors.clone();
         let mut hnsw = HNSW::new(8, 64, move |id| vectors_clone[id].clone());
         for i in 0..vectors.len() {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         let query_seq = vectors[10..15].to_vec();

@@ -14,7 +14,6 @@ use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use rayon::ThreadPool;
-use scc::hash_map::Entry as SccEntry;
 use scc::HashMap as SccHashMap;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -221,6 +220,7 @@ pub struct SegmentHandle {
     pub record: SegmentRecord,
     pub store: Arc<VectorStore>,
     pub index: Arc<RwLock<HNSW>>,
+    pub filter_index: HashMap<u32, BitmapSet>,
 }
 
 pub struct ArchivePqSegment {
@@ -232,7 +232,47 @@ pub struct ArchivePqSegment {
 
 pub struct HotShard {
     pub vectors: FastIdMap<Arc<Vec<f32>>>,
+    pub dense_vectors: Vec<Arc<Vec<f32>>>,
     pub index: HNSW,
+    pub filter_index: HashMap<u32, BitmapSet>,
+}
+
+#[derive(Clone, Default)]
+struct ResolvedTagFilter {
+    tags_all_ids: Vec<u32>,
+    tags_any_ids: Vec<u32>,
+}
+
+fn build_local_allow_set(
+    local_index: &HashMap<u32, BitmapSet>,
+    resolved: &ResolvedTagFilter,
+) -> Option<BitmapSet> {
+    let mut allow: Option<BitmapSet> = None;
+
+    if !resolved.tags_all_ids.is_empty() {
+        for tag_id in &resolved.tags_all_ids {
+            let bm = local_index.get(tag_id).cloned().unwrap_or_default();
+            allow = Some(match allow {
+                Some(curr) => curr.intersect(&bm),
+                None => bm,
+            });
+        }
+    }
+
+    if !resolved.tags_any_ids.is_empty() {
+        let mut any_union = BitmapSet::default();
+        for tag_id in &resolved.tags_any_ids {
+            if let Some(bm) = local_index.get(tag_id) {
+                any_union.union_with(bm);
+            }
+        }
+        allow = Some(match allow {
+            Some(curr) => curr.intersect(&any_union),
+            None => any_union,
+        });
+    }
+
+    allow
 }
 
 pub struct ProductionState {
@@ -248,9 +288,6 @@ pub struct ProductionState {
     pub metadata_cache: Arc<SccHashMap<usize, VectorMetadataV3>>,
     pub segments: ArcSwap<Vec<Arc<SegmentHandle>>>,
     pub archive_segments: ArcSwap<Vec<Arc<ArchivePqSegment>>>,
-    pub filter_index: Arc<SccHashMap<u32, BitmapSet>>,
-    filter_allow_cache: Arc<SccHashMap<String, (u64, Arc<BitmapSet>)>>,
-    filter_cache_epoch: AtomicU64,
     pub retired_segments: std::sync::Mutex<HashMap<String, Weak<SegmentHandle>>>,
 
     pub metrics: Metrics,
@@ -355,13 +392,13 @@ impl ProductionState {
             .map(|_| {
                 RwLock::new(HotShard {
                     vectors: FastIdMap::default(),
+                    dense_vectors: Vec::new(),
                     index: make_empty_hot_hnsw(config.hnsw_m, config.hnsw_ef_construction),
+                    filter_index: HashMap::new(),
                 })
             })
             .collect::<Vec<_>>();
         let metadata_cache = Arc::new(SccHashMap::new());
-        let filter_index = Arc::new(SccHashMap::new());
-        let filter_allow_cache = Arc::new(SccHashMap::new());
         let background_cancel = CancellationToken::new();
         let (audit_tx, audit_rx) = sync_channel(4096);
         let (ingest_writer_tx, ingest_writer_rx) =
@@ -417,9 +454,6 @@ impl ProductionState {
             metadata_cache,
             segments: ArcSwap::from_pointee(Vec::new()),
             archive_segments: ArcSwap::from_pointee(Vec::new()),
-            filter_index,
-            filter_allow_cache,
-            filter_cache_epoch: AtomicU64::new(1),
             retired_segments: std::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
             ingest_writer_tx,
@@ -833,44 +867,45 @@ impl ProductionState {
             .get(shard)
             .unwrap_or_else(|| panic!("data integrity fault: missing hot shard {}", shard));
         let mut shard_guard = shard_lock.write();
-        let HotShard { vectors, index } = &mut *shard_guard;
-        if vectors.contains_key(&vector_id) {
-            // Duplicate replay/race path: avoid duplicate graph work, but heal
-            // potential map/index skew if the ID was present in vectors only.
-            if !index.contains_id(vector_id) {
-                let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                    let vector = vectors.get(&id).unwrap_or_else(|| {
-                        panic!("data integrity fault: hot shard missing id={id} shard={shard}")
-                    });
-                    sink(vector.as_slice());
-                };
-                index.insert_with_accessor(vector_id, &accessor);
-            }
-            return;
-        }
-
-        vectors.insert(vector_id, Arc::new(vector));
-        let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-            let vector = vectors.get(&id).unwrap_or_else(|| {
-                panic!("data integrity fault: hot shard missing id={id} shard={shard}")
+        let HotShard {
+            vectors,
+            dense_vectors,
+            index,
+            filter_index,
+        } = &mut *shard_guard;
+        let vector_arc = Arc::new(vector);
+        let accessor = |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
+            let vector = dense_vectors.get(node_idx).unwrap_or_else(|| {
+                panic!(
+                    "data integrity fault: hot shard missing node_idx={} shard={}",
+                    node_idx, shard
+                )
             });
             sink(vector.as_slice());
         };
-        index.insert_with_accessor(vector_id, &accessor);
-        self.metadata_cache.upsert(vector_id, metadata.clone());
-        for tag_id in &metadata.tags {
-            match self.filter_index.entry(*tag_id) {
-                SccEntry::Occupied(mut entry) => {
-                    entry.get_mut().insert(vector_id);
-                }
-                SccEntry::Vacant(entry) => {
-                    let mut set = BitmapSet::default();
-                    set.insert(vector_id);
-                    entry.insert_entry(set);
-                }
+        let node_idx = index.insert_with_accessor(vector_id as u64, vector_arc.as_slice(), &accessor);
+        if node_idx == dense_vectors.len() {
+            dense_vectors.push(Arc::clone(&vector_arc));
+            vectors.insert(vector_id, Arc::clone(&vector_arc));
+            for tag_id in &metadata.tags {
+                filter_index
+                    .entry(*tag_id)
+                    .or_default()
+                    .insert(node_idx);
             }
+            self.metadata_cache.upsert(vector_id, metadata.clone());
+        } else if !vectors.contains_key(&vector_id) {
+            let existing = dense_vectors.get(node_idx).unwrap_or_else(|| {
+                panic!(
+                    "data integrity fault: hot shard missing duplicate node_idx={} shard={}",
+                    node_idx, shard
+                )
+            });
+            vectors.insert(vector_id, Arc::clone(existing));
+            return;
+        } else {
+            return;
         }
-        self.bump_filter_cache_epoch();
         self.hot_vectors_bytes
             .fetch_add(vector_bytes, AtomicOrdering::Relaxed);
         self.metadata_cache_bytes
@@ -1010,32 +1045,43 @@ impl ProductionState {
                 .get(shard)
                 .unwrap_or_else(|| panic!("data integrity fault: missing hot shard {}", shard));
             let mut shard_guard = shard_lock.write();
-            let HotShard { vectors, index } = &mut *shard_guard;
+            let HotShard {
+                vectors,
+                dense_vectors,
+                index,
+                filter_index,
+            } = &mut *shard_guard;
             for item in items {
-                if vectors.contains_key(&item.vector_id) {
-                    // Replay/idempotency overlap: skip full insert, but keep
-                    // graph consistent if this ID was missing from HNSW.
-                    if !index.contains_id(item.vector_id) {
-                        let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                            let vector = vectors.get(&id).unwrap_or_else(|| {
-                                panic!(
-                                    "data integrity fault: hot shard missing id={id} shard={shard}"
-                                )
-                            });
-                            sink(vector.as_slice());
-                        };
-                        index.insert_with_accessor(item.vector_id, &accessor);
-                    }
-                    continue;
-                }
-                vectors.insert(item.vector_id, Arc::new(item.vector));
-                let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                    let vector = vectors.get(&id).unwrap_or_else(|| {
-                        panic!("data integrity fault: hot shard missing id={id} shard={shard}")
+                let vector_arc = Arc::new(item.vector);
+                let accessor = |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
+                    let vector = dense_vectors.get(node_idx).unwrap_or_else(|| {
+                        panic!(
+                            "data integrity fault: hot shard missing node_idx={} shard={}",
+                            node_idx, shard
+                        )
                     });
                     sink(vector.as_slice());
                 };
-                index.insert_with_accessor(item.vector_id, &accessor);
+                let node_idx =
+                    index.insert_with_accessor(item.vector_id as u64, vector_arc.as_slice(), &accessor);
+                if node_idx == dense_vectors.len() {
+                    dense_vectors.push(Arc::clone(&vector_arc));
+                    vectors.insert(item.vector_id, Arc::clone(&vector_arc));
+                    for tag_id in &item.metadata.tags {
+                        filter_index
+                            .entry(*tag_id)
+                            .or_default()
+                            .insert(node_idx);
+                    }
+                } else if !vectors.contains_key(&item.vector_id) {
+                    let existing = dense_vectors.get(node_idx).unwrap_or_else(|| {
+                        panic!(
+                            "data integrity fault: hot shard missing duplicate node_idx={} shard={}",
+                            node_idx, shard
+                        )
+                    });
+                    vectors.insert(item.vector_id, Arc::clone(existing));
+                }
             }
         };
 
@@ -1068,18 +1114,6 @@ impl ProductionState {
                     (vec_len as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
                 );
                 self.metadata_cache.upsert(vector_id, metadata.clone());
-                for tag_id in &metadata.tags {
-                    match self.filter_index.entry(*tag_id) {
-                        SccEntry::Occupied(mut entry) => {
-                            entry.get_mut().insert(vector_id);
-                        }
-                        SccEntry::Vacant(entry) => {
-                            let mut set = BitmapSet::default();
-                            set.insert(vector_id);
-                            entry.insert_entry(set);
-                        }
-                    }
-                }
             }
 
             self.metadata_cache_bytes
@@ -1093,7 +1127,6 @@ impl ProductionState {
             self.metrics
                 .ingest_total
                 .fetch_add(created_count as u64, AtomicOrdering::Relaxed);
-            self.bump_filter_cache_epoch();
             self.update_hot_window_from_created_range(min_created_id, max_created_id_exclusive);
         }
 
@@ -1114,13 +1147,11 @@ impl ProductionState {
             ));
         }
 
-        let allow_bitmap = request.filter.as_ref().and_then(|f| {
-            if f.is_empty() {
-                None
-            } else {
-                self.cached_allow_set(f)
-            }
-        });
+        let resolved_filter = if let Some(filter) = request.filter.as_ref() {
+            self.resolve_filter_tag_ids(filter)?
+        } else {
+            None
+        };
 
         let mut best: FastIdMap<f32> = FastIdMap::default();
         let hot_shard_ef = effective_hot_shard_ef(request.k, request.ef, self.hot_shards.len());
@@ -1132,11 +1163,21 @@ impl ProductionState {
                     .enumerate()
                     .map(|(shard, shard_lock)| {
                         let shard_guard = shard_lock.read();
-                        let HotShard { vectors, index } = &*shard_guard;
-                        let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                            let vector = vectors.get(&id).unwrap_or_else(|| {
+                        let HotShard {
+                            dense_vectors,
+                            index,
+                            filter_index,
+                            ..
+                        } = &*shard_guard;
+                        let local_allow =
+                            resolved_filter
+                                .as_ref()
+                                .and_then(|resolved| build_local_allow_set(filter_index, resolved));
+                        let accessor = |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
+                            let vector = dense_vectors.get(node_idx).unwrap_or_else(|| {
                                 panic!(
-                                    "data integrity fault: hot shard missing id={id} shard={shard}"
+                                    "data integrity fault: hot shard missing node_idx={} shard={}",
+                                    node_idx, shard
                                 )
                             });
                             sink(vector.as_slice());
@@ -1146,7 +1187,7 @@ impl ProductionState {
                             &request.vector,
                             request.k,
                             hot_shard_ef,
-                            allow_bitmap.as_deref(),
+                            local_allow.as_ref(),
                             Some(FlatScanHint::HotShard {
                                 shard,
                                 shard_mask: self.shard_mask,
@@ -1176,12 +1217,15 @@ impl ProductionState {
                 .filter(|seg| raw_tier_allowed(seg.record.level))
                 .map(|seg| {
                     let index = seg.index.read();
+                    let local_allow = resolved_filter
+                        .as_ref()
+                        .and_then(|resolved| build_local_allow_set(&seg.filter_index, resolved));
                     search_index_with_dynamic_fallback(
                         &index,
                         &request.vector,
                         request.k,
                         request.ef,
-                        allow_bitmap.as_deref(),
+                        local_allow.as_ref(),
                         None,
                         None,
                     )
@@ -1204,7 +1248,7 @@ impl ProductionState {
                             seg,
                             &request.vector,
                             request.k,
-                            allow_bitmap.as_deref(),
+                            None,
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1333,23 +1377,17 @@ impl ProductionState {
                         .enumerate()
                         .map(|(shard_idx, shard_lock)| {
                             let shard_guard = shard_lock.read();
-                            let HotShard { vectors, index } = &*shard_guard;
+                            let HotShard {
+                                dense_vectors,
+                                index,
+                                ..
+                            } = &*shard_guard;
                             let metadata_cache = metadata_cache.clone();
-                            let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                                let target_shard = id & self.shard_mask;
-                                if target_shard == shard_idx {
-                                    let vector = vectors.get(&id).unwrap_or_else(|| {
-                                        panic!(
-                                            "data integrity fault: hot shard missing id={id} shard={shard_idx}"
-                                        )
-                                    });
-                                    sink(vector.as_slice());
-                                    return;
-                                }
-                                let other_guard = self.hot_shards[target_shard].read();
-                                let vector = other_guard.vectors.get(&id).unwrap_or_else(|| {
+                            let accessor = |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
+                                let vector = dense_vectors.get(node_idx).unwrap_or_else(|| {
                                     panic!(
-                                        "data integrity fault: hot shard missing id={id} shard={target_shard}"
+                                        "data integrity fault: hot shard missing node_idx={} shard={}",
+                                        node_idx, shard_idx
                                     )
                                 });
                                 sink(vector.as_slice());
@@ -1360,9 +1398,12 @@ impl ProductionState {
                                 request.ef.max(request.k),
                                 hot_max_id_exclusive,
                                 move |id| {
-                                    id >= hot_min_id
-                                        && id < hot_max_id_exclusive
-                                        && metadata_cache.contains(&id)
+                                    id >= hot_min_id as u64
+                                        && id < hot_max_id_exclusive as u64
+                                        && usize::try_from(id)
+                                            .ok()
+                                            .map(|id| metadata_cache.contains(&id))
+                                            .unwrap_or(false)
                                 },
                                 &accessor,
                             )
@@ -1371,19 +1412,26 @@ impl ProductionState {
                 });
                 for shard_results in results {
                     for (start_id, score) in shard_results {
-                        if start_id < hot_min_id
-                            || start_id.saturating_add(seq_len) > hot_max_id_exclusive
+                        if start_id < hot_min_id as u64
+                            || start_id.saturating_add(seq_len as u64)
+                                > hot_max_id_exclusive as u64
                         {
                             continue;
                         }
                         if (0..seq_len).any(|offset| {
-                            let id = start_id + offset;
-                            id < hot_min_id
-                                || id >= hot_max_id_exclusive
-                                || !metadata_cache.contains(&id)
+                            let id = start_id + offset as u64;
+                            id < hot_min_id as u64
+                                || id >= hot_max_id_exclusive as u64
+                                || usize::try_from(id)
+                                    .ok()
+                                    .map(|id| !metadata_cache.contains(&id))
+                                    .unwrap_or(true)
                         }) {
                             continue;
                         }
+                        let start_id = usize::try_from(start_id).unwrap_or_else(|_| {
+                            panic!("data integrity fault: identify start id overflow id={start_id}")
+                        });
                         merge_best(&mut best, start_id, score);
                     }
                 }
@@ -1408,15 +1456,16 @@ impl ProductionState {
                                 request.k,
                                 request.ef.max(request.k),
                                 max_exclusive,
-                                move |id| id >= min_start && id < max_exclusive,
+                                move |id| id >= min_start as u64 && id < max_exclusive as u64,
                             )
                         };
 
                         local
                             .into_iter()
                             .filter(|(start_id, _)| {
-                                *start_id >= min_start
-                                    && start_id.saturating_add(seq_len) <= max_exclusive
+                                *start_id >= min_start as u64
+                                    && start_id.saturating_add(seq_len as u64)
+                                        <= max_exclusive as u64
                             })
                             .collect::<Vec<_>>()
                     })
@@ -1425,6 +1474,9 @@ impl ProductionState {
 
             for results in segment_results {
                 for (start_id, score) in results {
+                    let start_id = usize::try_from(start_id).unwrap_or_else(|_| {
+                        panic!("data integrity fault: segment identify id overflow id={start_id}")
+                    });
                     merge_best(&mut best, start_id, score);
                 }
             }
@@ -2519,28 +2571,46 @@ impl ProductionState {
         // 1. Build shadow shard map/index pairs in parallel.
         let shadow_shards: Vec<HotShard> = pending_by_shard
             .into_par_iter()
-            .map(|entries| {
+            .map(|mut entries| {
                 let mut vectors: FastIdMap<Arc<Vec<f32>>> = FastIdMap::default();
                 vectors.reserve(entries.len());
-                for entry in entries {
-                    vectors.insert(entry.vector_id, Arc::new(entry.vector));
-                }
+                let mut dense_vectors: Vec<Arc<Vec<f32>>> = Vec::with_capacity(entries.len());
+                let mut filter_index: HashMap<u32, BitmapSet> = HashMap::new();
+                entries.sort_by_key(|e| e.vector_id);
 
                 let mut index =
                     make_empty_hot_hnsw(self.config.hnsw_m, self.config.hnsw_ef_construction);
-                let mut ids = vectors.keys().copied().collect::<Vec<_>>();
-                ids.sort_unstable();
-                for vector_id in ids {
-                    let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                        let vector = vectors.get(&id).unwrap_or_else(|| {
-                            panic!("data integrity fault: rebuilding hot shard missing id={id}")
+                for entry in entries {
+                    let vector_id = entry.vector_id;
+                    let vector_arc = Arc::new(entry.vector);
+                    let accessor = |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
+                        let vector = dense_vectors.get(node_idx).unwrap_or_else(|| {
+                            panic!(
+                                "data integrity fault: rebuilding hot shard missing node_idx={node_idx}"
+                            )
                         });
                         sink(vector.as_slice());
                     };
-                    index.insert_with_accessor(vector_id, &accessor);
+                    let node_idx =
+                        index.insert_with_accessor(vector_id as u64, vector_arc.as_slice(), &accessor);
+                    if node_idx == dense_vectors.len() {
+                        dense_vectors.push(Arc::clone(&vector_arc));
+                        vectors.insert(vector_id, Arc::clone(&vector_arc));
+                        for tag_id in &entry.metadata.tags {
+                            filter_index
+                                .entry(*tag_id)
+                                .or_default()
+                                .insert(node_idx);
+                        }
+                    }
                 }
 
-                HotShard { vectors, index }
+                HotShard {
+                    vectors,
+                    dense_vectors,
+                    index,
+                    filter_index,
+                }
             })
             .collect();
 
@@ -2570,32 +2640,43 @@ impl ProductionState {
             }
             let shard_lock = &self.hot_shards[shard_idx];
             let mut shard_guard = shard_lock.write();
-            let HotShard { vectors, index } = &mut *shard_guard;
+            let HotShard {
+                vectors,
+                dense_vectors,
+                index,
+                filter_index,
+            } = &mut *shard_guard;
             for entry in entries {
-                if vectors.contains_key(&entry.vector_id) {
-                    if !index.contains_id(entry.vector_id) {
-                        let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                            let vector = vectors.get(&id).unwrap_or_else(|| {
-                                panic!(
-                                    "data integrity fault: catch-up hot shard missing id={id} shard={shard_idx}"
-                                )
-                            });
-                            sink(vector.as_slice());
-                        };
-                        index.insert_with_accessor(entry.vector_id, &accessor);
-                    }
-                    continue;
-                }
-                vectors.insert(entry.vector_id, Arc::new(entry.vector));
-                let accessor = |id: usize, sink: &mut dyn FnMut(&[f32])| {
-                    let vector = vectors.get(&id).unwrap_or_else(|| {
+                let vector_arc = Arc::new(entry.vector);
+                let accessor = |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
+                    let vector = dense_vectors.get(node_idx).unwrap_or_else(|| {
                         panic!(
-                            "data integrity fault: catch-up hot shard missing id={id} shard={shard_idx}"
+                            "data integrity fault: catch-up hot shard missing node_idx={} shard={}",
+                            node_idx, shard_idx
                         )
                     });
                     sink(vector.as_slice());
                 };
-                index.insert_with_accessor(entry.vector_id, &accessor);
+                let node_idx =
+                    index.insert_with_accessor(entry.vector_id as u64, vector_arc.as_slice(), &accessor);
+                if node_idx == dense_vectors.len() {
+                    dense_vectors.push(Arc::clone(&vector_arc));
+                    vectors.insert(entry.vector_id, Arc::clone(&vector_arc));
+                    for tag_id in &entry.metadata.tags {
+                        filter_index
+                            .entry(*tag_id)
+                            .or_default()
+                            .insert(node_idx);
+                    }
+                } else if !vectors.contains_key(&entry.vector_id) {
+                    let existing = dense_vectors.get(node_idx).unwrap_or_else(|| {
+                        panic!(
+                            "data integrity fault: catch-up missing duplicate node_idx={} shard={}",
+                            node_idx, shard_idx
+                        )
+                    });
+                    vectors.insert(entry.vector_id, Arc::clone(existing));
+                }
             }
         }
 
@@ -2634,34 +2715,41 @@ impl ProductionState {
 
     pub fn rebuild_filter_index(&self) -> Result<()> {
         let entries = self.catalog.fetch_all_metadata(&self.collection.id)?;
-        let filter_rows = self.catalog.fetch_filter_rows(&self.collection.id)?;
-
-        self.filter_index.clear();
-        for row in filter_rows {
-            for tag_id in row.tag_ids {
-                match self.filter_index.entry(tag_id) {
-                    SccEntry::Occupied(mut entry) => {
-                        entry.get_mut().insert(row.vector_id);
-                    }
-                    SccEntry::Vacant(entry) => {
-                        let mut set = BitmapSet::default();
-                        set.insert(row.vector_id);
-                        entry.insert_entry(set);
-                    }
-                }
-            }
-        }
 
         self.metadata_cache.clear();
         let mut metadata_bytes = 0u64;
         for (id, meta) in entries {
             metadata_bytes =
                 metadata_bytes.saturating_add(Self::estimate_cached_metadata_bytes(&meta));
-            self.metadata_cache.upsert(id, meta);
+            self.metadata_cache.upsert(id, meta.clone());
         }
         self.metadata_cache_bytes
             .store(metadata_bytes, AtomicOrdering::Relaxed);
-        self.bump_filter_cache_epoch();
+
+        // Rebuild localized hot-shard filter indexes using dense node_idx bitmaps.
+        for shard_lock in &self.hot_shards {
+            let mut shard_guard = shard_lock.write();
+            shard_guard.filter_index.clear();
+            let ids = shard_guard.vectors.keys().copied().collect::<Vec<_>>();
+            for vector_id in ids {
+                let Some(metadata) = self
+                    .metadata_cache
+                    .read(&vector_id, |_, meta| meta.clone())
+                else {
+                    continue;
+                };
+                let Some(node_idx) = shard_guard.index.node_index_for_id(vector_id as u64) else {
+                    continue;
+                };
+                for tag_id in metadata.tags {
+                    shard_guard
+                        .filter_index
+                        .entry(tag_id)
+                        .or_default()
+                        .insert(node_idx);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2732,8 +2820,15 @@ impl ProductionState {
         Ok(out)
     }
 
-    fn build_allow_set(&self, filter: &super::model::QueryFilter) -> Option<BitmapSet> {
-        let mut allow: Option<BitmapSet> = None;
+    fn resolve_filter_tag_ids(
+        &self,
+        filter: &super::model::QueryFilter,
+    ) -> Result<Option<ResolvedTagFilter>> {
+        if filter.is_empty() {
+            return Ok(None);
+        }
+
+        let mut resolved = ResolvedTagFilter::default();
 
         if !filter.tags_all.is_empty() {
             let mut normalized = filter
@@ -2744,25 +2839,16 @@ impl ProductionState {
                 .collect::<Vec<_>>();
             normalized.sort();
             normalized.dedup();
-
-            let tag_ids = self
+            let ids = self
                 .catalog
-                .resolve_tag_ids_readonly(&self.collection.id, &normalized)
-                .ok()?;
-            if tag_ids.len() < normalized.len() {
-                return Some(BitmapSet::default());
+                .resolve_tag_ids_readonly(&self.collection.id, &normalized)?;
+            if ids.len() < normalized.len() {
+                return Ok(Some(ResolvedTagFilter {
+                    tags_all_ids: vec![u32::MAX],
+                    tags_any_ids: Vec::new(),
+                }));
             }
-
-            for tag_id in tag_ids {
-                let bm = self
-                    .filter_index
-                    .read(&tag_id, |_, bm| bm.clone())
-                    .unwrap_or_default();
-                allow = Some(match allow {
-                    Some(curr) => curr.intersect(&bm),
-                    None => bm,
-                });
-            }
+            resolved.tags_all_ids = ids;
         }
 
         if !filter.tags_any.is_empty() {
@@ -2774,102 +2860,12 @@ impl ProductionState {
                 .collect::<Vec<_>>();
             normalized.sort();
             normalized.dedup();
-            let tag_ids = self
+            resolved.tags_any_ids = self
                 .catalog
-                .resolve_tag_ids_readonly(&self.collection.id, &normalized)
-                .ok()?;
-
-            let parallel_threshold = self.config.filter_parallel_min_shards.max(10);
-            let any_union = if tag_ids.len() > parallel_threshold {
-                self.query_pool.install(|| {
-                    tag_ids
-                        .par_iter()
-                        .filter_map(|tag_id| self.filter_index.read(tag_id, |_, bm| bm.clone()))
-                        .reduce(BitmapSet::default, |mut acc, bm| {
-                            acc.union_with(&bm);
-                            acc
-                        })
-                })
-            } else {
-                let mut union = BitmapSet::default();
-                for tag_id in tag_ids {
-                    if let Some(bm) = self.filter_index.read(&tag_id, |_, bm| bm.clone()) {
-                        union.union_with(&bm);
-                    }
-                }
-                union
-            };
-            allow = Some(match allow {
-                Some(curr) => curr.intersect(&any_union),
-                None => any_union,
-            });
+                .resolve_tag_ids_readonly(&self.collection.id, &normalized)?;
         }
 
-        allow
-    }
-
-    fn bump_filter_cache_epoch(&self) {
-        self.filter_cache_epoch
-            .fetch_add(1, AtomicOrdering::Relaxed);
-    }
-
-    fn filter_cache_key(filter: &super::model::QueryFilter) -> String {
-        let mut tags_any = filter
-            .tags_any
-            .iter()
-            .map(|t| t.trim().to_ascii_lowercase())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>();
-        tags_any.sort();
-        tags_any.dedup();
-
-        let mut tags_all = filter
-            .tags_all
-            .iter()
-            .map(|t| t.trim().to_ascii_lowercase())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>();
-        tags_all.sort();
-        tags_all.dedup();
-
-        let mut key = String::with_capacity(128);
-        key.push_str("any=");
-        key.push_str(&tags_any.join(","));
-        key.push_str("|all=");
-        key.push_str(&tags_all.join(","));
-        key
-    }
-
-    fn cached_allow_set(&self, filter: &super::model::QueryFilter) -> Option<Arc<BitmapSet>> {
-        let epoch = self.filter_cache_epoch.load(AtomicOrdering::Relaxed);
-        let key = Self::filter_cache_key(filter);
-        if let Some(hit) = self
-            .filter_allow_cache
-            .read(&key, |_, (entry_epoch, bitmap)| {
-                if *entry_epoch == epoch {
-                    Some(Arc::clone(bitmap))
-                } else {
-                    None
-                }
-            })
-            .flatten()
-        {
-            self.metrics
-                .filter_allow_cache_hits_total
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            return Some(hit);
-        }
-        self.metrics
-            .filter_allow_cache_misses_total
-            .fetch_add(1, AtomicOrdering::Relaxed);
-
-        let bitmap = Arc::new(self.build_allow_set(filter)?);
-        if self.filter_allow_cache.len() >= 512 {
-            self.filter_allow_cache.clear();
-        }
-        self.filter_allow_cache
-            .upsert(key, (epoch, Arc::clone(&bitmap)));
-        Some(bitmap)
+        Ok(Some(resolved))
     }
 
     pub fn gc_obsolete_segment_files(&self) -> Result<usize> {
@@ -2992,16 +2988,15 @@ impl ProductionState {
         let count = store.count;
         let store_for_accessor = store.clone();
         let segment_id = seg.id.clone();
-        let accessor = move |id: usize, sink: &mut dyn FnMut(&[f32])| {
-            if id >= start && id < start + count {
-                sink(store_for_accessor.get(id - start));
+        let accessor = move |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
+            if node_idx < count {
+                sink(store_for_accessor.get(node_idx));
             } else {
                 panic!(
-                    "data integrity fault: segment '{}' missing vector id={} range=[{}..{})",
+                    "data integrity fault: segment '{}' missing node_idx={} count={}",
                     segment_id,
-                    id,
-                    start,
-                    start + count
+                    node_idx,
+                    count
                 );
             }
         };
@@ -3017,15 +3012,28 @@ impl ProductionState {
                 accessor,
             );
             for offset in 0..count {
-                idx.insert(start + offset);
+                idx.insert((start + offset) as u64, store.get(offset));
             }
             idx
         };
+
+        let mut filter_index: HashMap<u32, BitmapSet> = HashMap::new();
+        let filter_rows = self.catalog.fetch_filter_rows(&self.collection.id)?;
+        for row in filter_rows {
+            if row.vector_id < start || row.vector_id >= start + count {
+                continue;
+            }
+            let node_idx = row.vector_id - start;
+            for tag_id in row.tag_ids {
+                filter_index.entry(tag_id).or_default().insert(node_idx);
+            }
+        }
 
         Ok(Arc::new(SegmentHandle {
             record: seg.clone(),
             store,
             index: Arc::new(RwLock::new(index)),
+            filter_index,
         }))
     }
 
@@ -3318,24 +3326,14 @@ fn build_index_from_pairs(
     ids: &[usize],
     vectors: &[Vec<f32>],
 ) -> HNSW {
-    let mut map: FastIdMap<Vec<f32>> = FastIdMap::default();
-    map.reserve(ids.len());
-    for (id, vec) in ids.iter().zip(vectors.iter()) {
-        map.insert(*id, vec.clone());
-    }
-    let map = Arc::new(map);
-
+    let dense_vectors = Arc::new(vectors.to_vec());
     let mut hnsw = HNSW::new_with_accessor(m, ef_construction, {
-        let map = map.clone();
-        move |id, sink| {
-            if let Some(v) = map.get(&id) {
-                sink(v);
-            }
-        }
+        let dense_vectors = dense_vectors.clone();
+        move |node_idx, sink| sink(&dense_vectors[node_idx])
     });
 
-    for id in ids {
-        hnsw.insert(*id);
+    for (idx, id) in ids.iter().enumerate() {
+        hnsw.insert(*id as u64, &vectors[idx]);
     }
     hnsw
 }
@@ -3745,11 +3743,23 @@ fn search_index_with_dynamic_fallback(
     flat_scan_hint: Option<FlatScanHint>,
     accessor: Option<&(dyn Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync)>,
 ) -> Vec<(usize, f32)> {
+    let to_usize_hits = |hits: Vec<(u64, f32)>| {
+        hits.into_iter()
+            .map(|(id, score)| {
+                (
+                    usize::try_from(id).unwrap_or_else(|_| {
+                        panic!("data integrity fault: search id overflow id={id}")
+                    }),
+                    score,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     if allow_set.is_none() {
         return if let Some(accessor) = accessor {
-            index.search_with_accessor(query, k, ef, accessor)
+            to_usize_hits(index.search_with_accessor(query, k, ef, accessor))
         } else {
-            index.search(query, k, ef)
+            to_usize_hits(index.search(query, k, ef))
         };
     }
 
@@ -3779,10 +3789,17 @@ fn search_index_with_dynamic_fallback(
 
     // Stage A (strict): evaluate only allowed IDs.
     let strict = if let Some(accessor) = accessor {
-        index.search_filtered_with_accessor(query, k, ef.max(k), |id| allow.contains(id), accessor)
+        index.search_filtered_with_accessor(
+            query,
+            k,
+            ef.max(k),
+            |node_idx| allow.contains(node_idx),
+            accessor,
+        )
     } else {
-        index.search_filtered(query, k, ef.max(k), |id| allow.contains(id))
+        index.search_filtered(query, k, ef.max(k), |node_idx| allow.contains(node_idx))
     };
+    let strict = to_usize_hits(strict);
     if strict.len() >= target_hits {
         return strict;
     }
@@ -3799,15 +3816,17 @@ fn search_index_with_dynamic_fallback(
     for mult in expansions {
         let expanded_ef = ef.max(k).saturating_mul(mult);
         let expanded = if let Some(accessor) = accessor {
-            index.search_filtered_with_accessor(
+            to_usize_hits(index.search_filtered_with_accessor(
                 query,
                 k,
                 expanded_ef,
-                |id| allow.contains(id),
+                |node_idx| allow.contains(node_idx),
                 accessor,
-            )
+            ))
         } else {
-            index.search_filtered(query, k, expanded_ef, |id| allow.contains(id))
+            to_usize_hits(index.search_filtered(query, k, expanded_ef, |node_idx| {
+                allow.contains(node_idx)
+            }))
         };
         if expanded.len() > best.len() {
             best = expanded;
@@ -3838,7 +3857,20 @@ fn search_index_with_dynamic_fallback(
         index.search(query, overfetch_k, route_ef)
     })
     .into_iter()
-    .filter(|(id, _)| allow.contains(*id))
+    .filter(|(id, _)| {
+        index
+            .node_index_for_id(*id)
+            .map(|node_idx| allow.contains(node_idx))
+            .unwrap_or(false)
+    })
+    .map(|(id, score)| {
+        (
+            usize::try_from(id).unwrap_or_else(|_| {
+                panic!("data integrity fault: routed search id overflow id={id}")
+            }),
+            score,
+        )
+    })
     .take(k)
     .collect::<Vec<_>>();
 
@@ -3888,16 +3920,23 @@ fn flat_scan_index_with_allow_set(
     }
 
     let mut heap = std::collections::BinaryHeap::with_capacity(k + 1);
-    for id in allow.iter_ids() {
+    for node_idx in allow.iter_ids() {
+        let id_u64 = if let Some(id) = index.id_for_node_idx(node_idx) {
+            id
+        } else {
+            continue;
+        };
+        let id = usize::try_from(id_u64)
+            .unwrap_or_else(|_| panic!("data integrity fault: flat-scan id overflow id={id_u64}"));
         if let Some(FlatScanHint::HotShard { shard, shard_mask }) = flat_scan_hint {
             if (id & shard_mask) != shard {
                 continue;
             }
         }
         let maybe_score = if let Some(accessor) = accessor {
-            index.score_for_id_with_accessor(query, id, accessor)
+            index.score_for_node_idx_with_accessor(query, node_idx, accessor)
         } else {
-            index.score_for_id(query, id)
+            index.score_for_node_idx(query, node_idx)
         };
         let Some(score) = maybe_score else {
             continue;
@@ -4243,7 +4282,7 @@ mod tests {
             11,
         );
         for id in 0..total {
-            index.insert(id);
+            index.insert(id as u64, &vectors[id]);
         }
 
         let target_id = total - 1;

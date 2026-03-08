@@ -58,7 +58,7 @@ fn main() {
     let mut hnsw =
         HNSW::new_with_accessor_and_seed(16, 100, move |id, sink| sink(&vectors_for_index[id]), 42);
     for id in 0..num_vectors {
-        hnsw.insert(id);
+        hnsw.insert(id as u64, &vectors[id]);
     }
 
     let mut query_rng = StdRng::seed_from_u64(0xBADC0DE);

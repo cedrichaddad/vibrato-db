@@ -457,7 +457,7 @@ async fn main() -> anyhow::Result<()> {
                     let accessor = create_accessor(shared_store.clone(), dynamic_store.clone());
                     let mut hnsw = HNSW::new_with_accessor(m, ef_construction, accessor);
                     for i in 0..store.count as usize {
-                        hnsw.insert(i);
+                        hnsw.insert(i as u64, store.get(i));
                     }
                     hnsw
                 }
@@ -466,7 +466,7 @@ async fn main() -> anyhow::Result<()> {
                 let accessor = create_accessor(shared_store.clone(), dynamic_store.clone());
                 let mut hnsw = HNSW::new_with_accessor(m, ef_construction, accessor);
                 for i in 0..store.count as usize {
-                    hnsw.insert(i);
+                    hnsw.insert(i as u64, store.get(i));
                 }
                 hnsw
             };
@@ -856,9 +856,19 @@ fn build_hnsw_from_store<F>(count: usize, m: usize, ef_construction: usize, vect
 where
     F: Fn(usize, &mut dyn FnMut(&[f32])) + Send + Sync + 'static,
 {
-    let mut hnsw = HNSW::new_with_accessor(m, ef_construction, vector_fn);
+    let vector_fn = Arc::new(vector_fn);
+    let accessor_fn = Arc::clone(&vector_fn);
+    let mut hnsw = HNSW::new_with_accessor(m, ef_construction, move |id, sink| {
+        accessor_fn(id, sink);
+    });
     for i in 0..count {
-        hnsw.insert(i);
+        let mut query = None;
+        vector_fn(i, &mut |v| {
+            query = Some(v.to_vec());
+        });
+        if let Some(query_vec) = query {
+            hnsw.insert(i as u64, &query_vec);
+        }
     }
     hnsw
 }
@@ -938,7 +948,7 @@ fn build_index(
     let progress_interval = (total / 100).max(1);
 
     for i in 0..total {
-        hnsw.insert(i);
+        hnsw.insert(i as u64, store.get(i));
 
         if i % progress_interval == 0 {
             let pct = (i as f64 / total as f64) * 100.0;
