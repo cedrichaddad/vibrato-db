@@ -1396,7 +1396,7 @@ impl ProductionState {
                                 &request.vectors,
                                 request.k,
                                 request.ef.max(request.k),
-                                hot_max_id_exclusive,
+                                hot_max_id_exclusive as u64,
                                 move |id| {
                                     id >= hot_min_id as u64
                                         && id < hot_max_id_exclusive as u64
@@ -1455,7 +1455,7 @@ impl ProductionState {
                                 &request.vectors,
                                 request.k,
                                 request.ef.max(request.k),
-                                max_exclusive,
+                                max_exclusive as u64,
                                 move |id| id >= min_start as u64 && id < max_exclusive as u64,
                             )
                         };

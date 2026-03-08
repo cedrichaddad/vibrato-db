@@ -1089,7 +1089,7 @@ impl HNSW {
         query_sequence: &[Vec<f32>],
         k: usize,
         ef: usize,
-        total_vectors: usize,
+        total_vectors: u64,
     ) -> Vec<(u64, f32)> {
         self.search_subsequence_with_predicate_and_optional_accessor(
             query_sequence,
@@ -1106,7 +1106,7 @@ impl HNSW {
         query_sequence: &[Vec<f32>],
         k: usize,
         ef: usize,
-        total_vectors: usize,
+        total_vectors: u64,
         accessor: VectorAccessorRef<'_>,
     ) -> Vec<(u64, f32)> {
         self.search_subsequence_with_predicate_and_optional_accessor(
@@ -1127,7 +1127,7 @@ impl HNSW {
         query_sequence: &[Vec<f32>],
         k: usize,
         ef: usize,
-        total_vectors: usize,
+        total_vectors: u64,
         is_valid_id: F,
     ) -> Vec<(u64, f32)>
     where
@@ -1148,7 +1148,7 @@ impl HNSW {
         query_sequence: &[Vec<f32>],
         k: usize,
         ef: usize,
-        total_vectors: usize,
+        total_vectors: u64,
         is_valid_id: F,
         accessor: VectorAccessorRef<'_>,
     ) -> Vec<(u64, f32)>
@@ -1170,7 +1170,7 @@ impl HNSW {
         query_sequence: &[Vec<f32>],
         k: usize,
         ef: usize,
-        total_vectors: usize,
+        total_vectors: u64,
         mut is_valid_id: F,
         accessor: Option<VectorAccessorRef<'_>>,
     ) -> Vec<(u64, f32)>
@@ -1234,7 +1234,7 @@ impl HNSW {
                     continue;
                 };
 
-                if start_id.saturating_add(seq_len as u64) > total_vectors as u64 {
+                if start_id.saturating_add(seq_len as u64) > total_vectors {
                     continue;
                 }
 
@@ -1242,7 +1242,7 @@ impl HNSW {
                 let mut valid = true;
                 for (offset, query_vec) in query_sequence.iter().enumerate() {
                     let vec_id = start_id.saturating_add(offset as u64);
-                    if vec_id >= total_vectors as u64 || !is_valid_id(vec_id) {
+                    if vec_id >= total_vectors || !is_valid_id(vec_id) {
                         valid = false;
                         break;
                     }
@@ -1697,7 +1697,7 @@ mod tests {
 
         // Query length exceeds total vectors; function must return without panic.
         let query_seq: Vec<Vec<f32>> = (0..8).map(|_| random_vector(16)).collect();
-        let results = hnsw.search_subsequence(&query_seq, 3, 50, vectors.len());
+        let results = hnsw.search_subsequence(&query_seq, 3, 50, vectors.len() as u64);
         assert!(results.is_empty());
     }
 
@@ -1725,7 +1725,7 @@ mod tests {
         // Inject a single high-norm outlier so the highest-salience anchor is likely wrong.
         query_seq[6] = vec![50.0; dim];
 
-        let results = hnsw.search_subsequence(&query_seq, 5, 300, vectors.len());
+        let results = hnsw.search_subsequence(&query_seq, 5, 300, vectors.len() as u64);
         assert!(results.len() <= 5, "results must be bounded by k");
         let mut seen = std::collections::HashSet::new();
         assert!(
@@ -1786,14 +1786,14 @@ mod tests {
         }
 
         let query_seq = vectors[10..15].to_vec();
-        let open = hnsw.search_subsequence(&query_seq, 5, 100, vectors.len());
+        let open = hnsw.search_subsequence(&query_seq, 5, 100, vectors.len() as u64);
         assert!(
             open.iter().any(|(start, _)| *start == 10),
             "baseline subsequence should find the exact start"
         );
 
         let blocked =
-            hnsw.search_subsequence_with_predicate(&query_seq, 5, 100, vectors.len(), |id| {
+            hnsw.search_subsequence_with_predicate(&query_seq, 5, 100, vectors.len() as u64, |id| {
                 id != 12
             });
         assert!(
