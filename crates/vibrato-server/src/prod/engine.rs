@@ -228,6 +228,7 @@ pub struct ArchivePqSegment {
     pub pq: ProductQuantizer,
     pub codes: Arc<Vec<u8>>,
     pub num_subspaces: usize,
+    pub filter_index: HashMap<u32, BitmapSet>,
 }
 
 pub struct HotShard {
@@ -1244,11 +1245,14 @@ impl ProductionState {
                 archive_snapshot
                     .par_iter()
                     .map(|seg| {
+                        let local_allow = resolved_filter
+                            .as_ref()
+                            .and_then(|resolved| build_local_allow_set(&seg.filter_index, resolved));
                         search_archive_pq_segment(
                             seg,
                             &request.vector,
                             request.k,
-                            None,
+                            local_allow.as_ref(),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -3041,12 +3045,26 @@ impl ProductionState {
         let bytes = std::fs::read(&seg.path)
             .with_context(|| format!("reading archive segment {:?}", seg.path))?;
         let (pq, codes, nsub) = parse_archive_segment_bytes(&seg.id, &bytes)?;
+        let start = seg.vector_id_start;
+        let end_exclusive = seg.vector_id_end.saturating_add(1);
+        let mut filter_index: HashMap<u32, BitmapSet> = HashMap::new();
+        let filter_rows = self.catalog.fetch_filter_rows(&self.collection.id)?;
+        for row in filter_rows {
+            if row.vector_id < start || row.vector_id >= end_exclusive {
+                continue;
+            }
+            let node_idx = row.vector_id - start;
+            for tag_id in row.tag_ids {
+                filter_index.entry(tag_id).or_default().insert(node_idx);
+            }
+        }
 
         Ok(Arc::new(ArchivePqSegment {
             record: seg.clone(),
             pq,
             codes: Arc::new(codes),
             num_subspaces: nsub,
+            filter_index,
         }))
     }
 
@@ -3693,7 +3711,7 @@ fn search_archive_pq_segment(
     for offset in 0..segment.record.row_count {
         let vector_id = segment.record.vector_id_start + offset;
         if let Some(allow) = allow_set {
-            if !allow.contains(vector_id) {
+            if !allow.contains(offset) {
                 continue;
             }
         }

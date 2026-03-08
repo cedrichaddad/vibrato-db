@@ -1801,4 +1801,33 @@ mod tests {
             "predicate hole should invalidate exact sequence alignment"
         );
     }
+
+    #[test]
+    fn test_search_subsequence_accepts_u64_total_vector_bounds() {
+        let vectors: Vec<Vec<f32>> = (0..16).map(|_| random_vector(32)).collect();
+        let vectors_clone = vectors.clone();
+        let mut hnsw = HNSW::new_with_accessor(16, 100, move |node_idx, sink| {
+            sink(&vectors_clone[node_idx]);
+        });
+
+        let high_start = u32::MAX as u64 + 128;
+        for (offset, vector) in vectors.iter().enumerate() {
+            hnsw.insert(high_start + offset as u64, vector);
+        }
+
+        let query_seq = vectors[5..10].to_vec();
+        let total_vectors = high_start + vectors.len() as u64 + 1024;
+        let results = hnsw.search_subsequence_with_predicate(
+            &query_seq,
+            4,
+            128,
+            total_vectors,
+            |id| id >= high_start && id < high_start + vectors.len() as u64,
+        );
+
+        assert!(
+            results.iter().any(|(start, _)| *start == high_start + 5),
+            "subsequence should match correctly even when total_vectors exceeds u32::MAX"
+        );
+    }
 }
