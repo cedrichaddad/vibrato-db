@@ -92,6 +92,8 @@ pub struct WalEntry {
 pub struct WalIpcBatchEntry {
     pub sequence_id: u64,
     pub row_count: usize,
+    pub vector_id_start: u64,
+    pub vector_id_end: u64,
     pub ipc_blob: Vec<u8>,
     pub created_at: i64,
 }
@@ -1549,7 +1551,7 @@ impl SqliteCatalog {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_idempotency ON wal_entries(collection_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_vector_id ON wal_entries(collection_id, vector_id)",
             "CREATE INDEX IF NOT EXISTS idx_wal_pending_by_collection_lsn ON wal_entries(collection_id, checkpointed_at, lsn)",
-            "CREATE TABLE IF NOT EXISTS wal_batches (sequence_id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id TEXT NOT NULL, row_count INTEGER NOT NULL, ipc_blob BLOB NOT NULL, checkpointed_at INTEGER, created_at INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS wal_batches (sequence_id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id TEXT NOT NULL, row_count INTEGER NOT NULL, vector_id_start INTEGER NOT NULL, vector_id_end INTEGER NOT NULL, ipc_blob BLOB NOT NULL, checkpointed_at INTEGER, created_at INTEGER NOT NULL)",
             "CREATE INDEX IF NOT EXISTS idx_wal_batches_pending_by_collection_seq ON wal_batches(collection_id, checkpointed_at, sequence_id)",
             "CREATE TABLE IF NOT EXISTS vector_metadata (collection_id TEXT NOT NULL, vector_id INTEGER NOT NULL, schema_version INTEGER NOT NULL DEFAULT 3, entity_id INTEGER NOT NULL DEFAULT 0, sequence_ts INTEGER NOT NULL DEFAULT 0, payload_blob BLOB NOT NULL DEFAULT X'', tags_blob BLOB NOT NULL DEFAULT X'', created_at INTEGER NOT NULL, PRIMARY KEY(collection_id, vector_id))",
             "CREATE INDEX IF NOT EXISTS idx_vector_metadata_collection_vector ON vector_metadata(collection_id, vector_id)",
@@ -1597,6 +1599,7 @@ impl SqliteCatalog {
         self.ensure_column("wal_entries", "vector_blob", "BLOB")?;
         self.ensure_column("wal_entries", "metadata_blob", "BLOB")?;
         self.migrate_wal_entries_v3_layout()?;
+        self.migrate_wal_batches_v2_layout()?;
         self.ensure_column("orphan_files", "size_bytes", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("orphan_files", "deleted_reason", "TEXT")?;
         self.ensure_column("api_keys", "hash_version", "INTEGER NOT NULL DEFAULT 1")?;
@@ -1786,6 +1789,66 @@ impl SqliteCatalog {
                ON wal_entries(collection_id, vector_id);
              CREATE INDEX IF NOT EXISTS idx_wal_pending_by_collection_lsn
                ON wal_entries(collection_id, checkpointed_at, lsn);
+             COMMIT;",
+        )
+    }
+
+    fn migrate_wal_batches_v2_layout(&self) -> Result<()> {
+        let rows = self.query_json("PRAGMA table_info(wal_batches);")?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut has_vector_id_start = false;
+        let mut has_vector_id_end = false;
+        for row in &rows {
+            let name = row.get("name").and_then(Value::as_str).unwrap_or_default();
+            if name == "vector_id_start" {
+                has_vector_id_start = true;
+            } else if name == "vector_id_end" {
+                has_vector_id_end = true;
+            }
+        }
+        if has_vector_id_start && has_vector_id_end {
+            return Ok(());
+        }
+
+        self.exec(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS wal_batches_v2 (
+               sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+               collection_id TEXT NOT NULL,
+               row_count INTEGER NOT NULL,
+               vector_id_start INTEGER NOT NULL,
+               vector_id_end INTEGER NOT NULL,
+               ipc_blob BLOB NOT NULL,
+               checkpointed_at INTEGER,
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO wal_batches_v2(
+               sequence_id,
+               collection_id,
+               row_count,
+               vector_id_start,
+               vector_id_end,
+               ipc_blob,
+               checkpointed_at,
+               created_at
+             )
+             SELECT
+               sequence_id,
+               collection_id,
+               row_count,
+               0,
+               0,
+               ipc_blob,
+               checkpointed_at,
+               created_at
+             FROM wal_batches;
+             DROP TABLE wal_batches;
+             ALTER TABLE wal_batches_v2 RENAME TO wal_batches;
+             CREATE INDEX IF NOT EXISTS idx_wal_batches_pending_by_collection_seq
+               ON wal_batches(collection_id, checkpointed_at, sequence_id);
              COMMIT;",
         )
     }
@@ -2959,8 +3022,10 @@ impl FromSqlRow for WalIpcBatchEntry {
         Ok(Self {
             sequence_id: column_i64(stmt, 0).max(0) as u64,
             row_count: column_i64(stmt, 1).max(0) as usize,
-            ipc_blob: column_blob_bytes(stmt, 2).to_vec(),
-            created_at: column_i64(stmt, 3),
+            vector_id_start: column_i64(stmt, 2).max(0) as u64,
+            vector_id_end: column_i64(stmt, 3).max(0) as u64,
+            ipc_blob: column_blob_bytes(stmt, 4).to_vec(),
+            created_at: column_i64(stmt, 5),
         })
     }
 }
@@ -3090,6 +3155,8 @@ impl SqliteCatalog {
         &self,
         collection_id: &str,
         row_count: usize,
+        vector_id_start: u64,
+        vector_id_end: u64,
         ipc_blob: &[u8],
     ) -> Result<u64> {
         if row_count == 0 {
@@ -3105,15 +3172,19 @@ impl SqliteCatalog {
             "INSERT INTO wal_batches(
                collection_id,
                row_count,
+               vector_id_start,
+               vector_id_end,
                ipc_blob,
                checkpointed_at,
                created_at
-             ) VALUES (?1, ?2, ?3, NULL, ?4);",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6);",
         )?;
         insert_stmt.bind_text(1, collection_id)?;
         insert_stmt.bind_i64(2, row_count as i64)?;
-        insert_stmt.bind_blob(3, ipc_blob)?;
-        insert_stmt.bind_i64(4, now_unix_ts())?;
+        insert_stmt.bind_i64(3, vector_id_start.min(i64::MAX as u64) as i64)?;
+        insert_stmt.bind_i64(4, vector_id_end.min(i64::MAX as u64) as i64)?;
+        insert_stmt.bind_blob(5, ipc_blob)?;
+        insert_stmt.bind_i64(6, now_unix_ts())?;
         insert_stmt.step_done()?;
 
         let mut id_stmt = PreparedStmt::new(&guard, "SELECT last_insert_rowid();")?;
@@ -3133,7 +3204,7 @@ impl SqliteCatalog {
         limit: usize,
     ) -> Result<Vec<WalIpcBatchEntry>> {
         self.query_rows::<WalIpcBatchEntry>(&format!(
-            "SELECT sequence_id, row_count, ipc_blob, created_at
+            "SELECT sequence_id, row_count, vector_id_start, vector_id_end, ipc_blob, created_at
              FROM wal_batches
              WHERE collection_id='{}'
                AND checkpointed_at IS NULL
@@ -3163,6 +3234,19 @@ impl SqliteCatalog {
             start_seq,
             end_seq
         ))
+    }
+
+    pub fn count_wal_ipc_pending_vectors(&self, collection_id: &str) -> Result<usize> {
+        let rows = self.query_json(&format!(
+            "SELECT COALESCE(SUM(row_count), 0) AS n
+             FROM wal_batches
+             WHERE collection_id='{}' AND checkpointed_at IS NULL;",
+            sql_quote(collection_id)
+        ))?;
+        Ok(rows
+            .first()
+            .and_then(|r| r["n"].as_i64())
+            .unwrap_or_default() as usize)
     }
 
     fn query_wal(&self, sql: &str) -> Result<Vec<WalEntry>> {
@@ -4109,10 +4193,10 @@ mod tests {
             .expect("ensure collection");
 
         let seq1 = catalog
-            .ingest_wal_ipc_batch(&collection.id, 2, b"ipc-batch-1")
+            .ingest_wal_ipc_batch(&collection.id, 2, 10, 11, b"ipc-batch-1")
             .expect("append batch 1");
         let seq2 = catalog
-            .ingest_wal_ipc_batch(&collection.id, 3, b"ipc-batch-2")
+            .ingest_wal_ipc_batch(&collection.id, 3, 20, 22, b"ipc-batch-2")
             .expect("append batch 2");
         assert!(seq2 > seq1);
 
@@ -4120,12 +4204,22 @@ mod tests {
             .pending_wal_ipc_batches_after_seq(&collection.id, 0, 10)
             .expect("pending wal batches");
         assert_eq!(pending.len(), 2);
+        assert_eq!(
+            catalog
+                .count_wal_ipc_pending_vectors(&collection.id)
+                .expect("pending vector count"),
+            5
+        );
         assert_eq!(pending[0].sequence_id, seq1);
         assert_eq!(pending[0].row_count, 2);
+        assert_eq!(pending[0].vector_id_start, 10);
+        assert_eq!(pending[0].vector_id_end, 11);
         assert_eq!(pending[0].ipc_blob.as_slice(), b"ipc-batch-1");
         assert!(pending[0].created_at > 0);
         assert_eq!(pending[1].sequence_id, seq2);
         assert_eq!(pending[1].row_count, 3);
+        assert_eq!(pending[1].vector_id_start, 20);
+        assert_eq!(pending[1].vector_id_end, 22);
         assert_eq!(pending[1].ipc_blob.as_slice(), b"ipc-batch-2");
 
         catalog
@@ -4136,5 +4230,11 @@ mod tests {
             .expect("remaining wal batches");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].sequence_id, seq2);
+        assert_eq!(
+            catalog
+                .count_wal_ipc_pending_vectors(&collection.id)
+                .expect("remaining pending vector count"),
+            3
+        );
     }
 }

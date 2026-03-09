@@ -11,6 +11,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
+use arrow_array::builder::{
+    BinaryBuilder, FixedSizeListBuilder, Float32Builder, ListBuilder, StringBuilder, UInt32Builder,
+    UInt64Builder,
+};
+use arrow_array::{Array, RecordBatch};
+use arrow_ipc::writer::StreamWriter;
+use arrow_schema::{Field, Schema};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use rayon::ThreadPool;
@@ -99,6 +106,14 @@ struct IngestWriteJob {
 struct IngestWriteOutcome {
     wal_results: Vec<WalIngestResult>,
     entries: Vec<(Vec<f32>, IngestMetadataV3Input, Option<String>)>,
+}
+
+#[derive(Debug)]
+struct AcceptedWalBatchRow {
+    vector_id: usize,
+    vector: Vec<f32>,
+    metadata: VectorMetadataV3,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -623,6 +638,136 @@ impl ProductionState {
         edges.saturating_add(32)
     }
 
+    fn serialize_accepted_rows_to_ipc(
+        &self,
+        ordered_rows: &[&AcceptedWalBatchRow],
+    ) -> Result<Vec<u8>> {
+        let dim = self.collection.dim;
+        let mut vector_id_builder = UInt64Builder::with_capacity(ordered_rows.len());
+        let mut vector_builder = FixedSizeListBuilder::new(
+            Float32Builder::with_capacity(ordered_rows.len().saturating_mul(dim)),
+            dim as i32,
+        );
+        let mut entity_id_builder = UInt64Builder::with_capacity(ordered_rows.len());
+        let mut sequence_ts_builder = UInt64Builder::with_capacity(ordered_rows.len());
+        let payload_capacity = ordered_rows
+            .iter()
+            .map(|row| row.metadata.payload.len())
+            .sum::<usize>();
+        let mut payload_builder =
+            BinaryBuilder::with_capacity(ordered_rows.len(), payload_capacity);
+        let mut tag_ids_builder = ListBuilder::new(UInt32Builder::new());
+        let mut idempotency_builder = StringBuilder::with_capacity(
+            ordered_rows.len(),
+            ordered_rows
+                .iter()
+                .map(|row| row.idempotency_key.as_ref().map(|v| v.len()).unwrap_or(0))
+                .sum(),
+        );
+
+        for row in ordered_rows {
+            vector_id_builder.append_value(row.vector_id as u64);
+            for value in &row.vector {
+                vector_builder.values().append_value(*value);
+            }
+            vector_builder.append(true);
+            entity_id_builder.append_value(row.metadata.entity_id);
+            sequence_ts_builder.append_value(row.metadata.sequence_ts);
+            payload_builder.append_value(&row.metadata.payload);
+
+            for tag_id in &row.metadata.tags {
+                tag_ids_builder.values().append_value(*tag_id);
+            }
+            tag_ids_builder.append(true);
+
+            if let Some(key) = row.idempotency_key.as_ref() {
+                idempotency_builder.append_value(key);
+            } else {
+                idempotency_builder.append_null();
+            }
+        }
+
+        let vector_id_array = vector_id_builder.finish();
+        let vector_array = vector_builder.finish();
+        let entity_id_array = entity_id_builder.finish();
+        let sequence_ts_array = sequence_ts_builder.finish();
+        let payload_array = payload_builder.finish();
+        let tag_ids_array = tag_ids_builder.finish();
+        let idempotency_array = idempotency_builder.finish();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("vector_id", vector_id_array.data_type().clone(), false),
+            Field::new("vector", vector_array.data_type().clone(), false),
+            Field::new("entity_id", entity_id_array.data_type().clone(), false),
+            Field::new("sequence_ts", sequence_ts_array.data_type().clone(), false),
+            Field::new("payload", payload_array.data_type().clone(), false),
+            Field::new("tag_ids", tag_ids_array.data_type().clone(), false),
+            Field::new(
+                "idempotency_key",
+                idempotency_array.data_type().clone(),
+                true,
+            ),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(vector_id_array),
+                Arc::new(vector_array),
+                Arc::new(entity_id_array),
+                Arc::new(sequence_ts_array),
+                Arc::new(payload_array),
+                Arc::new(tag_ids_array),
+                Arc::new(idempotency_array),
+            ],
+        )?;
+
+        let mut blob = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut blob, &schema)?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        drop(writer);
+        Ok(blob)
+    }
+
+    fn append_wal_ipc_batch_for_accepted_rows(&self, rows: &[AcceptedWalBatchRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut ordered_rows = rows.iter().collect::<Vec<_>>();
+        ordered_rows.sort_by_key(|row| row.vector_id);
+        let vector_id_start = ordered_rows
+            .first()
+            .map(|row| row.vector_id as u64)
+            .unwrap_or(0);
+        let vector_id_end = ordered_rows
+            .last()
+            .map(|row| row.vector_id as u64)
+            .unwrap_or(vector_id_start);
+        for (offset, row) in ordered_rows.iter().enumerate() {
+            let expected = vector_id_start.saturating_add(offset as u64);
+            if row.vector_id as u64 != expected {
+                return Err(anyhow!(
+                    "data integrity fault: accepted ingest batch has non-contiguous vector ids start={} offset={} actual={}",
+                    vector_id_start,
+                    offset,
+                    row.vector_id
+                ));
+            }
+        }
+
+        let ipc_blob = self.serialize_accepted_rows_to_ipc(&ordered_rows)?;
+        self.catalog.ingest_wal_ipc_batch(
+            &self.collection.id,
+            ordered_rows.len(),
+            vector_id_start,
+            vector_id_end,
+            &ipc_blob,
+        )?;
+        Ok(())
+    }
+
     fn enqueue_ingest_batch(
         &self,
         entries: Vec<(Vec<f32>, IngestMetadataV3Input, Option<String>)>,
@@ -1020,22 +1165,36 @@ impl ProductionState {
             metadata: VectorMetadataV3,
         }
 
-        // 2. Group by shard for efficient lock acquisition.
-        // Own vectors here so we can move them into Arc without another clone.
-        let mut by_shard: HashMap<usize, Vec<CreatedShardItem>> = HashMap::new();
-        for (result, (vector, _, _)) in wal_results.iter().zip(entries.into_iter()) {
+        // 2. Build accepted (created-only) row set.
+        let mut accepted_rows = Vec::new();
+        for (result, (vector, _, idempotency_key)) in wal_results.iter().zip(entries.into_iter()) {
             if result.created {
                 let metadata = result.metadata.clone().unwrap_or_default();
-                let shard = result.vector_id & self.shard_mask;
-                by_shard.entry(shard).or_default().push(CreatedShardItem {
+                accepted_rows.push(AcceptedWalBatchRow {
                     vector_id: result.vector_id,
                     vector,
                     metadata,
+                    idempotency_key,
                 });
             }
         }
 
-        let created_count = by_shard.values().map(|v| v.len()).sum::<usize>();
+        // 3. Persist deduplicated/id-stamped WAL batch blob in engine domain.
+        self.append_wal_ipc_batch_for_accepted_rows(&accepted_rows)?;
+
+        // 4. Group by shard for efficient lock acquisition.
+        // Own vectors here so we can move them into Arc without another clone.
+        let created_count = accepted_rows.len();
+        let mut by_shard: HashMap<usize, Vec<CreatedShardItem>> = HashMap::new();
+        for row in accepted_rows {
+            let shard = row.vector_id & self.shard_mask;
+            by_shard.entry(shard).or_default().push(CreatedShardItem {
+                vector_id: row.vector_id,
+                vector: row.vector,
+                metadata: row.metadata,
+            });
+        }
+
         let mut metadata_updates = Vec::with_capacity(created_count);
         for items in by_shard.values() {
             for item in items {
@@ -1089,7 +1248,7 @@ impl ProductionState {
             }
         };
 
-        // 3. Insert into hot index shards.
+        // 5. Insert into hot index shards.
         // For small batches, avoid Rayon dispatch overhead.
         let parallel_ingest_threshold = self.hot_shards.len().saturating_mul(64).max(256);
         if created_count >= parallel_ingest_threshold {
@@ -1102,7 +1261,7 @@ impl ProductionState {
             }
         }
 
-        // 4. Update metadata cache + filter index in one pass.
+        // 6. Update metadata cache + filter index in one pass.
         if created_count > 0 {
             let mut metadata_bytes_delta = 0u64;
             let mut vector_bytes = 0u64;
@@ -1134,7 +1293,7 @@ impl ProductionState {
             self.update_hot_window_from_created_range(min_created_id, max_created_id_exclusive);
         }
 
-        // 5. Build output
+        // 7. Build output
         Ok(wal_results
             .iter()
             .map(|r| (r.vector_id, r.created))
