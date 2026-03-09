@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
+use crossbeam_queue::SegQueue;
 use arrow_array::builder::{
     BinaryBuilder, FixedSizeListBuilder, Float32Builder, ListBuilder, StringBuilder, UInt32Builder,
     UInt64Builder,
@@ -116,6 +117,38 @@ struct AcceptedWalBatchRow {
     idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct UnindexedChunkRow {
+    pub vector_id: u64,
+    pub metadata: VectorMetadataV3,
+}
+
+#[derive(Debug)]
+pub struct UnindexedChunk {
+    pub vector_id_start: u64,
+    pub vector_id_end: u64,
+    pub vectors: Vec<f32>,
+    pub rows: Vec<UnindexedChunkRow>,
+    pub tag_allow_list: HashMap<u32, BitmapSet>,
+    pub approx_bytes: u64,
+}
+
+pub struct UnindexedState {
+    pub chunks: ArcSwap<Vec<Arc<UnindexedChunk>>>,
+    pub index_queue: SegQueue<Arc<UnindexedChunk>>,
+    pub vector_pool: SegQueue<Vec<f32>>,
+}
+
+impl UnindexedState {
+    pub fn new() -> Self {
+        Self {
+            chunks: ArcSwap::from_pointee(Vec::new()),
+            index_queue: SegQueue::new(),
+            vector_pool: SegQueue::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct BackgroundIoThrottle {
     bytes_per_sec: u64,
@@ -188,6 +221,7 @@ pub struct ProductionConfig {
     pub max_tags_per_vector: usize,
     pub max_tag_len: usize,
     pub max_idempotency_key_len: usize,
+    pub unindexed_memory_limit_bytes: u64,
     pub flight_decode_warn_ms: u64,
     pub vector_madvise_mode: VectorMadviseMode,
     pub api_pepper: String,
@@ -313,10 +347,12 @@ pub struct ProductionState {
 
     pub metrics: Metrics,
     wal_ipc_schema: Arc<Schema>,
+    pub unindexed: UnindexedState,
     ingest_writer_tx: SyncSender<IngestWriteJob>,
     ingest_writer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     ingest_writer_failed: AtomicBool,
     pub ingest_queue_bytes: AtomicU64,
+    pub unindexed_bytes: AtomicU64,
     pub hot_vectors_bytes: AtomicU64,
     pub hnsw_graph_bytes: AtomicU64,
     pub metadata_cache_bytes: AtomicU64,
@@ -378,6 +414,7 @@ impl ProductionConfig {
             max_tags_per_vector: 64,
             max_tag_len: 64,
             max_idempotency_key_len: 64,
+            unindexed_memory_limit_bytes: 512 * 1024 * 1024,
             flight_decode_warn_ms: 20,
             vector_madvise_mode: VectorMadviseMode::Normal,
             api_pepper: std::env::var("VIBRATO_API_PEPPER")
@@ -503,10 +540,12 @@ impl ProductionState {
             retired_segments: std::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
             wal_ipc_schema,
+            unindexed: UnindexedState::new(),
             ingest_writer_tx,
             ingest_writer_handle: std::sync::Mutex::new(None),
             ingest_writer_failed: AtomicBool::new(false),
             ingest_queue_bytes: AtomicU64::new(0),
+            unindexed_bytes: AtomicU64::new(0),
             hot_vectors_bytes: AtomicU64::new(0),
             hnsw_graph_bytes: AtomicU64::new(0),
             metadata_cache_bytes: AtomicU64::new(0),
@@ -765,6 +804,342 @@ impl ProductionState {
         Ok(())
     }
 
+    fn estimate_unindexed_chunk_bytes(
+        &self,
+        rows: &[UnindexedChunkRow],
+        vector_values: usize,
+        tag_allow_list: &HashMap<u32, BitmapSet>,
+    ) -> u64 {
+        let vector_bytes = (vector_values as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
+        let metadata_bytes = rows.iter().fold(0u64, |acc, row| {
+            acc.saturating_add(Self::estimate_cached_metadata_bytes(&row.metadata))
+        });
+        let row_overhead = (rows.len() as u64).saturating_mul(std::mem::size_of::<UnindexedChunkRow>() as u64);
+        let tag_index_bytes = (tag_allow_list.len() as u64)
+            .saturating_mul(std::mem::size_of::<(u32, BitmapSet)>() as u64);
+        vector_bytes
+            .saturating_add(metadata_bytes)
+            .saturating_add(row_overhead)
+            .saturating_add(tag_index_bytes)
+    }
+
+    fn build_unindexed_chunk(
+        &self,
+        mut rows: Vec<AcceptedWalBatchRow>,
+    ) -> Result<Arc<UnindexedChunk>> {
+        if rows.is_empty() {
+            return Err(anyhow!(
+                "data integrity fault: attempted to build unindexed chunk from empty row set"
+            ));
+        }
+        rows.sort_by_key(|row| row.vector_id);
+        let vector_id_start = rows.first().map(|row| row.vector_id).unwrap_or(0);
+        let vector_id_end = rows.last().map(|row| row.vector_id).unwrap_or(vector_id_start);
+
+        let mut chunk_rows = Vec::with_capacity(rows.len());
+        let needed_values = rows.len().saturating_mul(self.collection.dim);
+        let mut vectors = self
+            .unindexed
+            .vector_pool
+            .pop()
+            .filter(|buf| buf.capacity() >= needed_values)
+            .unwrap_or_else(|| Vec::with_capacity(needed_values));
+        vectors.clear();
+        let mut tag_allow_list: HashMap<u32, BitmapSet> = HashMap::new();
+        for (offset, row) in rows.into_iter().enumerate() {
+            let expected = vector_id_start.saturating_add(offset as u64);
+            if row.vector_id != expected {
+                return Err(anyhow!(
+                    "data integrity fault: unindexed chunk has non-contiguous ids start={} offset={} actual={}",
+                    vector_id_start,
+                    offset,
+                    row.vector_id
+                ));
+            }
+            if row.vector.len() != self.collection.dim {
+                return Err(anyhow!(
+                    "data integrity fault: unindexed chunk dim mismatch id={} expected={} got={}",
+                    row.vector_id,
+                    self.collection.dim,
+                    row.vector.len()
+                ));
+            }
+            vectors.extend_from_slice(&row.vector);
+            let node_idx = chunk_rows.len();
+            for tag_id in &row.metadata.tags {
+                tag_allow_list.entry(*tag_id).or_default().insert(node_idx);
+            }
+            chunk_rows.push(UnindexedChunkRow {
+                vector_id: row.vector_id,
+                metadata: row.metadata,
+            });
+        }
+
+        let approx_bytes = self.estimate_unindexed_chunk_bytes(&chunk_rows, vectors.len(), &tag_allow_list);
+        Ok(Arc::new(UnindexedChunk {
+            vector_id_start,
+            vector_id_end,
+            vectors,
+            rows: chunk_rows,
+            tag_allow_list,
+            approx_bytes,
+        }))
+    }
+
+    fn publish_unindexed_chunk(&self, chunk: Arc<UnindexedChunk>) {
+        self.unindexed_bytes
+            .fetch_add(chunk.approx_bytes, AtomicOrdering::Relaxed);
+        self.unindexed.chunks.rcu(|current| {
+            let mut next = (**current).clone();
+            next.push(Arc::clone(&chunk));
+            Arc::new(next)
+        });
+        self.unindexed.index_queue.push(chunk);
+    }
+
+    fn mark_unindexed_chunks_indexed(&self, chunks: &[Arc<UnindexedChunk>]) {
+        if chunks.is_empty() {
+            return;
+        }
+        let mut remove_ptrs = HashSet::with_capacity(chunks.len());
+        let mut total_bytes = 0u64;
+        for chunk in chunks {
+            remove_ptrs.insert(Arc::as_ptr(chunk) as usize);
+            total_bytes = total_bytes.saturating_add(chunk.approx_bytes);
+        }
+        self.unindexed.chunks.rcu(|current| {
+            let retained = current
+                .iter()
+                .filter(|existing| !remove_ptrs.contains(&(Arc::as_ptr(existing) as usize)))
+                .cloned()
+                .collect::<Vec<_>>();
+            Arc::new(retained)
+        });
+        atomic_saturating_sub(&self.unindexed_bytes, total_bytes);
+    }
+
+    fn query_unindexed_chunks(
+        &self,
+        query: &[f32],
+        k: usize,
+        resolved_filter: Option<&ResolvedTagFilter>,
+    ) -> Vec<(usize, f32)> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let snapshot = self.unindexed.chunks.load_full();
+        if snapshot.is_empty() {
+            return Vec::new();
+        }
+        let dim = self.collection.dim;
+        let mut best: FastIdMap<f32> = FastIdMap::default();
+        for chunk in snapshot.iter() {
+            if let Some(resolved) = resolved_filter {
+                if let Some(allow) = build_local_allow_set(&chunk.tag_allow_list, resolved) {
+                    for row_idx in allow.iter_ids() {
+                        let Some(row) = chunk.rows.get(row_idx) else {
+                            continue;
+                        };
+                        let id = match usize::try_from(row.vector_id) {
+                            Ok(id) => id,
+                            Err(_) => continue,
+                        };
+                        let start = row_idx.saturating_mul(dim);
+                        let end = start.saturating_add(dim);
+                        if end > chunk.vectors.len() {
+                            continue;
+                        }
+                        let score = dot_product(query, &chunk.vectors[start..end]);
+                        merge_best(&mut best, id, score);
+                    }
+                    continue;
+                }
+            }
+            for (row_idx, row) in chunk.rows.iter().enumerate() {
+                let id = match usize::try_from(row.vector_id) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                let start = row_idx.saturating_mul(dim);
+                let end = start.saturating_add(dim);
+                if end > chunk.vectors.len() {
+                    continue;
+                }
+                let score = dot_product(query, &chunk.vectors[start..end]);
+                merge_best(&mut best, id, score);
+            }
+        }
+        let mut out = best.into_iter().collect::<Vec<_>>();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        out.truncate(k);
+        out
+    }
+
+    fn identify_unindexed_sequences(&self, query_sequence: &[Vec<f32>], k: usize) -> Vec<(usize, f32)> {
+        if query_sequence.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let snapshot = self.unindexed.chunks.load_full();
+        if snapshot.is_empty() {
+            return Vec::new();
+        }
+        let dim = self.collection.dim;
+        let seq_len = query_sequence.len();
+        let mut id_to_location: FastIdMap<(usize, usize)> = FastIdMap::default();
+        for (chunk_idx, chunk) in snapshot.iter().enumerate() {
+            for (row_idx, row) in chunk.rows.iter().enumerate() {
+                if let Ok(id) = usize::try_from(row.vector_id) {
+                    id_to_location.insert(id, (chunk_idx, row_idx));
+                }
+            }
+        }
+        if id_to_location.is_empty() {
+            return Vec::new();
+        }
+
+        let mut best: FastIdMap<f32> = FastIdMap::default();
+        let start_ids = id_to_location.keys().copied().collect::<Vec<_>>();
+        for start_id in start_ids {
+            let mut total_sim = 0.0f32;
+            let mut valid = true;
+            for (offset, query_vec) in query_sequence.iter().enumerate() {
+                let Some(id) = start_id.checked_add(offset) else {
+                    valid = false;
+                    break;
+                };
+                let Some(&(chunk_idx, row_idx)) = id_to_location.get(&id) else {
+                    valid = false;
+                    break;
+                };
+                let chunk = &snapshot[chunk_idx];
+                let start = row_idx.saturating_mul(dim);
+                let end = start.saturating_add(dim);
+                if end > chunk.vectors.len() {
+                    valid = false;
+                    break;
+                }
+                total_sim += dot_product(query_vec, &chunk.vectors[start..end]);
+            }
+            if valid {
+                merge_best(&mut best, start_id, total_sim / seq_len as f32);
+            }
+        }
+
+        let mut out = best.into_iter().collect::<Vec<_>>();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        out.truncate(k);
+        out
+    }
+
+    fn index_unindexed_chunk(&self, chunk: &Arc<UnindexedChunk>) -> Result<()> {
+        if chunk.rows.is_empty() {
+            return Ok(());
+        }
+        let dim = self.collection.dim;
+        let mut by_shard: HashMap<usize, Vec<usize>> = HashMap::new();
+        by_shard.reserve(chunk.rows.len().min(1024));
+        for (row_idx, row) in chunk.rows.iter().enumerate() {
+            let vector_id = usize::try_from(row.vector_id).map_err(|_| {
+                anyhow!(
+                    "data integrity fault: indexer vector_id exceeds usize on this platform vector_id={}",
+                    row.vector_id
+                )
+            })?;
+            by_shard
+                .entry(vector_id & self.shard_mask)
+                .or_default()
+                .push(row_idx);
+        }
+
+        let mut inserted_count = 0usize;
+        let mut vector_bytes_delta = 0u64;
+        let mut min_created_id = usize::MAX;
+        let mut max_created_id_exclusive = 0usize;
+
+        for (shard, row_indices) in by_shard {
+            for row_slice in row_indices.chunks(64) {
+                let shard_lock = self
+                    .hot_shards
+                    .get(shard)
+                    .unwrap_or_else(|| panic!("data integrity fault: missing hot shard {}", shard));
+                let mut shard_guard = shard_lock.write();
+                let HotShard {
+                    vectors,
+                    dense_vectors,
+                    index,
+                    filter_index,
+                } = &mut *shard_guard;
+                for row_idx in row_slice {
+                    let row = &chunk.rows[*row_idx];
+                    let vector_id = usize::try_from(row.vector_id).map_err(|_| {
+                        anyhow!(
+                            "data integrity fault: indexer vector_id exceeds usize on this platform vector_id={}",
+                            row.vector_id
+                        )
+                    })?;
+                    let start = row_idx.saturating_mul(dim);
+                    let end = start.saturating_add(dim);
+                    if end > chunk.vectors.len() {
+                        return Err(anyhow!(
+                            "data integrity fault: unindexed chunk vector range out of bounds row_idx={} dim={} len={}",
+                            row_idx,
+                            dim,
+                            chunk.vectors.len()
+                        ));
+                    }
+                    let vector_arc = Arc::new(chunk.vectors[start..end].to_vec());
+                    let accessor = |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
+                        let vector = dense_vectors.get(node_idx).unwrap_or_else(|| {
+                            panic!(
+                                "data integrity fault: indexer hot shard missing node_idx={} shard={}",
+                                node_idx, shard
+                            )
+                        });
+                        sink(vector.as_slice());
+                    };
+                    let node_idx =
+                        index.insert_with_accessor(row.vector_id, vector_arc.as_slice(), &accessor);
+                    if node_idx == dense_vectors.len() {
+                        dense_vectors.push(Arc::clone(&vector_arc));
+                        vectors.insert(vector_id, Arc::clone(&vector_arc));
+                        for tag_id in &row.metadata.tags {
+                            filter_index.entry(*tag_id).or_default().insert(node_idx);
+                        }
+                        inserted_count = inserted_count.saturating_add(1);
+                        vector_bytes_delta = vector_bytes_delta.saturating_add(
+                            (vector_arc.len() as u64)
+                                .saturating_mul(std::mem::size_of::<f32>() as u64),
+                        );
+                        min_created_id = min_created_id.min(vector_id);
+                        max_created_id_exclusive =
+                            max_created_id_exclusive.max(vector_id.saturating_add(1));
+                    } else if !vectors.contains_key(&vector_id) {
+                        let existing = dense_vectors.get(node_idx).unwrap_or_else(|| {
+                            panic!(
+                                "data integrity fault: indexer missing duplicate node_idx={} shard={}",
+                                node_idx, shard
+                            )
+                        });
+                        vectors.insert(vector_id, Arc::clone(existing));
+                    }
+                }
+                drop(shard_guard);
+                std::thread::yield_now();
+            }
+        }
+
+        if inserted_count > 0 {
+            self.hot_vectors_bytes
+                .fetch_add(vector_bytes_delta, AtomicOrdering::Relaxed);
+            self.hnsw_graph_bytes.fetch_add(
+                (inserted_count as u64).saturating_mul(self.estimate_hnsw_bytes_per_vector()),
+                AtomicOrdering::Relaxed,
+            );
+            self.update_hot_window_from_created_range(min_created_id, max_created_id_exclusive);
+        }
+        Ok(())
+    }
+
     fn enqueue_ingest_batch(
         &self,
         entries: Vec<(Vec<f32>, IngestMetadataV3Input, Option<String>)>,
@@ -834,6 +1209,7 @@ impl ProductionState {
     pub fn memory_proxy_bytes(&self) -> u64 {
         self.ingest_queue_bytes
             .load(AtomicOrdering::Relaxed)
+            .saturating_add(self.unindexed_bytes.load(AtomicOrdering::Relaxed))
             .saturating_add(self.hot_vectors_bytes.load(AtomicOrdering::Relaxed))
             .saturating_add(self.hnsw_graph_bytes.load(AtomicOrdering::Relaxed))
             .saturating_add(self.metadata_cache_bytes.load(AtomicOrdering::Relaxed))
@@ -1148,19 +1524,25 @@ impl ProductionState {
             }
             IngestBackpressureDecision::Throttle { .. } | IngestBackpressureDecision::Allow => {}
         }
+        if self.config.unindexed_memory_limit_bytes > 0 {
+            let current_unindexed = self.unindexed_bytes.load(AtomicOrdering::Relaxed);
+            let projected_unindexed = current_unindexed.saturating_add(estimated_bytes);
+            if projected_unindexed > self.config.unindexed_memory_limit_bytes {
+                self.record_ingest_hard_reject();
+                return Err(anyhow!(
+                    "resource exhausted: indexing queue full unindexed_bytes={} projected={} limit={}",
+                    current_unindexed,
+                    projected_unindexed,
+                    self.config.unindexed_memory_limit_bytes
+                ));
+            }
+        }
 
         // 1. Bulk catalog write on dedicated SQLite writer lane.
         let IngestWriteOutcome {
             wal_results,
             entries,
         } = self.enqueue_ingest_batch(entries, estimated_bytes)?;
-
-        #[derive(Debug)]
-        struct CreatedShardItem {
-            vector_id: usize,
-            vector: Vec<f32>,
-            metadata: VectorMetadataV3,
-        }
 
         // 2. Build accepted (created-only) row set.
         let mut accepted_rows = Vec::new();
@@ -1185,124 +1567,40 @@ impl ProductionState {
         // 3. Persist deduplicated/id-stamped WAL batch blob in engine domain.
         self.append_wal_ipc_batch_for_accepted_rows(&accepted_rows)?;
 
-        // 4. Group by shard for efficient lock acquisition.
-        // Own vectors here so we can move them into Arc without another clone.
+        // 4. Publish accepted rows into lock-free unindexed read state.
         let created_count = accepted_rows.len();
-        let mut by_shard: HashMap<usize, Vec<CreatedShardItem>> = HashMap::new();
-        for row in accepted_rows {
+        let mut metadata_updates = Vec::with_capacity(created_count);
+        for row in &accepted_rows {
             let vector_id = usize::try_from(row.vector_id).map_err(|_| {
                 anyhow!(
                     "data integrity fault: vector_id exceeds usize on this platform vector_id={}",
                     row.vector_id
                 )
             })?;
-            let shard = vector_id & self.shard_mask;
-            by_shard.entry(shard).or_default().push(CreatedShardItem {
-                vector_id,
-                vector: row.vector,
-                metadata: row.metadata,
-            });
+            metadata_updates.push((vector_id, row.metadata.clone()));
+        }
+        if created_count > 0 {
+            let chunk = self.build_unindexed_chunk(accepted_rows)?;
+            self.publish_unindexed_chunk(chunk);
         }
 
-        let mut metadata_updates = Vec::with_capacity(created_count);
-        for items in by_shard.values() {
-            for item in items {
-                metadata_updates.push((item.vector_id, item.metadata.clone(), item.vector.len()));
-            }
-        }
-
-        let apply_shard_items = |shard: usize, items: Vec<CreatedShardItem>| {
-            let shard_lock = self
-                .hot_shards
-                .get(shard)
-                .unwrap_or_else(|| panic!("data integrity fault: missing hot shard {}", shard));
-            let mut shard_guard = shard_lock.write();
-            let HotShard {
-                vectors,
-                dense_vectors,
-                index,
-                filter_index,
-            } = &mut *shard_guard;
-            for item in items {
-                let vector_arc = Arc::new(item.vector);
-                let accessor = |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
-                    let vector = dense_vectors.get(node_idx).unwrap_or_else(|| {
-                        panic!(
-                            "data integrity fault: hot shard missing node_idx={} shard={}",
-                            node_idx, shard
-                        )
-                    });
-                    sink(vector.as_slice());
-                };
-                let node_idx = index.insert_with_accessor(
-                    item.vector_id as u64,
-                    vector_arc.as_slice(),
-                    &accessor,
-                );
-                if node_idx == dense_vectors.len() {
-                    dense_vectors.push(Arc::clone(&vector_arc));
-                    vectors.insert(item.vector_id, Arc::clone(&vector_arc));
-                    for tag_id in &item.metadata.tags {
-                        filter_index.entry(*tag_id).or_default().insert(node_idx);
-                    }
-                } else if !vectors.contains_key(&item.vector_id) {
-                    let existing = dense_vectors.get(node_idx).unwrap_or_else(|| {
-                        panic!(
-                            "data integrity fault: hot shard missing duplicate node_idx={} shard={}",
-                            node_idx, shard
-                        )
-                    });
-                    vectors.insert(item.vector_id, Arc::clone(existing));
-                }
-            }
-        };
-
-        // 5. Insert into hot index shards.
-        // For small batches, avoid Rayon dispatch overhead.
-        let parallel_ingest_threshold = self.hot_shards.len().saturating_mul(64).max(256);
-        if created_count >= parallel_ingest_threshold {
-            by_shard
-                .into_par_iter()
-                .for_each(|(shard, items)| apply_shard_items(shard, items));
-        } else {
-            for (shard, items) in by_shard {
-                apply_shard_items(shard, items);
-            }
-        }
-
-        // 6. Update metadata cache + filter index in one pass.
+        // 5. Update metadata cache for immediate metadata visibility.
         if created_count > 0 {
             let mut metadata_bytes_delta = 0u64;
-            let mut vector_bytes = 0u64;
-            let mut min_created_id = usize::MAX;
-            let mut max_created_id_exclusive = 0usize;
-            for (vector_id, metadata, vec_len) in metadata_updates {
-                min_created_id = min_created_id.min(vector_id);
-                max_created_id_exclusive =
-                    max_created_id_exclusive.max(vector_id.saturating_add(1));
+            for (vector_id, metadata) in metadata_updates {
                 metadata_bytes_delta = metadata_bytes_delta
                     .saturating_add(Self::estimate_cached_metadata_bytes(&metadata));
-                vector_bytes = vector_bytes.saturating_add(
-                    (vec_len as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
-                );
                 self.metadata_cache.upsert(vector_id, metadata.clone());
             }
 
             self.metadata_cache_bytes
                 .fetch_add(metadata_bytes_delta, AtomicOrdering::Relaxed);
-            self.hnsw_graph_bytes.fetch_add(
-                (created_count as u64).saturating_mul(self.estimate_hnsw_bytes_per_vector()),
-                AtomicOrdering::Relaxed,
-            );
-            self.hot_vectors_bytes
-                .fetch_add(vector_bytes, AtomicOrdering::Relaxed);
             self.metrics
                 .ingest_total
                 .fetch_add(created_count as u64, AtomicOrdering::Relaxed);
-            self.update_hot_window_from_created_range(min_created_id, max_created_id_exclusive);
         }
 
-        // 7. Build output
+        // 6. Build output
         Ok(wal_results
             .iter()
             .map(|r| (r.vector_id, r.created))
@@ -1372,6 +1670,12 @@ impl ProductionState {
                 for (id, score) in results {
                     merge_best(&mut best, id, score);
                 }
+            }
+
+            let unindexed_results =
+                self.query_unindexed_chunks(&request.vector, request.k, resolved_filter.as_ref());
+            for (id, score) in unindexed_results {
+                merge_best(&mut best, id, score);
             }
         }
 
@@ -1652,6 +1956,11 @@ impl ProductionState {
                     });
                     merge_best(&mut best, start_id, score);
                 }
+            }
+
+            let unindexed_results = self.identify_unindexed_sequences(&request.vectors, request.k);
+            for (start_id, score) in unindexed_results {
+                merge_best(&mut best, start_id, score);
             }
         }
 
@@ -2140,6 +2449,11 @@ impl ProductionState {
         out.push_str(&format!(
             "vibrato_ingest_queue_bytes {}\n",
             stats.ingest_queue_bytes
+        ));
+        out.push_str("# TYPE vibrato_unindexed_bytes gauge\n");
+        out.push_str(&format!(
+            "vibrato_unindexed_bytes {}\n",
+            self.unindexed_bytes.load(AtomicOrdering::Relaxed)
         ));
         out.push_str("# TYPE vibrato_memory_proxy_bytes gauge\n");
         out.push_str(&format!(
@@ -3111,13 +3425,16 @@ impl ProductionState {
         let colocated = self.config.audio_colocated;
         let checkpoint_cancel = self.background_cancel.child_token();
         let compaction_cancel = self.background_cancel.child_token();
+        let indexer_cancel = self.background_cancel.child_token();
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
+            .num_threads(3)
             .thread_name(|idx| {
                 if idx == 0 {
                     "vibrato-bg-checkpoint".to_string()
-                } else {
+                } else if idx == 1 {
                     "vibrato-bg-compaction".to_string()
+                } else {
+                    "vibrato-bg-indexer".to_string()
                 }
             })
             .start_handler(move |_| {
@@ -3140,6 +3457,9 @@ impl ProductionState {
 
         let compaction_state = Arc::clone(self);
         pool.spawn(move || compaction_loop(compaction_state, compaction_cancel));
+
+        let indexer_state = Arc::clone(self);
+        pool.spawn(move || unindexed_index_loop(indexer_state, indexer_cancel));
 
         *guard = Some(pool);
     }
@@ -4195,6 +4515,62 @@ fn compaction_loop(state: Arc<ProductionState>, cancel: CancellationToken) {
         }
         if let Err(err) = state.compact_once() {
             tracing::warn!("background compaction failed: {err}");
+        }
+    }
+}
+
+fn unindexed_index_loop(state: Arc<ProductionState>, cancel: CancellationToken) {
+    const IDLE_SLEEP: Duration = Duration::from_millis(50);
+    const ERROR_BACKOFF: Duration = Duration::from_millis(100);
+    const MAX_DRAIN_PER_TICK: usize = 64;
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+
+        let mut drained = Vec::with_capacity(MAX_DRAIN_PER_TICK);
+        while drained.len() < MAX_DRAIN_PER_TICK {
+            let Some(chunk) = state.unindexed.index_queue.pop() else {
+                break;
+            };
+            drained.push(chunk);
+        }
+
+        if drained.is_empty() {
+            std::thread::sleep(IDLE_SLEEP);
+            continue;
+        }
+
+        let mut indexed = Vec::with_capacity(drained.len());
+        let mut had_error = false;
+        for chunk in drained {
+            if cancel.is_cancelled() {
+                break;
+            }
+            match state.index_unindexed_chunk(&chunk) {
+                Ok(()) => indexed.push(chunk),
+                Err(err) => {
+                    had_error = true;
+                    tracing::warn!("background unindexed indexer failed: {err}");
+                    state.set_ready(false, format!("degraded: background indexer failure: {err}"));
+                    state.unindexed.index_queue.push(chunk);
+                }
+            }
+        }
+
+        if !indexed.is_empty() {
+            state.mark_unindexed_chunks_indexed(&indexed);
+            for chunk in indexed {
+                if let Ok(mut owned) = Arc::try_unwrap(chunk) {
+                    owned.vectors.clear();
+                    state.unindexed.vector_pool.push(owned.vectors);
+                }
+            }
+        }
+
+        if had_error {
+            std::thread::sleep(ERROR_BACKOFF);
         }
     }
 }

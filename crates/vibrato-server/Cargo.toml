@@ -25,6 +25,7 @@ tonic = { version = "0.13.1", features = ["transport"] }
 
 anyhow = "1.0"
 arc-swap = "1.8.1"
+crossbeam-queue = "0.3"
 parking_lot = "0.12"
 rayon = "1.11"
 rand = "0.8"
