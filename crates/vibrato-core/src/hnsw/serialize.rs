@@ -130,7 +130,10 @@ impl HNSW {
         let is_v2 = &magic == b"VIBGRPH2";
         let is_v1 = &magic == b"VIBGRAPH";
         if !is_v1 && !is_v2 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid HNSW magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid HNSW magic",
+            ));
         }
 
         // 2. Header
@@ -199,7 +202,10 @@ impl HNSW {
                     layers.push(neighbors);
                 }
 
-                nodes.push(Node { id: ids[idx], layers });
+                nodes.push(Node {
+                    id: ids[idx],
+                    layers,
+                });
             }
 
             let entry = entry_point_hint.map(|idx| {
@@ -279,12 +285,16 @@ impl HNSW {
                         format!("legacy entry point {} does not fit u32", legacy_id),
                     )
                 })?;
-                id_to_index.get(&legacy_id_u32).copied().map(|v| v as usize).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("legacy entry point id {} missing from graph ids", legacy_id),
-                    )
-                })
+                id_to_index
+                    .get(&legacy_id_u32)
+                    .copied()
+                    .map(|v| v as usize)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("legacy entry point id {} missing from graph ids", legacy_id),
+                        )
+                    })
             });
             let entry = match entry {
                 Some(v) => Some(v?),
@@ -318,10 +328,9 @@ mod tests {
 
     #[test]
     fn vibgrph2_roundtrip_preserves_ids_and_edges() {
-        let vectors: HashMap<u64, Vec<f32>> =
-            [(10u64, make_vec(0.2)), (42u64, make_vec(0.8))]
-                .into_iter()
-                .collect();
+        let vectors: HashMap<u64, Vec<f32>> = [(10u64, make_vec(0.2)), (42u64, make_vec(0.8))]
+            .into_iter()
+            .collect();
         let ordered_ids = [10u64, 42u64];
         let vectors_for_build = vectors.clone();
         let mut hnsw = HNSW::new_with_accessor(8, 64, move |node_idx, sink| {
@@ -374,10 +383,9 @@ mod tests {
         bytes.extend_from_slice(&(1u32).to_le_bytes()); // layer 0 neighbor count
         bytes.extend_from_slice(&(10u32).to_le_bytes()); // neighbor id
 
-        let vectors: HashMap<u64, Vec<f32>> =
-            [(10u64, make_vec(0.2)), (42u64, make_vec(0.8))]
-                .into_iter()
-                .collect();
+        let vectors: HashMap<u64, Vec<f32>> = [(10u64, make_vec(0.2)), (42u64, make_vec(0.8))]
+            .into_iter()
+            .collect();
         let ordered_ids = [10u64, 42u64];
         let vectors_for_load = vectors.clone();
         let mut cursor = Cursor::new(bytes);

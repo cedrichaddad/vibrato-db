@@ -225,9 +225,8 @@ pub unsafe extern "C" fn vibrato_search(
             if i >= k {
                 break;
             }
-            out_ids[i] = usize::try_from(*id).unwrap_or_else(|_| {
-                panic!("data integrity fault: ffi id overflow id={id}")
-            });
+            out_ids[i] = usize::try_from(*id)
+                .unwrap_or_else(|_| panic!("data integrity fault: ffi id overflow id={id}"));
             out_scores[i] = *score;
             i += 1;
         }

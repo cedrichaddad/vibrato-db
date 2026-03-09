@@ -23,6 +23,7 @@ use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
+use arrow_ipc::writer::StreamWriter;
 use arrow_schema::DataType;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use tokio::sync::oneshot;
@@ -178,6 +179,20 @@ struct FlightBatchIngestResult {
 
 fn elapsed_micros_u64(duration: std::time::Duration) -> u64 {
     duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+fn serialize_batch_to_ipc(batch: &RecordBatch) -> std::result::Result<Vec<u8>, Status> {
+    let mut out = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut out, &batch.schema())
+        .map_err(|e| Status::internal(format!("ipc writer init failed: {e}")))?;
+    writer
+        .write(batch)
+        .map_err(|e| Status::internal(format!("ipc writer write failed: {e}")))?;
+    writer
+        .finish()
+        .map_err(|e| Status::internal(format!("ipc writer finish failed: {e}")))?;
+    drop(writer);
+    Ok(out)
 }
 
 fn parse_flight_batch_columns<'a>(
@@ -475,14 +490,7 @@ fn extract_batch_entries(
     let mut entries = Vec::with_capacity(cols.num_rows);
     let mut tag_cache = TagNormalizationCache::default();
     for row in 0..cols.num_rows {
-        entries.push(decode_entry_at_row(
-            &cols,
-            row,
-            64,
-            64,
-            64,
-            &mut tag_cache,
-        )?);
+        entries.push(decode_entry_at_row(&cols, row, 64, 64, 64, &mut tag_cache)?);
     }
 
     Ok(entries)
@@ -568,6 +576,15 @@ fn ingest_flight_batch_streaming(
         commit_us = commit_us.saturating_add(elapsed_micros_u64(commit_started.elapsed()));
         results.append(&mut batch_results);
     }
+
+    // Persist the original Arrow payload once per Flight batch for WAL bridge/recovery.
+    let wal_started = Instant::now();
+    let ipc_blob = serialize_batch_to_ipc(&batch)?;
+    state
+        .catalog
+        .ingest_wal_ipc_batch(&state.collection.id, cols.num_rows, &ipc_blob)
+        .map_err(|e| Status::internal(format!("ipc wal append failed: {e}")))?;
+    commit_us = commit_us.saturating_add(elapsed_micros_u64(wal_started.elapsed()));
 
     Ok(FlightBatchIngestResult {
         results,
@@ -880,12 +897,7 @@ mod tests {
 
     fn make_batch_with_idempotency(idempotency: Option<&str>) -> RecordBatch {
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            vec![Some(vec![
-                Some(1.0f32),
-                Some(0.0),
-                Some(0.0),
-                Some(0.0),
-            ])],
+            vec![Some(vec![Some(1.0f32), Some(0.0), Some(0.0), Some(0.0)])],
             4,
         );
         let entity_id = UInt64Array::from(vec![Some(42)]);

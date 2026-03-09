@@ -283,8 +283,9 @@ impl VibratoWorker {
     fn map_base_results(&self, hits: Vec<(u64, f32)>) -> Vec<SearchResult> {
         hits.into_iter()
             .map(|(id, score)| {
-                let id = usize::try_from(id)
-                    .unwrap_or_else(|_| panic!("data integrity fault: vst base id overflow id={id}"));
+                let id = usize::try_from(id).unwrap_or_else(|_| {
+                    panic!("data integrity fault: vst base id overflow id={id}")
+                });
                 let path = self
                     .metadata
                     .get(&id)

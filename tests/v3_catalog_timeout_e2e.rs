@@ -23,17 +23,28 @@ fn catalog_read_timeout_bounds_slow_metadata_scan() {
         .ensure_collection(&config.collection_name, config.dim)
         .expect("ensure collection");
 
-    for i in 0..20_000usize {
+    // Keep this test deterministic across debug/release:
+    // release builds can decode 20k small rows fast enough to beat 5ms.
+    let (row_count, read_timeout_ms, payload_len) = if cfg!(debug_assertions) {
+        (20_000usize, 5u64, 0usize)
+    } else {
+        (80_000usize, 2u64, 64usize)
+    };
+
+    for i in 0..row_count {
         let meta = IngestMetadataV3Input {
             entity_id: i as u64,
             sequence_ts: i as u64,
             tags: vec!["drums".to_string()],
-            payload: Vec::new(),
+            payload: vec![0u8; payload_len],
         };
         let _ = catalog
             .ingest_wal_atomic(
                 &collection.id,
-                &[i as f32 / 20_000.0, 1.0 - (i as f32 / 20_000.0)],
+                &[
+                    i as f32 / row_count as f32,
+                    1.0 - (i as f32 / row_count as f32),
+                ],
                 &meta,
                 Some(&format!("timeout-key-{i}")),
             )
@@ -43,9 +54,9 @@ fn catalog_read_timeout_bounds_slow_metadata_scan() {
     let tight_timeout = SqliteCatalog::open_with_options(
         &config.catalog_path(),
         CatalogOptions {
-            // 1ms can fail during open() on slower CI hosts before scan begins.
-            // Keep timeout tight but large enough for deterministic initialization.
-            read_timeout_ms: 5,
+            // Extremely tight timeout to force deterministic timeout behavior in both
+            // debug and optimized release binaries.
+            read_timeout_ms,
             wal_autocheckpoint_pages: 1000,
             max_tag_registry_size: 500_000,
         },
@@ -53,9 +64,13 @@ fn catalog_read_timeout_bounds_slow_metadata_scan() {
 
     match tight_timeout {
         Ok(catalog) => {
-            let err = catalog
-                .fetch_all_metadata(&collection.id)
-                .expect_err("metadata scan should exceed configured timeout");
+            let err = match catalog.fetch_all_metadata(&collection.id) {
+                Ok(rows) => panic!(
+                    "metadata scan should exceed configured timeout (rows_returned={})",
+                    rows.len()
+                ),
+                Err(err) => err,
+            };
             assert!(
                 err.to_string()
                     .to_ascii_lowercase()

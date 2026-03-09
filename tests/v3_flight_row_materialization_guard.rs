@@ -15,8 +15,13 @@ fn flight_ingest_path_uses_owned_batch_handoff() {
         "flight ingest path must stream/decode batches in chunks instead of materializing all rows up front"
     );
     assert!(
-        contents.contains("ingest_batch_owned(std::mem::take(&mut chunk))"),
+        contents.contains("ingest_batch_owned(chunk)")
+            || contents.contains("ingest_batch_owned(std::mem::take(&mut chunk))"),
         "flight ingest path must hand off owned chunk buffers to avoid extra row-buffer cloning"
+    );
+    assert!(
+        !contents.contains("ingest_batch_owned(chunk.clone())"),
+        "flight ingest path must not clone chunk buffers on the hot path"
     );
     assert!(
         contents.contains("flight_decode_pool.spawn_fifo"),

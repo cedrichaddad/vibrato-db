@@ -810,7 +810,7 @@ mod tests {
             }
         });
         for i in 0..num_vectors {
-            hnsw.insert(i);
+            hnsw.insert(i as u64, &vectors[i]);
         }
 
         Arc::new(AppState {

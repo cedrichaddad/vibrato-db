@@ -98,7 +98,13 @@ async fn v2_ingest(
     let idempotency_key = match validate_idempotency_key(&state, body.idempotency_key.clone()) {
         Ok(v) => v,
         Err(msg) => {
-            return error_response(StatusCode::BAD_REQUEST, &request_id, "bad_request", msg, None);
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &request_id,
+                "bad_request",
+                msg,
+                None,
+            );
         }
     };
     let vector = body.vector.clone();
@@ -1136,7 +1142,12 @@ fn classify_query_error(err: &anyhow::Error) -> (StatusCode, &'static str) {
     if lower.contains("catalog_read_timeout") {
         return (StatusCode::SERVICE_UNAVAILABLE, "catalog_read_timeout");
     }
-    if lower.contains("dimension mismatch") {
+    if lower.contains("dimension mismatch")
+        || lower.contains("empty")
+        || lower.contains("invalid")
+        || lower.contains("at least one vector")
+        || lower.contains("requires at least one")
+    {
         return (StatusCode::BAD_REQUEST, "bad_request");
     }
     if lower.contains("join error")

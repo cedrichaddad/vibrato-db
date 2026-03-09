@@ -88,6 +88,14 @@ pub struct WalEntry {
     pub metadata: VectorMetadataV3,
 }
 
+#[derive(Debug, Clone)]
+pub struct WalIpcBatchEntry {
+    pub sequence_id: u64,
+    pub row_count: usize,
+    pub ipc_blob: Vec<u8>,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IngestMetadataV3Input {
     pub entity_id: u64,
@@ -284,6 +292,10 @@ struct TimeoutCtx {
     timeout: Duration,
     timed_out: bool,
 }
+
+// Amortize timeout checks to avoid calling Instant::now()/elapsed on every row.
+// 1024-row cadence keeps timeout overshoot bounded while minimizing loop overhead.
+const TIMEOUT_CHECK_MASK: u32 = 1023;
 
 #[inline]
 fn sqlite_transient_destructor() -> unsafe extern "C" fn(*mut c_void) {
@@ -548,6 +560,7 @@ impl RawSqliteConnection {
         let c_sql = CString::new(sql)?;
         let mut rows = Vec::new();
         let mut tail = c_sql.as_ptr();
+        let mut row_count: u32 = 0;
 
         let mut timeout_ctx = timeout_ms.map(|ms| TimeoutCtx {
             start: Instant::now(),
@@ -590,6 +603,18 @@ impl RawSqliteConnection {
                     let step_rc = unsafe { sqlite3_step(stmt) };
                     if step_rc == SQLITE_ROW {
                         rows.push(statement_row_to_json(stmt));
+                        row_count = row_count.wrapping_add(1);
+                        if row_count & TIMEOUT_CHECK_MASK == 0 {
+                            if let Some(ctx) = timeout_ctx.as_mut() {
+                                if ctx.start.elapsed() >= ctx.timeout {
+                                    ctx.timed_out = true;
+                                    break Err(anyhow!(
+                                        "catalog_read_timeout: sqlite exceeded {}ms",
+                                        timeout_ms.unwrap_or(0)
+                                    ));
+                                }
+                            }
+                        }
                         continue;
                     }
                     if step_rc == SQLITE_DONE {
@@ -632,6 +657,7 @@ impl RawSqliteConnection {
         let c_sql = CString::new(sql)?;
         let mut rows = Vec::new();
         let mut tail = c_sql.as_ptr();
+        let mut row_count: u32 = 0;
 
         let mut timeout_ctx = timeout_ms.map(|ms| TimeoutCtx {
             start: Instant::now(),
@@ -677,6 +703,18 @@ impl RawSqliteConnection {
                         match decoded {
                             Ok(row) => rows.push(row),
                             Err(err) => break Err(err),
+                        }
+                        row_count = row_count.wrapping_add(1);
+                        if row_count & TIMEOUT_CHECK_MASK == 0 {
+                            if let Some(ctx) = timeout_ctx.as_mut() {
+                                if ctx.start.elapsed() >= ctx.timeout {
+                                    ctx.timed_out = true;
+                                    break Err(anyhow!(
+                                        "catalog_read_timeout: sqlite exceeded {}ms",
+                                        timeout_ms.unwrap_or(0)
+                                    ));
+                                }
+                            }
                         }
                         continue;
                     }
@@ -757,6 +795,7 @@ impl RawSqliteConnection {
             );
             let mut stmt = PreparedStmt::new(self, &sql)?;
             let mut rows = Vec::with_capacity(ids.len());
+            let mut row_count: u32 = 0;
 
             for chunk in ids.chunks(FETCH_IDS_CHUNK_WIDTH) {
                 stmt.reset()?;
@@ -775,6 +814,18 @@ impl RawSqliteConnection {
 
                 while stmt.step_row()? {
                     rows.push(unsafe { MetadataRow::from_row(stmt.stmt)? });
+                    row_count = row_count.wrapping_add(1);
+                    if row_count & TIMEOUT_CHECK_MASK == 0 {
+                        if let Some(ctx) = timeout_ctx.as_mut() {
+                            if ctx.start.elapsed() >= ctx.timeout {
+                                ctx.timed_out = true;
+                                return Err(anyhow!(
+                                    "catalog_read_timeout: sqlite exceeded {}ms",
+                                    timeout_ms.unwrap_or(0)
+                                ));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1498,6 +1549,8 @@ impl SqliteCatalog {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_idempotency ON wal_entries(collection_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_vector_id ON wal_entries(collection_id, vector_id)",
             "CREATE INDEX IF NOT EXISTS idx_wal_pending_by_collection_lsn ON wal_entries(collection_id, checkpointed_at, lsn)",
+            "CREATE TABLE IF NOT EXISTS wal_batches (sequence_id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id TEXT NOT NULL, row_count INTEGER NOT NULL, ipc_blob BLOB NOT NULL, checkpointed_at INTEGER, created_at INTEGER NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_wal_batches_pending_by_collection_seq ON wal_batches(collection_id, checkpointed_at, sequence_id)",
             "CREATE TABLE IF NOT EXISTS vector_metadata (collection_id TEXT NOT NULL, vector_id INTEGER NOT NULL, schema_version INTEGER NOT NULL DEFAULT 3, entity_id INTEGER NOT NULL DEFAULT 0, sequence_ts INTEGER NOT NULL DEFAULT 0, payload_blob BLOB NOT NULL DEFAULT X'', tags_blob BLOB NOT NULL DEFAULT X'', created_at INTEGER NOT NULL, PRIMARY KEY(collection_id, vector_id))",
             "CREATE INDEX IF NOT EXISTS idx_vector_metadata_collection_vector ON vector_metadata(collection_id, vector_id)",
             "CREATE TABLE IF NOT EXISTS vector_id_counters (collection_id TEXT PRIMARY KEY, next_id INTEGER NOT NULL)",
@@ -2901,6 +2954,17 @@ impl FromSqlRow for WalEntry {
     }
 }
 
+impl FromSqlRow for WalIpcBatchEntry {
+    unsafe fn from_row(stmt: *mut Sqlite3Stmt) -> Result<Self> {
+        Ok(Self {
+            sequence_id: column_i64(stmt, 0).max(0) as u64,
+            row_count: column_i64(stmt, 1).max(0) as usize,
+            ipc_blob: column_blob_bytes(stmt, 2).to_vec(),
+            created_at: column_i64(stmt, 3),
+        })
+    }
+}
+
 impl FromSqlRow for WalIngestResult {
     unsafe fn from_row(stmt: *mut Sqlite3Stmt) -> Result<Self> {
         let vector_id = column_i64(stmt, 0).max(0) as usize;
@@ -3022,6 +3086,85 @@ impl FromSqlRow for VectorTagPairRow {
 }
 
 impl SqliteCatalog {
+    pub fn ingest_wal_ipc_batch(
+        &self,
+        collection_id: &str,
+        row_count: usize,
+        ipc_blob: &[u8],
+    ) -> Result<u64> {
+        if row_count == 0 {
+            return Ok(0);
+        }
+
+        let guard = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut insert_stmt = PreparedStmt::new(
+            &guard,
+            "INSERT INTO wal_batches(
+               collection_id,
+               row_count,
+               ipc_blob,
+               checkpointed_at,
+               created_at
+             ) VALUES (?1, ?2, ?3, NULL, ?4);",
+        )?;
+        insert_stmt.bind_text(1, collection_id)?;
+        insert_stmt.bind_i64(2, row_count as i64)?;
+        insert_stmt.bind_blob(3, ipc_blob)?;
+        insert_stmt.bind_i64(4, now_unix_ts())?;
+        insert_stmt.step_done()?;
+
+        let mut id_stmt = PreparedStmt::new(&guard, "SELECT last_insert_rowid();")?;
+        if !id_stmt.step_row()? {
+            return Err(anyhow!(
+                "failed to fetch wal_batches sequence id for collection '{}'",
+                collection_id
+            ));
+        }
+        Ok(id_stmt.column_i64(0).max(0) as u64)
+    }
+
+    pub fn pending_wal_ipc_batches_after_seq(
+        &self,
+        collection_id: &str,
+        seq_exclusive: u64,
+        limit: usize,
+    ) -> Result<Vec<WalIpcBatchEntry>> {
+        self.query_rows::<WalIpcBatchEntry>(&format!(
+            "SELECT sequence_id, row_count, ipc_blob, created_at
+             FROM wal_batches
+             WHERE collection_id='{}'
+               AND checkpointed_at IS NULL
+               AND sequence_id > {}
+             ORDER BY sequence_id ASC
+             LIMIT {};",
+            sql_quote(collection_id),
+            seq_exclusive,
+            limit
+        ))
+    }
+
+    pub fn mark_wal_ipc_batches_checkpointed(
+        &self,
+        collection_id: &str,
+        start_seq: u64,
+        end_seq: u64,
+    ) -> Result<()> {
+        self.exec(&format!(
+            "UPDATE wal_batches
+             SET checkpointed_at = {}
+             WHERE collection_id='{}'
+               AND sequence_id >= {}
+               AND sequence_id <= {};",
+            now_unix_ts(),
+            sql_quote(collection_id),
+            start_seq,
+            end_seq
+        ))
+    }
+
     fn query_wal(&self, sql: &str) -> Result<Vec<WalEntry>> {
         self.query_rows::<WalEntry>(sql)
     }
@@ -3954,5 +4097,44 @@ mod tests {
         assert_eq!(rows[0]["api_key_id"], serde_json::json!("vbk_1"));
         assert_eq!(rows[1]["request_id"], serde_json::json!("req_2"));
         assert_eq!(rows[1]["api_key_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn wal_ipc_batches_append_and_checkpoint() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("catalog.sqlite3");
+        let catalog = SqliteCatalog::open(&path).expect("open catalog");
+        let collection = catalog
+            .ensure_collection("ipc_batch_collection", 4)
+            .expect("ensure collection");
+
+        let seq1 = catalog
+            .ingest_wal_ipc_batch(&collection.id, 2, b"ipc-batch-1")
+            .expect("append batch 1");
+        let seq2 = catalog
+            .ingest_wal_ipc_batch(&collection.id, 3, b"ipc-batch-2")
+            .expect("append batch 2");
+        assert!(seq2 > seq1);
+
+        let pending = catalog
+            .pending_wal_ipc_batches_after_seq(&collection.id, 0, 10)
+            .expect("pending wal batches");
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].sequence_id, seq1);
+        assert_eq!(pending[0].row_count, 2);
+        assert_eq!(pending[0].ipc_blob.as_slice(), b"ipc-batch-1");
+        assert!(pending[0].created_at > 0);
+        assert_eq!(pending[1].sequence_id, seq2);
+        assert_eq!(pending[1].row_count, 3);
+        assert_eq!(pending[1].ipc_blob.as_slice(), b"ipc-batch-2");
+
+        catalog
+            .mark_wal_ipc_batches_checkpointed(&collection.id, seq1, seq1)
+            .expect("checkpoint first wal batch");
+        let remaining = catalog
+            .pending_wal_ipc_batches_after_seq(&collection.id, 0, 10)
+            .expect("remaining wal batches");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sequence_id, seq2);
     }
 }

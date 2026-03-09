@@ -4940,6 +4940,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-flight",
+ "arrow-ipc",
  "arrow-schema",
  "axum 0.7.9",
  "base64 0.22.1",

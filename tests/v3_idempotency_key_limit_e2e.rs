@@ -97,9 +97,7 @@ async fn http_ingest_rejects_oversized_idempotency_key() {
 
     let token = create_api_key(&data_dir).expect("create api key");
     let base_url = format!("http://127.0.0.1:{port}");
-    let mut server = start_server(&data_dir, port)
-        .await
-        .expect("start serve-v3");
+    let mut server = start_server(&data_dir, port).await.expect("start serve-v3");
     wait_for_ready(&base_url, &token).await.expect("ready");
 
     let client = reqwest::Client::new();

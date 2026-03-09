@@ -607,7 +607,8 @@ impl HNSW {
                         let pruned_ids: Vec<u32> = pruned
                             .iter()
                             .map(|(idx, _)| {
-                                u32::try_from(*idx).expect("data integrity fault: prune idx overflow")
+                                u32::try_from(*idx)
+                                    .expect("data integrity fault: prune idx overflow")
                             })
                             .collect();
                         prune_ops.push((neighbor_idx, layer, pruned_ids));
@@ -798,9 +799,13 @@ impl HNSW {
                                 -dot_product(candidate_vec, virtual_vec)
                             } else {
                                 let mut dist = 0.0f32;
-                                self.with_vector_at_idx(existing_idx, accessor, &mut |existing_vec| {
-                                    dist = -dot_product(candidate_vec, existing_vec);
-                                });
+                                self.with_vector_at_idx(
+                                    existing_idx,
+                                    accessor,
+                                    &mut |existing_vec| {
+                                        dist = -dot_product(candidate_vec, existing_vec);
+                                    },
+                                );
                                 dist
                             };
 
@@ -1414,8 +1419,11 @@ mod tests {
                 .map(|(id, v)| (id, dot_product(&query, v)))
                 .collect();
             ground_truth.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let ground_truth_ids: std::collections::HashSet<u64> =
-                ground_truth.iter().take(k).map(|(id, _)| *id as u64).collect();
+            let ground_truth_ids: std::collections::HashSet<u64> = ground_truth
+                .iter()
+                .take(k)
+                .map(|(id, _)| *id as u64)
+                .collect();
 
             // HNSW search
             let hnsw_results = hnsw.search(&query, k, 50);
@@ -1792,10 +1800,13 @@ mod tests {
             "baseline subsequence should find the exact start"
         );
 
-        let blocked =
-            hnsw.search_subsequence_with_predicate(&query_seq, 5, 100, vectors.len() as u64, |id| {
-                id != 12
-            });
+        let blocked = hnsw.search_subsequence_with_predicate(
+            &query_seq,
+            5,
+            100,
+            vectors.len() as u64,
+            |id| id != 12,
+        );
         assert!(
             blocked.iter().all(|(start, _)| *start != 10),
             "predicate hole should invalidate exact sequence alignment"
@@ -1817,13 +1828,10 @@ mod tests {
 
         let query_seq = vectors[5..10].to_vec();
         let total_vectors = high_start + vectors.len() as u64 + 1024;
-        let results = hnsw.search_subsequence_with_predicate(
-            &query_seq,
-            4,
-            128,
-            total_vectors,
-            |id| id >= high_start && id < high_start + vectors.len() as u64,
-        );
+        let results =
+            hnsw.search_subsequence_with_predicate(&query_seq, 4, 128, total_vectors, |id| {
+                id >= high_start && id < high_start + vectors.len() as u64
+            });
 
         assert!(
             results.iter().any(|(start, _)| *start == high_start + 5),

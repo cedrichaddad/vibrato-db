@@ -242,12 +242,17 @@ pub struct HotShard {
 struct ResolvedTagFilter {
     tags_all_ids: Vec<u32>,
     tags_any_ids: Vec<u32>,
+    impossible: bool,
 }
 
 fn build_local_allow_set(
     local_index: &HashMap<u32, BitmapSet>,
     resolved: &ResolvedTagFilter,
 ) -> Option<BitmapSet> {
+    if resolved.impossible {
+        return Some(BitmapSet::default());
+    }
+
     let mut allow: Option<BitmapSet> = None;
 
     if !resolved.tags_all_ids.is_empty() {
@@ -884,15 +889,13 @@ impl ProductionState {
             });
             sink(vector.as_slice());
         };
-        let node_idx = index.insert_with_accessor(vector_id as u64, vector_arc.as_slice(), &accessor);
+        let node_idx =
+            index.insert_with_accessor(vector_id as u64, vector_arc.as_slice(), &accessor);
         if node_idx == dense_vectors.len() {
             dense_vectors.push(Arc::clone(&vector_arc));
             vectors.insert(vector_id, Arc::clone(&vector_arc));
             for tag_id in &metadata.tags {
-                filter_index
-                    .entry(*tag_id)
-                    .or_default()
-                    .insert(node_idx);
+                filter_index.entry(*tag_id).or_default().insert(node_idx);
             }
             self.metadata_cache.upsert(vector_id, metadata.clone());
         } else if !vectors.contains_key(&vector_id) {
@@ -1063,16 +1066,16 @@ impl ProductionState {
                     });
                     sink(vector.as_slice());
                 };
-                let node_idx =
-                    index.insert_with_accessor(item.vector_id as u64, vector_arc.as_slice(), &accessor);
+                let node_idx = index.insert_with_accessor(
+                    item.vector_id as u64,
+                    vector_arc.as_slice(),
+                    &accessor,
+                );
                 if node_idx == dense_vectors.len() {
                     dense_vectors.push(Arc::clone(&vector_arc));
                     vectors.insert(item.vector_id, Arc::clone(&vector_arc));
                     for tag_id in &item.metadata.tags {
-                        filter_index
-                            .entry(*tag_id)
-                            .or_default()
-                            .insert(node_idx);
+                        filter_index.entry(*tag_id).or_default().insert(node_idx);
                     }
                 } else if !vectors.contains_key(&item.vector_id) {
                     let existing = dense_vectors.get(node_idx).unwrap_or_else(|| {
@@ -1170,10 +1173,9 @@ impl ProductionState {
                             filter_index,
                             ..
                         } = &*shard_guard;
-                        let local_allow =
-                            resolved_filter
-                                .as_ref()
-                                .and_then(|resolved| build_local_allow_set(filter_index, resolved));
+                        let local_allow = resolved_filter
+                            .as_ref()
+                            .and_then(|resolved| build_local_allow_set(filter_index, resolved));
                         let accessor = |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
                             let vector = dense_vectors.get(node_idx).unwrap_or_else(|| {
                                 panic!(
@@ -1245,9 +1247,9 @@ impl ProductionState {
                 archive_snapshot
                     .par_iter()
                     .map(|seg| {
-                        let local_allow = resolved_filter
-                            .as_ref()
-                            .and_then(|resolved| build_local_allow_set(&seg.filter_index, resolved));
+                        let local_allow = resolved_filter.as_ref().and_then(|resolved| {
+                            build_local_allow_set(&seg.filter_index, resolved)
+                        });
                         search_archive_pq_segment(
                             seg,
                             &request.vector,
@@ -1417,8 +1419,7 @@ impl ProductionState {
                 for shard_results in results {
                     for (start_id, score) in shard_results {
                         if start_id < hot_min_id as u64
-                            || start_id.saturating_add(seq_len as u64)
-                                > hot_max_id_exclusive as u64
+                            || start_id.saturating_add(seq_len as u64) > hot_max_id_exclusive as u64
                         {
                             continue;
                         }
@@ -2661,16 +2662,16 @@ impl ProductionState {
                     });
                     sink(vector.as_slice());
                 };
-                let node_idx =
-                    index.insert_with_accessor(entry.vector_id as u64, vector_arc.as_slice(), &accessor);
+                let node_idx = index.insert_with_accessor(
+                    entry.vector_id as u64,
+                    vector_arc.as_slice(),
+                    &accessor,
+                );
                 if node_idx == dense_vectors.len() {
                     dense_vectors.push(Arc::clone(&vector_arc));
                     vectors.insert(entry.vector_id, Arc::clone(&vector_arc));
                     for tag_id in &entry.metadata.tags {
-                        filter_index
-                            .entry(*tag_id)
-                            .or_default()
-                            .insert(node_idx);
+                        filter_index.entry(*tag_id).or_default().insert(node_idx);
                     }
                 } else if !vectors.contains_key(&entry.vector_id) {
                     let existing = dense_vectors.get(node_idx).unwrap_or_else(|| {
@@ -2736,9 +2737,7 @@ impl ProductionState {
             shard_guard.filter_index.clear();
             let ids = shard_guard.vectors.keys().copied().collect::<Vec<_>>();
             for vector_id in ids {
-                let Some(metadata) = self
-                    .metadata_cache
-                    .read(&vector_id, |_, meta| meta.clone())
+                let Some(metadata) = self.metadata_cache.read(&vector_id, |_, meta| meta.clone())
                 else {
                     continue;
                 };
@@ -2847,10 +2846,8 @@ impl ProductionState {
                 .catalog
                 .resolve_tag_ids_readonly(&self.collection.id, &normalized)?;
             if ids.len() < normalized.len() {
-                return Ok(Some(ResolvedTagFilter {
-                    tags_all_ids: vec![u32::MAX],
-                    tags_any_ids: Vec::new(),
-                }));
+                resolved.impossible = true;
+                return Ok(Some(resolved));
             }
             resolved.tags_all_ids = ids;
         }
@@ -2867,6 +2864,10 @@ impl ProductionState {
             resolved.tags_any_ids = self
                 .catalog
                 .resolve_tag_ids_readonly(&self.collection.id, &normalized)?;
+            if !normalized.is_empty() && resolved.tags_any_ids.is_empty() {
+                resolved.impossible = true;
+                return Ok(Some(resolved));
+            }
         }
 
         Ok(Some(resolved))
@@ -2998,9 +2999,7 @@ impl ProductionState {
             } else {
                 panic!(
                     "data integrity fault: segment '{}' missing node_idx={} count={}",
-                    segment_id,
-                    node_idx,
-                    count
+                    segment_id, node_idx, count
                 );
             }
         };
@@ -3842,9 +3841,9 @@ fn search_index_with_dynamic_fallback(
                 accessor,
             ))
         } else {
-            to_usize_hits(index.search_filtered(query, k, expanded_ef, |node_idx| {
-                allow.contains(node_idx)
-            }))
+            to_usize_hits(
+                index.search_filtered(query, k, expanded_ef, |node_idx| allow.contains(node_idx)),
+            )
         };
         if expanded.len() > best.len() {
             best = expanded;
