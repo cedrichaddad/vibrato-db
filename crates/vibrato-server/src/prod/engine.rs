@@ -110,7 +110,7 @@ struct IngestWriteOutcome {
 
 #[derive(Debug)]
 struct AcceptedWalBatchRow {
-    vector_id: usize,
+    vector_id: u64,
     vector: Vec<f32>,
     metadata: VectorMetadataV3,
     idempotency_key: Option<String>,
@@ -692,18 +692,14 @@ impl ProductionState {
         );
 
         for row in ordered_rows {
-            vector_id_builder.append_value(row.vector_id as u64);
-            for value in &row.vector {
-                vector_builder.values().append_value(*value);
-            }
+            vector_id_builder.append_value(row.vector_id);
+            vector_builder.values().append_slice(&row.vector);
             vector_builder.append(true);
             entity_id_builder.append_value(row.metadata.entity_id);
             sequence_ts_builder.append_value(row.metadata.sequence_ts);
             payload_builder.append_value(&row.metadata.payload);
 
-            for tag_id in &row.metadata.tags {
-                tag_ids_builder.values().append_value(*tag_id);
-            }
+            tag_ids_builder.values().append_slice(&row.metadata.tags);
             tag_ids_builder.append(true);
 
             if let Some(key) = row.idempotency_key.as_ref() {
@@ -741,17 +737,14 @@ impl ProductionState {
 
         let mut ordered_rows = rows.iter().collect::<Vec<_>>();
         ordered_rows.sort_by_key(|row| row.vector_id);
-        let vector_id_start = ordered_rows
-            .first()
-            .map(|row| row.vector_id as u64)
-            .unwrap_or(0);
+        let vector_id_start = ordered_rows.first().map(|row| row.vector_id).unwrap_or(0);
         let vector_id_end = ordered_rows
             .last()
-            .map(|row| row.vector_id as u64)
+            .map(|row| row.vector_id)
             .unwrap_or(vector_id_start);
         for (offset, row) in ordered_rows.iter().enumerate() {
             let expected = vector_id_start.saturating_add(offset as u64);
-            if row.vector_id as u64 != expected {
+            if row.vector_id != expected {
                 return Err(anyhow!(
                     "data integrity fault: accepted ingest batch has non-contiguous vector ids start={} offset={} actual={}",
                     vector_id_start,
@@ -1174,8 +1167,14 @@ impl ProductionState {
         for (result, (vector, _, idempotency_key)) in wal_results.iter().zip(entries.into_iter()) {
             if result.created {
                 let metadata = result.metadata.clone().unwrap_or_default();
+                let vector_id = u64::try_from(result.vector_id).map_err(|_| {
+                    anyhow!(
+                        "data integrity fault: vector_id does not fit u64 result.vector_id={}",
+                        result.vector_id
+                    )
+                })?;
                 accepted_rows.push(AcceptedWalBatchRow {
-                    vector_id: result.vector_id,
+                    vector_id,
                     vector,
                     metadata,
                     idempotency_key,
@@ -1191,9 +1190,15 @@ impl ProductionState {
         let created_count = accepted_rows.len();
         let mut by_shard: HashMap<usize, Vec<CreatedShardItem>> = HashMap::new();
         for row in accepted_rows {
-            let shard = row.vector_id & self.shard_mask;
+            let vector_id = usize::try_from(row.vector_id).map_err(|_| {
+                anyhow!(
+                    "data integrity fault: vector_id exceeds usize on this platform vector_id={}",
+                    row.vector_id
+                )
+            })?;
+            let shard = vector_id & self.shard_mask;
             by_shard.entry(shard).or_default().push(CreatedShardItem {
-                vector_id: row.vector_id,
+                vector_id,
                 vector: row.vector,
                 metadata: row.metadata,
             });
