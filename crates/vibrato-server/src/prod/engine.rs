@@ -131,12 +131,14 @@ pub struct UnindexedChunk {
     pub rows: Vec<UnindexedChunkRow>,
     pub tag_allow_list: HashMap<u32, BitmapSet>,
     pub approx_bytes: u64,
+    recycle_pool: Arc<SegQueue<Vec<f32>>>,
+    unindexed_bytes: Arc<AtomicU64>,
 }
 
 pub struct UnindexedState {
     pub chunks: ArcSwap<Vec<Arc<UnindexedChunk>>>,
     pub index_queue: SegQueue<Arc<UnindexedChunk>>,
-    pub vector_pool: SegQueue<Vec<f32>>,
+    pub vector_pool: Arc<SegQueue<Vec<f32>>>,
 }
 
 impl UnindexedState {
@@ -144,8 +146,17 @@ impl UnindexedState {
         Self {
             chunks: ArcSwap::from_pointee(Vec::new()),
             index_queue: SegQueue::new(),
-            vector_pool: SegQueue::new(),
+            vector_pool: Arc::new(SegQueue::new()),
         }
+    }
+}
+
+impl Drop for UnindexedChunk {
+    fn drop(&mut self) {
+        atomic_saturating_sub(self.unindexed_bytes.as_ref(), self.approx_bytes);
+        let mut recycled = std::mem::take(&mut self.vectors);
+        recycled.clear();
+        self.recycle_pool.push(recycled);
     }
 }
 
@@ -352,7 +363,7 @@ pub struct ProductionState {
     ingest_writer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     ingest_writer_failed: AtomicBool,
     pub ingest_queue_bytes: AtomicU64,
-    pub unindexed_bytes: AtomicU64,
+    pub unindexed_bytes: Arc<AtomicU64>,
     pub hot_vectors_bytes: AtomicU64,
     pub hnsw_graph_bytes: AtomicU64,
     pub metadata_cache_bytes: AtomicU64,
@@ -524,6 +535,7 @@ impl ProductionState {
                 None
             };
         let wal_ipc_schema = Self::wal_ipc_schema_for_dim(collection.dim);
+        let unindexed_bytes = Arc::new(AtomicU64::new(0));
 
         let state = Arc::new(Self {
             config,
@@ -545,7 +557,7 @@ impl ProductionState {
             ingest_writer_handle: std::sync::Mutex::new(None),
             ingest_writer_failed: AtomicBool::new(false),
             ingest_queue_bytes: AtomicU64::new(0),
-            unindexed_bytes: AtomicU64::new(0),
+            unindexed_bytes,
             hot_vectors_bytes: AtomicU64::new(0),
             hnsw_graph_bytes: AtomicU64::new(0),
             metadata_cache_bytes: AtomicU64::new(0),
@@ -883,11 +895,14 @@ impl ProductionState {
             rows: chunk_rows,
             tag_allow_list,
             approx_bytes,
+            recycle_pool: Arc::clone(&self.unindexed.vector_pool),
+            unindexed_bytes: Arc::clone(&self.unindexed_bytes),
         }))
     }
 
     fn publish_unindexed_chunk(&self, chunk: Arc<UnindexedChunk>) {
         self.unindexed_bytes
+            .as_ref()
             .fetch_add(chunk.approx_bytes, AtomicOrdering::Relaxed);
         self.unindexed.chunks.rcu(|current| {
             let mut next = (**current).clone();
@@ -902,10 +917,8 @@ impl ProductionState {
             return;
         }
         let mut remove_ptrs = HashSet::with_capacity(chunks.len());
-        let mut total_bytes = 0u64;
         for chunk in chunks {
             remove_ptrs.insert(Arc::as_ptr(chunk) as usize);
-            total_bytes = total_bytes.saturating_add(chunk.approx_bytes);
         }
         self.unindexed.chunks.rcu(|current| {
             let retained = current
@@ -915,7 +928,6 @@ impl ProductionState {
                 .collect::<Vec<_>>();
             Arc::new(retained)
         });
-        atomic_saturating_sub(&self.unindexed_bytes, total_bytes);
     }
 
     fn query_unindexed_chunks(
@@ -985,40 +997,43 @@ impl ProductionState {
         }
         let dim = self.collection.dim;
         let seq_len = query_sequence.len();
-        let mut id_to_location: FastIdMap<(usize, usize)> = FastIdMap::default();
-        for (chunk_idx, chunk) in snapshot.iter().enumerate() {
-            for (row_idx, row) in chunk.rows.iter().enumerate() {
+        let resolve_vector = |id: u64| -> Option<&[f32]> {
+            for chunk in snapshot.iter() {
+                if id < chunk.vector_id_start || id > chunk.vector_id_end {
+                    continue;
+                }
+                let local_offset = (id.saturating_sub(chunk.vector_id_start)) as usize;
+                let start = local_offset.saturating_mul(dim);
+                let end = start.saturating_add(dim);
+                if end <= chunk.vectors.len() {
+                    return Some(&chunk.vectors[start..end]);
+                }
+            }
+            None
+        };
+
+        let mut best: FastIdMap<f32> = FastIdMap::default();
+        let mut start_ids = Vec::new();
+        for chunk in snapshot.iter() {
+            for row in &chunk.rows {
                 if let Ok(id) = usize::try_from(row.vector_id) {
-                    id_to_location.insert(id, (chunk_idx, row_idx));
+                    start_ids.push(id);
                 }
             }
         }
-        if id_to_location.is_empty() {
-            return Vec::new();
-        }
-
-        let mut best: FastIdMap<f32> = FastIdMap::default();
-        let start_ids = id_to_location.keys().copied().collect::<Vec<_>>();
         for start_id in start_ids {
             let mut total_sim = 0.0f32;
             let mut valid = true;
             for (offset, query_vec) in query_sequence.iter().enumerate() {
-                let Some(id) = start_id.checked_add(offset) else {
+                let Some(id) = (start_id as u64).checked_add(offset as u64) else {
                     valid = false;
                     break;
                 };
-                let Some(&(chunk_idx, row_idx)) = id_to_location.get(&id) else {
+                let Some(stored_vec) = resolve_vector(id) else {
                     valid = false;
                     break;
                 };
-                let chunk = &snapshot[chunk_idx];
-                let start = row_idx.saturating_mul(dim);
-                let end = start.saturating_add(dim);
-                if end > chunk.vectors.len() {
-                    valid = false;
-                    break;
-                }
-                total_sim += dot_product(query_vec, &chunk.vectors[start..end]);
+                total_sim += dot_product(query_vec, stored_vec);
             }
             if valid {
                 merge_best(&mut best, start_id, total_sim / seq_len as f32);
@@ -4521,7 +4536,6 @@ fn compaction_loop(state: Arc<ProductionState>, cancel: CancellationToken) {
 
 fn unindexed_index_loop(state: Arc<ProductionState>, cancel: CancellationToken) {
     const IDLE_SLEEP: Duration = Duration::from_millis(50);
-    const ERROR_BACKOFF: Duration = Duration::from_millis(100);
     const MAX_DRAIN_PER_TICK: usize = 64;
 
     loop {
@@ -4543,7 +4557,6 @@ fn unindexed_index_loop(state: Arc<ProductionState>, cancel: CancellationToken) 
         }
 
         let mut indexed = Vec::with_capacity(drained.len());
-        let mut had_error = false;
         for chunk in drained {
             if cancel.is_cancelled() {
                 break;
@@ -4551,26 +4564,20 @@ fn unindexed_index_loop(state: Arc<ProductionState>, cancel: CancellationToken) 
             match state.index_unindexed_chunk(&chunk) {
                 Ok(()) => indexed.push(chunk),
                 Err(err) => {
-                    had_error = true;
-                    tracing::warn!("background unindexed indexer failed: {err}");
+                    if !indexed.is_empty() {
+                        state.mark_unindexed_chunks_indexed(&indexed);
+                    }
+                    tracing::error!("background unindexed indexer fatal failure: {err}");
                     state.set_ready(false, format!("degraded: background indexer failure: {err}"));
-                    state.unindexed.index_queue.push(chunk);
+                    state.live.store(false, AtomicOrdering::SeqCst);
+                    state.background_cancel.cancel();
+                    return;
                 }
             }
         }
 
         if !indexed.is_empty() {
             state.mark_unindexed_chunks_indexed(&indexed);
-            for chunk in indexed {
-                if let Ok(mut owned) = Arc::try_unwrap(chunk) {
-                    owned.vectors.clear();
-                    state.unindexed.vector_pool.push(owned.vectors);
-                }
-            }
-        }
-
-        if had_error {
-            std::thread::sleep(ERROR_BACKOFF);
         }
     }
 }
