@@ -15,9 +15,9 @@ use arrow_array::builder::{
     BinaryBuilder, FixedSizeListBuilder, Float32Builder, ListBuilder, StringBuilder, UInt32Builder,
     UInt64Builder,
 };
-use arrow_array::{Array, RecordBatch};
+use arrow_array::RecordBatch;
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use rayon::ThreadPool;
@@ -312,6 +312,7 @@ pub struct ProductionState {
     pub retired_segments: std::sync::Mutex<HashMap<String, Weak<SegmentHandle>>>,
 
     pub metrics: Metrics,
+    wal_ipc_schema: Arc<Schema>,
     ingest_writer_tx: SyncSender<IngestWriteJob>,
     ingest_writer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     ingest_writer_failed: AtomicBool,
@@ -390,6 +391,29 @@ impl ProductionConfig {
 }
 
 impl ProductionState {
+    fn wal_ipc_schema_for_dim(dim: usize) -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("vector_id", DataType::UInt64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim as i32,
+                ),
+                false,
+            ),
+            Field::new("entity_id", DataType::UInt64, false),
+            Field::new("sequence_ts", DataType::UInt64, false),
+            Field::new("payload", DataType::Binary, false),
+            Field::new(
+                "tag_ids",
+                DataType::List(Arc::new(Field::new("item", DataType::UInt32, true))),
+                false,
+            ),
+            Field::new("idempotency_key", DataType::Utf8, true),
+        ]))
+    }
+
     #[inline]
     fn auto_query_pool_threads(available: usize) -> usize {
         if available <= 2 {
@@ -462,6 +486,7 @@ impl ProductionState {
             } else {
                 None
             };
+        let wal_ipc_schema = Self::wal_ipc_schema_for_dim(collection.dim);
 
         let state = Arc::new(Self {
             config,
@@ -477,6 +502,7 @@ impl ProductionState {
             archive_segments: ArcSwap::from_pointee(Vec::new()),
             retired_segments: std::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
+            wal_ipc_schema,
             ingest_writer_tx,
             ingest_writer_handle: std::sync::Mutex::new(None),
             ingest_writer_failed: AtomicBool::new(false),
@@ -687,43 +713,21 @@ impl ProductionState {
             }
         }
 
-        let vector_id_array = vector_id_builder.finish();
-        let vector_array = vector_builder.finish();
-        let entity_id_array = entity_id_builder.finish();
-        let sequence_ts_array = sequence_ts_builder.finish();
-        let payload_array = payload_builder.finish();
-        let tag_ids_array = tag_ids_builder.finish();
-        let idempotency_array = idempotency_builder.finish();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("vector_id", vector_id_array.data_type().clone(), false),
-            Field::new("vector", vector_array.data_type().clone(), false),
-            Field::new("entity_id", entity_id_array.data_type().clone(), false),
-            Field::new("sequence_ts", sequence_ts_array.data_type().clone(), false),
-            Field::new("payload", payload_array.data_type().clone(), false),
-            Field::new("tag_ids", tag_ids_array.data_type().clone(), false),
-            Field::new(
-                "idempotency_key",
-                idempotency_array.data_type().clone(),
-                true,
-            ),
-        ]));
-
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            self.wal_ipc_schema.clone(),
             vec![
-                Arc::new(vector_id_array),
-                Arc::new(vector_array),
-                Arc::new(entity_id_array),
-                Arc::new(sequence_ts_array),
-                Arc::new(payload_array),
-                Arc::new(tag_ids_array),
-                Arc::new(idempotency_array),
+                Arc::new(vector_id_builder.finish()),
+                Arc::new(vector_builder.finish()),
+                Arc::new(entity_id_builder.finish()),
+                Arc::new(sequence_ts_builder.finish()),
+                Arc::new(payload_builder.finish()),
+                Arc::new(tag_ids_builder.finish()),
+                Arc::new(idempotency_builder.finish()),
             ],
         )?;
 
         let mut blob = Vec::new();
-        let mut writer = StreamWriter::try_new(&mut blob, &schema)?;
+        let mut writer = StreamWriter::try_new(&mut blob, &self.wal_ipc_schema)?;
         writer.write(&batch)?;
         writer.finish()?;
         drop(writer);
