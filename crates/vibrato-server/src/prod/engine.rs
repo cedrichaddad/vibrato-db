@@ -131,8 +131,8 @@ pub struct UnindexedChunk {
     pub rows: Vec<UnindexedChunkRow>,
     pub tag_allow_list: HashMap<u32, BitmapSet>,
     pub approx_bytes: u64,
-    recycle_pool: Arc<SegQueue<Vec<f32>>>,
-    unindexed_bytes: Arc<AtomicU64>,
+    recycle_pool: Weak<SegQueue<Vec<f32>>>,
+    unindexed_bytes: Weak<AtomicU64>,
 }
 
 pub struct UnindexedState {
@@ -153,10 +153,14 @@ impl UnindexedState {
 
 impl Drop for UnindexedChunk {
     fn drop(&mut self) {
-        atomic_saturating_sub(self.unindexed_bytes.as_ref(), self.approx_bytes);
-        let mut recycled = std::mem::take(&mut self.vectors);
-        recycled.clear();
-        self.recycle_pool.push(recycled);
+        if let Some(unindexed_bytes) = self.unindexed_bytes.upgrade() {
+            atomic_saturating_sub(unindexed_bytes.as_ref(), self.approx_bytes);
+        }
+        if let Some(recycle_pool) = self.recycle_pool.upgrade() {
+            let mut recycled = std::mem::take(&mut self.vectors);
+            recycled.clear();
+            recycle_pool.push(recycled);
+        }
     }
 }
 
@@ -895,8 +899,8 @@ impl ProductionState {
             rows: chunk_rows,
             tag_allow_list,
             approx_bytes,
-            recycle_pool: Arc::clone(&self.unindexed.vector_pool),
-            unindexed_bytes: Arc::clone(&self.unindexed_bytes),
+            recycle_pool: Arc::downgrade(&self.unindexed.vector_pool),
+            unindexed_bytes: Arc::downgrade(&self.unindexed_bytes),
         }))
     }
 
@@ -1003,10 +1007,22 @@ impl ProductionState {
                     continue;
                 }
                 let local_offset = (id.saturating_sub(chunk.vector_id_start)) as usize;
-                let start = local_offset.saturating_mul(dim);
-                let end = start.saturating_add(dim);
-                if end <= chunk.vectors.len() {
-                    return Some(&chunk.vectors[start..end]);
+                if let Some(row) = chunk.rows.get(local_offset) {
+                    if row.vector_id == id {
+                        let start = local_offset.saturating_mul(dim);
+                        let end = start.saturating_add(dim);
+                        if end <= chunk.vectors.len() {
+                            return Some(&chunk.vectors[start..end]);
+                        }
+                    }
+                }
+                // Defensive fallback if a future change introduces sparse row IDs.
+                if let Some(fallback_idx) = chunk.rows.iter().position(|row| row.vector_id == id) {
+                    let start = fallback_idx.saturating_mul(dim);
+                    let end = start.saturating_add(dim);
+                    if end <= chunk.vectors.len() {
+                        return Some(&chunk.vectors[start..end]);
+                    }
                 }
             }
             None
