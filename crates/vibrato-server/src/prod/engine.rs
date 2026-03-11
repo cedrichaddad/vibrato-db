@@ -380,7 +380,7 @@ pub struct ProductionState {
     last_checkpoint_started_unix: AtomicU64,
     last_compaction_started_unix: AtomicU64,
     background_cancel: CancellationToken,
-    pub background_pool: std::sync::Mutex<Option<Arc<ThreadPool>>>,
+    pub background_worker_handles: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
     background_io_throttle: Option<Arc<BackgroundIoThrottle>>,
     pub flight_decode_pool: Arc<ThreadPool>,
     pub query_pool: Arc<ThreadPool>,
@@ -574,7 +574,7 @@ impl ProductionState {
             last_checkpoint_started_unix: AtomicU64::new(0),
             last_compaction_started_unix: AtomicU64::new(0),
             background_cancel,
-            background_pool: std::sync::Mutex::new(None),
+            background_worker_handles: std::sync::Mutex::new(Vec::new()),
             background_io_throttle,
             flight_decode_pool,
             query_pool,
@@ -823,10 +823,11 @@ impl ProductionState {
     fn estimate_unindexed_chunk_bytes(
         &self,
         rows: &[UnindexedChunkRow],
-        vector_values: usize,
+        vector_capacity: usize,
         tag_allow_list: &HashMap<u32, BitmapSet>,
     ) -> u64 {
-        let vector_bytes = (vector_values as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
+        let vector_bytes =
+            (vector_capacity as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
         let metadata_bytes = rows.iter().fold(0u64, |acc, row| {
             acc.saturating_add(Self::estimate_cached_metadata_bytes(&row.metadata))
         });
@@ -891,7 +892,10 @@ impl ProductionState {
             });
         }
 
-        let approx_bytes = self.estimate_unindexed_chunk_bytes(&chunk_rows, vectors.len(), &tag_allow_list);
+        // Track the backing allocation, not logical len(), so pooled oversized buffers
+        // still count against the unindexed memory breaker until they are recycled.
+        let approx_bytes =
+            self.estimate_unindexed_chunk_bytes(&chunk_rows, vectors.capacity(), &tag_allow_list);
         Ok(Arc::new(UnindexedChunk {
             vector_id_start,
             vector_id_end,
@@ -1050,6 +1054,57 @@ impl ProductionState {
                     break;
                 };
                 total_sim += dot_product(query_vec, stored_vec);
+            }
+            if valid {
+                merge_best(&mut best, start_id, total_sim / seq_len as f32);
+            }
+        }
+
+        let mut out = best.into_iter().collect::<Vec<_>>();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        out.truncate(k);
+        out
+    }
+
+    fn identify_hot_sequences_exact(&self, query_sequence: &[Vec<f32>], k: usize) -> Vec<(usize, f32)> {
+        const EXACT_HOT_IDENTIFY_MAX_VECTORS: usize = 16_384;
+
+        if query_sequence.is_empty() || k == 0 {
+            return Vec::new();
+        }
+
+        let shard_guards = self
+            .hot_shards
+            .iter()
+            .map(|shard| shard.read())
+            .collect::<Vec<_>>();
+        let hot_vector_count = shard_guards.iter().map(|guard| guard.vectors.len()).sum::<usize>();
+        if hot_vector_count == 0 || hot_vector_count > EXACT_HOT_IDENTIFY_MAX_VECTORS {
+            return Vec::new();
+        }
+
+        let hot_min_id = self.hot_min_id.load(AtomicOrdering::Relaxed);
+        let hot_max_id_exclusive = self.hot_max_id_exclusive.load(AtomicOrdering::Relaxed);
+        let seq_len = query_sequence.len();
+        if hot_max_id_exclusive <= hot_min_id
+            || seq_len > hot_max_id_exclusive.saturating_sub(hot_min_id)
+        {
+            return Vec::new();
+        }
+
+        let mut best: FastIdMap<f32> = FastIdMap::default();
+        let last_start_exclusive = hot_max_id_exclusive.saturating_sub(seq_len).saturating_add(1);
+        for start_id in hot_min_id..last_start_exclusive {
+            let mut total_sim = 0.0f32;
+            let mut valid = true;
+            for (offset, query_vec) in query_sequence.iter().enumerate() {
+                let id = start_id.saturating_add(offset);
+                let shard = id & self.shard_mask;
+                let Some(stored_vec) = shard_guards[shard].vectors.get(&id) else {
+                    valid = false;
+                    break;
+                };
+                total_sim += dot_product(query_vec, stored_vec.as_slice());
             }
             if valid {
                 merge_best(&mut best, start_id, total_sim / seq_len as f32);
@@ -1880,67 +1935,85 @@ impl ProductionState {
             if hot_max_id_exclusive > hot_min_id
                 && seq_len <= hot_max_id_exclusive.saturating_sub(hot_min_id)
             {
-                let results = self.query_pool.install(|| {
-                    self.hot_shards
-                        .par_iter()
-                        .enumerate()
-                        .map(|(shard_idx, shard_lock)| {
-                            let shard_guard = shard_lock.read();
-                            let HotShard {
-                                dense_vectors,
-                                index,
-                                ..
-                            } = &*shard_guard;
-                            let metadata_cache = metadata_cache.clone();
-                            let accessor = |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
-                                let vector = dense_vectors.get(node_idx).unwrap_or_else(|| {
-                                    panic!(
-                                        "data integrity fault: hot shard missing node_idx={} shard={}",
-                                        node_idx, shard_idx
-                                    )
-                                });
-                                sink(vector.as_slice());
-                            };
-                            index.search_subsequence_with_predicate_and_accessor(
-                                &request.vectors,
-                                request.k,
-                                request.ef.max(request.k),
-                                hot_max_id_exclusive as u64,
-                                move |id| {
-                                    id >= hot_min_id as u64
-                                        && id < hot_max_id_exclusive as u64
-                                        && usize::try_from(id)
-                                            .ok()
-                                            .map(|id| metadata_cache.contains(&id))
-                                            .unwrap_or(false)
-                                },
-                                &accessor,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                });
-                for shard_results in results {
-                    for (start_id, score) in shard_results {
-                        if start_id < hot_min_id as u64
-                            || start_id.saturating_add(seq_len as u64) > hot_max_id_exclusive as u64
+                let hot_exact_results = self.identify_hot_sequences_exact(&request.vectors, request.k);
+                if !hot_exact_results.is_empty() {
+                    for (start_id, score) in hot_exact_results {
+                        if start_id < hot_min_id
+                            || start_id.saturating_add(seq_len) > hot_max_id_exclusive
                         {
                             continue;
                         }
-                        if (0..seq_len).any(|offset| {
-                            let id = start_id + offset as u64;
-                            id < hot_min_id as u64
-                                || id >= hot_max_id_exclusive as u64
-                                || usize::try_from(id)
-                                    .ok()
-                                    .map(|id| !metadata_cache.contains(&id))
-                                    .unwrap_or(true)
-                        }) {
+                        if (0..seq_len).any(|offset| !metadata_cache.contains(&(start_id + offset))) {
                             continue;
                         }
-                        let start_id = usize::try_from(start_id).unwrap_or_else(|_| {
-                            panic!("data integrity fault: identify start id overflow id={start_id}")
-                        });
                         merge_best(&mut best, start_id, score);
+                    }
+                } else {
+                    let results = self.query_pool.install(|| {
+                        self.hot_shards
+                            .par_iter()
+                            .enumerate()
+                            .map(|(shard_idx, shard_lock)| {
+                                let shard_guard = shard_lock.read();
+                                let HotShard {
+                                    dense_vectors,
+                                    index,
+                                    ..
+                                } = &*shard_guard;
+                                let metadata_cache = metadata_cache.clone();
+                                let accessor = |node_idx: usize, sink: &mut dyn FnMut(&[f32])| {
+                                    let vector = dense_vectors.get(node_idx).unwrap_or_else(|| {
+                                        panic!(
+                                            "data integrity fault: hot shard missing node_idx={} shard={}",
+                                            node_idx, shard_idx
+                                        )
+                                    });
+                                    sink(vector.as_slice());
+                                };
+                                index.search_subsequence_with_predicate_and_accessor(
+                                    &request.vectors,
+                                    request.k,
+                                    request.ef.max(request.k),
+                                    hot_max_id_exclusive as u64,
+                                    move |id| {
+                                        id >= hot_min_id as u64
+                                            && id < hot_max_id_exclusive as u64
+                                            && usize::try_from(id)
+                                                .ok()
+                                                .map(|id| metadata_cache.contains(&id))
+                                                .unwrap_or(false)
+                                    },
+                                    &accessor,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    for shard_results in results {
+                        for (start_id, score) in shard_results {
+                            if start_id < hot_min_id as u64
+                                || start_id.saturating_add(seq_len as u64)
+                                    > hot_max_id_exclusive as u64
+                            {
+                                continue;
+                            }
+                            if (0..seq_len).any(|offset| {
+                                let id = start_id + offset as u64;
+                                id < hot_min_id as u64
+                                    || id >= hot_max_id_exclusive as u64
+                                    || usize::try_from(id)
+                                        .ok()
+                                        .map(|id| !metadata_cache.contains(&id))
+                                        .unwrap_or(true)
+                            }) {
+                                continue;
+                            }
+                            let start_id = usize::try_from(start_id).unwrap_or_else(|_| {
+                                panic!(
+                                    "data integrity fault: identify start id overflow id={start_id}"
+                                )
+                            });
+                            merge_best(&mut best, start_id, score);
+                        }
                     }
                 }
             }
@@ -3446,10 +3519,10 @@ impl ProductionState {
         }
 
         let mut guard = self
-            .background_pool
+            .background_worker_handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.is_some() {
+        if !guard.is_empty() {
             return;
         }
 
@@ -3457,42 +3530,60 @@ impl ProductionState {
         let checkpoint_cancel = self.background_cancel.child_token();
         let compaction_cancel = self.background_cancel.child_token();
         let indexer_cancel = self.background_cancel.child_token();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(3)
-            .thread_name(|idx| {
-                if idx == 0 {
-                    "vibrato-bg-checkpoint".to_string()
-                } else if idx == 1 {
-                    "vibrato-bg-compaction".to_string()
-                } else {
-                    "vibrato-bg-indexer".to_string()
-                }
-            })
-            .start_handler(move |_| {
+        let checkpoint_state = Arc::clone(self);
+        let checkpoint_handle = match std::thread::Builder::new()
+            .name("vibrato-bg-checkpoint".to_string())
+            .spawn(move || {
                 if colocated {
                     set_background_worker_priority();
                 }
-            })
-            .build();
-
-        let pool = match pool {
-            Ok(pool) => Arc::new(pool),
+                checkpoint_loop(checkpoint_state, checkpoint_cancel);
+            }) {
+            Ok(handle) => handle,
             Err(err) => {
-                tracing::error!("failed to create background worker pool: {err}");
+                tracing::error!("failed to spawn checkpoint worker: {err}");
                 return;
             }
         };
 
-        let checkpoint_state = Arc::clone(self);
-        pool.spawn(move || checkpoint_loop(checkpoint_state, checkpoint_cancel));
-
         let compaction_state = Arc::clone(self);
-        pool.spawn(move || compaction_loop(compaction_state, compaction_cancel));
+        let compaction_handle = match std::thread::Builder::new()
+            .name("vibrato-bg-compaction".to_string())
+            .spawn(move || {
+                if colocated {
+                    set_background_worker_priority();
+                }
+                compaction_loop(compaction_state, compaction_cancel);
+            }) {
+            Ok(handle) => handle,
+            Err(err) => {
+                tracing::error!("failed to spawn compaction worker: {err}");
+                guard.push(checkpoint_handle);
+                return;
+            }
+        };
 
         let indexer_state = Arc::clone(self);
-        pool.spawn(move || unindexed_index_loop(indexer_state, indexer_cancel));
+        let indexer_handle = match std::thread::Builder::new()
+            .name("vibrato-bg-indexer".to_string())
+            .spawn(move || {
+                if colocated {
+                    set_background_worker_priority();
+                }
+                unindexed_index_loop(indexer_state, indexer_cancel);
+            }) {
+            Ok(handle) => handle,
+            Err(err) => {
+                tracing::error!("failed to spawn unindexed indexer worker: {err}");
+                guard.push(checkpoint_handle);
+                guard.push(compaction_handle);
+                return;
+            }
+        };
 
-        *guard = Some(pool);
+        guard.push(checkpoint_handle);
+        guard.push(compaction_handle);
+        guard.push(indexer_handle);
     }
 
     fn load_segment_handle(&self, seg: &SegmentRecord) -> Result<Arc<SegmentHandle>> {
