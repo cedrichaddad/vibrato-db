@@ -135,6 +135,45 @@ pub struct UnindexedChunk {
     unindexed_bytes: Weak<AtomicU64>,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveIdentifyRun {
+    start_id: usize,
+    vectors: Vec<f32>,
+}
+
+#[derive(Clone, Copy)]
+struct ExactIdentifyRunRef<'a> {
+    start_id: usize,
+    vectors: &'a [f32],
+}
+
+impl<'a> ExactIdentifyRunRef<'a> {
+    #[inline]
+    fn len(self, dim: usize) -> usize {
+        self.vectors.len() / dim
+    }
+
+    #[inline]
+    fn end_id_exclusive(self, dim: usize) -> usize {
+        self.start_id.saturating_add(self.len(dim))
+    }
+
+    #[inline]
+    fn vector_at(self, dim: usize, idx: usize) -> Option<&'a [f32]> {
+        let start = idx.saturating_mul(dim);
+        let end = start.saturating_add(dim);
+        (end <= self.vectors.len()).then_some(&self.vectors[start..end])
+    }
+}
+
+#[derive(Debug, Default)]
+struct ActiveIdentifySlab {
+    runs: Vec<ActiveIdentifyRun>,
+    min_vector_id: usize,
+    max_vector_id_exclusive: usize,
+    total_vectors: usize,
+}
+
 pub struct UnindexedState {
     pub chunks: ArcSwap<Vec<Arc<UnindexedChunk>>>,
     pub index_queue: SegQueue<Arc<UnindexedChunk>>,
@@ -369,8 +408,10 @@ pub struct ProductionState {
     pub ingest_queue_bytes: AtomicU64,
     pub unindexed_bytes: Arc<AtomicU64>,
     pub hot_vectors_bytes: AtomicU64,
+    pub active_identify_bytes: AtomicU64,
     pub hnsw_graph_bytes: AtomicU64,
     pub metadata_cache_bytes: AtomicU64,
+    active_identify_slab: RwLock<ActiveIdentifySlab>,
     pub hot_min_id: AtomicUsize,
     pub hot_max_id_exclusive: AtomicUsize,
     pub inflight_decode_bytes: AtomicU64,
@@ -563,8 +604,10 @@ impl ProductionState {
             ingest_queue_bytes: AtomicU64::new(0),
             unindexed_bytes,
             hot_vectors_bytes: AtomicU64::new(0),
+            active_identify_bytes: AtomicU64::new(0),
             hnsw_graph_bytes: AtomicU64::new(0),
             metadata_cache_bytes: AtomicU64::new(0),
+            active_identify_slab: RwLock::new(ActiveIdentifySlab::default()),
             hot_min_id: AtomicUsize::new(0),
             hot_max_id_exclusive: AtomicUsize::new(0),
             inflight_decode_bytes: AtomicU64::new(0),
@@ -920,6 +963,135 @@ impl ProductionState {
         self.unindexed.index_queue.push(chunk);
     }
 
+    #[inline]
+    fn active_identify_vector_bytes(vectors: &[f32]) -> u64 {
+        (vectors.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64)
+    }
+
+    fn refresh_active_identify_bounds_locked(slab: &mut ActiveIdentifySlab, dim: usize) {
+        slab.total_vectors = 0;
+        slab.min_vector_id = usize::MAX;
+        slab.max_vector_id_exclusive = 0;
+        for run in &slab.runs {
+            let len = run.vectors.len() / dim;
+            if len == 0 {
+                continue;
+            }
+            slab.total_vectors = slab.total_vectors.saturating_add(len);
+            slab.min_vector_id = slab.min_vector_id.min(run.start_id);
+            slab.max_vector_id_exclusive = slab
+                .max_vector_id_exclusive
+                .max(run.start_id.saturating_add(len));
+        }
+        if slab.total_vectors == 0 {
+            slab.min_vector_id = 0;
+            slab.max_vector_id_exclusive = 0;
+        }
+    }
+
+    fn append_active_identify_run(&self, start_id: usize, vectors: &[f32]) -> Result<()> {
+        if vectors.is_empty() {
+            return Ok(());
+        }
+        if !vectors.len().is_multiple_of(self.collection.dim) {
+            return Err(anyhow!(
+                "data integrity fault: active identify run misaligned start_id={} dim={} len={}",
+                start_id,
+                self.collection.dim,
+                vectors.len()
+            ));
+        }
+        let added_bytes = Self::active_identify_vector_bytes(vectors);
+        let mut slab = self.active_identify_slab.write();
+        slab.runs.push(ActiveIdentifyRun {
+            start_id,
+            vectors: vectors.to_vec(),
+        });
+        slab.runs.sort_by_key(|run| run.start_id);
+
+        let mut merged: Vec<ActiveIdentifyRun> = Vec::with_capacity(slab.runs.len());
+        for run in slab.runs.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                let last_len = last.vectors.len() / self.collection.dim;
+                let last_end = last.start_id.saturating_add(last_len);
+                if last_end == run.start_id {
+                    last.vectors.extend_from_slice(&run.vectors);
+                    continue;
+                }
+            }
+            merged.push(run);
+        }
+        slab.runs = merged;
+        Self::refresh_active_identify_bounds_locked(&mut slab, self.collection.dim);
+        drop(slab);
+        self.active_identify_bytes
+            .fetch_add(added_bytes, AtomicOrdering::Relaxed);
+        Ok(())
+    }
+
+    fn rebuild_active_identify_slab_from_hot(&self) -> Result<()> {
+        let mut ordered = Vec::new();
+        for shard_lock in &self.hot_shards {
+            let shard_guard = shard_lock.read();
+            for (id, vector) in &shard_guard.vectors {
+                ordered.push((*id, vector.clone()));
+            }
+        }
+        ordered.sort_by_key(|(id, _)| *id);
+
+        let mut slab = ActiveIdentifySlab::default();
+        let mut active_identify_bytes = 0u64;
+        let mut current_run_start = None;
+        let mut current_run_vectors = Vec::new();
+        let mut expected_next_id = 0usize;
+
+        for (id, vector) in ordered {
+            if vector.len() != self.collection.dim {
+                return Err(anyhow!(
+                    "data integrity fault: active identify rebuild dim mismatch id={} expected={} got={}",
+                    id,
+                    self.collection.dim,
+                    vector.len()
+                ));
+            }
+            match current_run_start {
+                None => {
+                    current_run_start = Some(id);
+                }
+                Some(_) if id != expected_next_id => {
+                    if let Some(start_id) = current_run_start.take() {
+                        active_identify_bytes = active_identify_bytes.saturating_add(
+                            Self::active_identify_vector_bytes(&current_run_vectors),
+                        );
+                        slab.runs.push(ActiveIdentifyRun {
+                            start_id,
+                            vectors: std::mem::take(&mut current_run_vectors),
+                        });
+                    }
+                    current_run_start = Some(id);
+                }
+                Some(_) => {}
+            }
+            current_run_vectors.extend_from_slice(vector.as_slice());
+            expected_next_id = id.saturating_add(1);
+        }
+
+        if let Some(start_id) = current_run_start.take() {
+            active_identify_bytes = active_identify_bytes
+                .saturating_add(Self::active_identify_vector_bytes(&current_run_vectors));
+            slab.runs.push(ActiveIdentifyRun {
+                start_id,
+                vectors: current_run_vectors,
+            });
+        }
+
+        Self::refresh_active_identify_bounds_locked(&mut slab, self.collection.dim);
+        *self.active_identify_slab.write() = slab;
+        self.active_identify_bytes
+            .store(active_identify_bytes, AtomicOrdering::Relaxed);
+        Ok(())
+    }
+
     fn mark_unindexed_chunks_indexed(&self, chunks: &[Arc<UnindexedChunk>]) {
         if chunks.is_empty() {
             return;
@@ -995,126 +1167,207 @@ impl ProductionState {
         out
     }
 
-    fn identify_unindexed_sequences(&self, query_sequence: &[Vec<f32>], k: usize) -> Vec<(usize, f32)> {
-        if query_sequence.is_empty() || k == 0 {
+    fn identify_anchor_offsets(query_sequence: &[Vec<f32>], max_probe_count: usize) -> Vec<usize> {
+        let seq_len = query_sequence.len();
+        let probe_count = seq_len.min(max_probe_count.max(1));
+        let min_anchor_gap = if seq_len >= 48 {
+            48
+        } else if seq_len >= 32 {
+            32
+        } else if seq_len >= 16 {
+            16
+        } else {
+            1
+        };
+
+        let mut salience = query_sequence
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, dot_product(v, v)))
+            .collect::<Vec<_>>();
+        salience.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+        let mut anchor_offsets = Vec::with_capacity(probe_count);
+        for (idx, _) in salience {
+            if anchor_offsets
+                .iter()
+                .all(|selected: &usize| selected.abs_diff(idx) >= min_anchor_gap)
+            {
+                anchor_offsets.push(idx);
+                if anchor_offsets.len() >= probe_count {
+                    break;
+                }
+            }
+        }
+        if anchor_offsets.is_empty() {
+            anchor_offsets.push(0);
+        }
+        anchor_offsets
+    }
+
+    fn locate_identify_run(runs: &[ExactIdentifyRunRef<'_>], dim: usize, id: usize) -> Option<usize> {
+        let idx = runs.partition_point(|run| run.end_id_exclusive(dim) <= id);
+        let run = runs.get(idx)?;
+        if id >= run.start_id && id < run.end_id_exclusive(dim) {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    fn verify_identify_candidate(
+        runs: &[ExactIdentifyRunRef<'_>],
+        dim: usize,
+        start_id: usize,
+        query_sequence: &[Vec<f32>],
+    ) -> Option<f32> {
+        let seq_len = query_sequence.len();
+        let mut run_idx = Self::locate_identify_run(runs, dim, start_id)?;
+        let mut current_run = runs[run_idx];
+        let mut local_idx = start_id.saturating_sub(current_run.start_id);
+        let mut total_sim = 0.0f32;
+
+        for query_vec in query_sequence {
+            if local_idx >= current_run.len(dim) {
+                run_idx = run_idx.saturating_add(1);
+                current_run = *runs.get(run_idx)?;
+                if current_run.start_id != start_id.saturating_add(local_idx) {
+                    return None;
+                }
+                local_idx = 0;
+            }
+            let stored_vec = current_run.vector_at(dim, local_idx)?;
+            total_sim += dot_product(query_vec, stored_vec);
+            local_idx = local_idx.saturating_add(1);
+        }
+
+        Some(total_sim / seq_len as f32)
+    }
+
+    fn identify_exact_over_runs(
+        &self,
+        runs: &[ExactIdentifyRunRef<'_>],
+        query_sequence: &[Vec<f32>],
+        k: usize,
+    ) -> Vec<(usize, f32)> {
+        if runs.is_empty() || query_sequence.is_empty() || k == 0 {
             return Vec::new();
         }
+
+        let dim = self.collection.dim;
+        let anchor_offsets = Self::identify_anchor_offsets(query_sequence, 1);
+        let anchor_overfetch = (k.saturating_mul(16)).max(64);
+        let mut candidate_starts = HashSet::with_capacity(anchor_overfetch * anchor_offsets.len());
+
+        #[derive(Clone, Copy, PartialEq)]
+        struct MinScore {
+            id: usize,
+            score: f32,
+        }
+        impl Eq for MinScore {}
+        impl PartialOrd for MinScore {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for MinScore {
+            fn cmp(&self, other: &Self) -> Ordering {
+                other
+                    .score
+                    .partial_cmp(&self.score)
+                    .unwrap_or(Ordering::Equal)
+            }
+        }
+
+        for anchor_offset in anchor_offsets {
+            let anchor_query = &query_sequence[anchor_offset];
+            let mut heap = std::collections::BinaryHeap::with_capacity(anchor_overfetch + 1);
+            for run in runs {
+                let len = run.len(dim);
+                for local_idx in 0..len {
+                    let anchor_id = run.start_id.saturating_add(local_idx);
+                    if anchor_id < anchor_offset {
+                        continue;
+                    }
+                    let start_id = anchor_id - anchor_offset;
+                    let Some(stored_vec) = run.vector_at(dim, local_idx) else {
+                        continue;
+                    };
+                    let score = dot_product(anchor_query, stored_vec);
+                    if heap.len() < anchor_overfetch {
+                        heap.push(MinScore { id: start_id, score });
+                    } else if let Some(worst) = heap.peek() {
+                        if score > worst.score {
+                            heap.pop();
+                            heap.push(MinScore { id: start_id, score });
+                        }
+                    }
+                }
+            }
+            while let Some(entry) = heap.pop() {
+                candidate_starts.insert(entry.id);
+            }
+        }
+
+        let mut topk = std::collections::BinaryHeap::with_capacity(k + 1);
+        for start_id in candidate_starts {
+            let Some(score) = Self::verify_identify_candidate(runs, dim, start_id, query_sequence)
+            else {
+                continue;
+            };
+            if topk.len() < k {
+                topk.push(MinScore { id: start_id, score });
+            } else if let Some(worst) = topk.peek() {
+                if score > worst.score {
+                    topk.pop();
+                    topk.push(MinScore { id: start_id, score });
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(topk.len());
+        while let Some(entry) = topk.pop() {
+            out.push((entry.id, entry.score));
+        }
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        out
+    }
+
+    fn identify_unindexed_sequences(&self, query_sequence: &[Vec<f32>], k: usize) -> Vec<(usize, f32)> {
         let snapshot = self.unindexed.chunks.load_full();
         if snapshot.is_empty() {
             return Vec::new();
         }
-        let dim = self.collection.dim;
-        let seq_len = query_sequence.len();
-        let resolve_vector = |id: u64| -> Option<&[f32]> {
-            for chunk in snapshot.iter() {
-                if id < chunk.vector_id_start || id > chunk.vector_id_end {
-                    continue;
-                }
-                let local_offset = (id.saturating_sub(chunk.vector_id_start)) as usize;
-                if let Some(row) = chunk.rows.get(local_offset) {
-                    if row.vector_id == id {
-                        let start = local_offset.saturating_mul(dim);
-                        let end = start.saturating_add(dim);
-                        if end <= chunk.vectors.len() {
-                            return Some(&chunk.vectors[start..end]);
-                        }
-                    }
-                }
-                // Defensive fallback if a future change introduces sparse row IDs.
-                if let Some(fallback_idx) = chunk.rows.iter().position(|row| row.vector_id == id) {
-                    let start = fallback_idx.saturating_mul(dim);
-                    let end = start.saturating_add(dim);
-                    if end <= chunk.vectors.len() {
-                        return Some(&chunk.vectors[start..end]);
-                    }
-                }
-            }
-            None
-        };
-
-        let mut best: FastIdMap<f32> = FastIdMap::default();
-        let mut start_ids = Vec::new();
-        for chunk in snapshot.iter() {
-            for row in &chunk.rows {
-                if let Ok(id) = usize::try_from(row.vector_id) {
-                    start_ids.push(id);
-                }
-            }
-        }
-        for start_id in start_ids {
-            let mut total_sim = 0.0f32;
-            let mut valid = true;
-            for (offset, query_vec) in query_sequence.iter().enumerate() {
-                let Some(id) = (start_id as u64).checked_add(offset as u64) else {
-                    valid = false;
-                    break;
-                };
-                let Some(stored_vec) = resolve_vector(id) else {
-                    valid = false;
-                    break;
-                };
-                total_sim += dot_product(query_vec, stored_vec);
-            }
-            if valid {
-                merge_best(&mut best, start_id, total_sim / seq_len as f32);
-            }
-        }
-
-        let mut out = best.into_iter().collect::<Vec<_>>();
-        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-        out.truncate(k);
-        out
+        let runs = snapshot
+            .iter()
+            .filter_map(|chunk| {
+                usize::try_from(chunk.vector_id_start)
+                    .ok()
+                    .map(|start_id| ExactIdentifyRunRef {
+                        start_id,
+                        vectors: chunk.vectors.as_slice(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        self.identify_exact_over_runs(&runs, query_sequence, k)
     }
 
     fn identify_hot_sequences_exact(&self, query_sequence: &[Vec<f32>], k: usize) -> Vec<(usize, f32)> {
         const EXACT_HOT_IDENTIFY_MAX_VECTORS: usize = 16_384;
 
-        if query_sequence.is_empty() || k == 0 {
+        let slab = self.active_identify_slab.read();
+        if slab.total_vectors == 0 || slab.total_vectors > EXACT_HOT_IDENTIFY_MAX_VECTORS {
             return Vec::new();
         }
-
-        let shard_guards = self
-            .hot_shards
+        let runs = slab
+            .runs
             .iter()
-            .map(|shard| shard.read())
+            .map(|run| ExactIdentifyRunRef {
+                start_id: run.start_id,
+                vectors: run.vectors.as_slice(),
+            })
             .collect::<Vec<_>>();
-        let hot_vector_count = shard_guards.iter().map(|guard| guard.vectors.len()).sum::<usize>();
-        if hot_vector_count == 0 || hot_vector_count > EXACT_HOT_IDENTIFY_MAX_VECTORS {
-            return Vec::new();
-        }
-
-        let hot_min_id = self.hot_min_id.load(AtomicOrdering::Relaxed);
-        let hot_max_id_exclusive = self.hot_max_id_exclusive.load(AtomicOrdering::Relaxed);
-        let seq_len = query_sequence.len();
-        if hot_max_id_exclusive <= hot_min_id
-            || seq_len > hot_max_id_exclusive.saturating_sub(hot_min_id)
-        {
-            return Vec::new();
-        }
-
-        let mut best: FastIdMap<f32> = FastIdMap::default();
-        let last_start_exclusive = hot_max_id_exclusive.saturating_sub(seq_len).saturating_add(1);
-        for start_id in hot_min_id..last_start_exclusive {
-            let mut total_sim = 0.0f32;
-            let mut valid = true;
-            for (offset, query_vec) in query_sequence.iter().enumerate() {
-                let id = start_id.saturating_add(offset);
-                let shard = id & self.shard_mask;
-                let Some(stored_vec) = shard_guards[shard].vectors.get(&id) else {
-                    valid = false;
-                    break;
-                };
-                total_sim += dot_product(query_vec, stored_vec.as_slice());
-            }
-            if valid {
-                merge_best(&mut best, start_id, total_sim / seq_len as f32);
-            }
-        }
-
-        let mut out = best.into_iter().collect::<Vec<_>>();
-        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-        out.truncate(k);
-        out
+        self.identify_exact_over_runs(&runs, query_sequence, k)
     }
 
     fn index_unindexed_chunk(&self, chunk: &Arc<UnindexedChunk>) -> Result<()> {
@@ -1215,6 +1468,19 @@ impl ProductionState {
         }
 
         if inserted_count > 0 {
+            if inserted_count == chunk.rows.len() {
+                self.append_active_identify_run(
+                    usize::try_from(chunk.vector_id_start).unwrap_or_else(|_| {
+                        panic!(
+                            "data integrity fault: active identify start id overflow id={}",
+                            chunk.vector_id_start
+                        )
+                    }),
+                    chunk.vectors.as_slice(),
+                )?;
+            } else {
+                self.rebuild_active_identify_slab_from_hot()?;
+            }
             self.hot_vectors_bytes
                 .fetch_add(vector_bytes_delta, AtomicOrdering::Relaxed);
             self.hnsw_graph_bytes.fetch_add(
@@ -1297,6 +1563,7 @@ impl ProductionState {
             .load(AtomicOrdering::Relaxed)
             .saturating_add(self.unindexed_bytes.load(AtomicOrdering::Relaxed))
             .saturating_add(self.hot_vectors_bytes.load(AtomicOrdering::Relaxed))
+            .saturating_add(self.active_identify_bytes.load(AtomicOrdering::Relaxed))
             .saturating_add(self.hnsw_graph_bytes.load(AtomicOrdering::Relaxed))
             .saturating_add(self.metadata_cache_bytes.load(AtomicOrdering::Relaxed))
             .saturating_add(self.inflight_decode_bytes.load(AtomicOrdering::Relaxed))
@@ -1522,6 +1789,8 @@ impl ProductionState {
             self.estimate_hnsw_bytes_per_vector(),
             AtomicOrdering::Relaxed,
         );
+        self.append_active_identify_run(vector_id, vector_arc.as_slice())
+            .unwrap_or_else(|err| panic!("data integrity fault: active identify slab append failed: {err}"));
         self.update_hot_window_from_created_range(vector_id, vector_id.saturating_add(1));
     }
 
@@ -3300,6 +3569,7 @@ impl ProductionState {
             self.hot_max_id_exclusive
                 .store(hot_max_id_exclusive, AtomicOrdering::Relaxed);
         }
+        self.rebuild_active_identify_slab_from_hot()?;
 
         Ok(())
     }
