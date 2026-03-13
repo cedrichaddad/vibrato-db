@@ -317,6 +317,272 @@ unsafe fn l2_distance_squared_avx2_aligned(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // ============================================================================
+// Batched dot-product scoring for identify hot path
+// ============================================================================
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_product_scores4_neon_const<const CHUNKS: usize>(
+    query: &[f32],
+    candidates: &[f32],
+    out: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    debug_assert_eq!(query.len(), CHUNKS * 4);
+    debug_assert!(candidates.len() >= 4 * query.len());
+    debug_assert!(out.len() >= 4);
+
+    let dim = query.len();
+    let q_ptr = query.as_ptr();
+    let c0 = candidates.as_ptr();
+    let c1 = c0.add(dim);
+    let c2 = c1.add(dim);
+    let c3 = c2.add(dim);
+
+    let mut acc0_a = vdupq_n_f32(0.0);
+    let mut acc0_b = vdupq_n_f32(0.0);
+    let mut acc1_a = vdupq_n_f32(0.0);
+    let mut acc1_b = vdupq_n_f32(0.0);
+    let mut acc2_a = vdupq_n_f32(0.0);
+    let mut acc2_b = vdupq_n_f32(0.0);
+    let mut acc3_a = vdupq_n_f32(0.0);
+    let mut acc3_b = vdupq_n_f32(0.0);
+
+    let mut i = 0usize;
+    while i + 1 < CHUNKS {
+        let base0 = i * 4;
+        let base1 = (i + 1) * 4;
+
+        let q0 = vld1q_f32(q_ptr.add(base0));
+        let q1 = vld1q_f32(q_ptr.add(base1));
+
+        acc0_a = vfmaq_f32(acc0_a, q0, vld1q_f32(c0.add(base0)));
+        acc0_b = vfmaq_f32(acc0_b, q1, vld1q_f32(c0.add(base1)));
+        acc1_a = vfmaq_f32(acc1_a, q0, vld1q_f32(c1.add(base0)));
+        acc1_b = vfmaq_f32(acc1_b, q1, vld1q_f32(c1.add(base1)));
+        acc2_a = vfmaq_f32(acc2_a, q0, vld1q_f32(c2.add(base0)));
+        acc2_b = vfmaq_f32(acc2_b, q1, vld1q_f32(c2.add(base1)));
+        acc3_a = vfmaq_f32(acc3_a, q0, vld1q_f32(c3.add(base0)));
+        acc3_b = vfmaq_f32(acc3_b, q1, vld1q_f32(c3.add(base1)));
+        i += 2;
+    }
+
+    if i < CHUNKS {
+        let base = i * 4;
+        let q = vld1q_f32(q_ptr.add(base));
+        acc0_a = vfmaq_f32(acc0_a, q, vld1q_f32(c0.add(base)));
+        acc1_a = vfmaq_f32(acc1_a, q, vld1q_f32(c1.add(base)));
+        acc2_a = vfmaq_f32(acc2_a, q, vld1q_f32(c2.add(base)));
+        acc3_a = vfmaq_f32(acc3_a, q, vld1q_f32(c3.add(base)));
+    }
+
+    out[0] = vaddvq_f32(vaddq_f32(acc0_a, acc0_b));
+    out[1] = vaddvq_f32(vaddq_f32(acc1_a, acc1_b));
+    out[2] = vaddvq_f32(vaddq_f32(acc2_a, acc2_b));
+    out[3] = vaddvq_f32(vaddq_f32(acc3_a, acc3_b));
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_product_scores4_neon(query: &[f32], candidates: &[f32], dim: usize, out: &mut [f32]) {
+    use std::arch::aarch64::*;
+
+    debug_assert_eq!(query.len(), dim);
+    debug_assert!(candidates.len() >= 4 * dim);
+    debug_assert!(dim.is_multiple_of(4));
+
+    let chunks = dim / 4;
+    let q_ptr = query.as_ptr();
+    let c0 = candidates.as_ptr();
+    let c1 = c0.add(dim);
+    let c2 = c1.add(dim);
+    let c3 = c2.add(dim);
+
+    let mut acc0_a = vdupq_n_f32(0.0);
+    let mut acc0_b = vdupq_n_f32(0.0);
+    let mut acc1_a = vdupq_n_f32(0.0);
+    let mut acc1_b = vdupq_n_f32(0.0);
+    let mut acc2_a = vdupq_n_f32(0.0);
+    let mut acc2_b = vdupq_n_f32(0.0);
+    let mut acc3_a = vdupq_n_f32(0.0);
+    let mut acc3_b = vdupq_n_f32(0.0);
+
+    let mut i = 0usize;
+    while i + 1 < chunks {
+        let base0 = i * 4;
+        let base1 = (i + 1) * 4;
+
+        let q0 = vld1q_f32(q_ptr.add(base0));
+        let q1 = vld1q_f32(q_ptr.add(base1));
+
+        acc0_a = vfmaq_f32(acc0_a, q0, vld1q_f32(c0.add(base0)));
+        acc0_b = vfmaq_f32(acc0_b, q1, vld1q_f32(c0.add(base1)));
+        acc1_a = vfmaq_f32(acc1_a, q0, vld1q_f32(c1.add(base0)));
+        acc1_b = vfmaq_f32(acc1_b, q1, vld1q_f32(c1.add(base1)));
+        acc2_a = vfmaq_f32(acc2_a, q0, vld1q_f32(c2.add(base0)));
+        acc2_b = vfmaq_f32(acc2_b, q1, vld1q_f32(c2.add(base1)));
+        acc3_a = vfmaq_f32(acc3_a, q0, vld1q_f32(c3.add(base0)));
+        acc3_b = vfmaq_f32(acc3_b, q1, vld1q_f32(c3.add(base1)));
+        i += 2;
+    }
+
+    if i < chunks {
+        let base = i * 4;
+        let q = vld1q_f32(q_ptr.add(base));
+        acc0_a = vfmaq_f32(acc0_a, q, vld1q_f32(c0.add(base)));
+        acc1_a = vfmaq_f32(acc1_a, q, vld1q_f32(c1.add(base)));
+        acc2_a = vfmaq_f32(acc2_a, q, vld1q_f32(c2.add(base)));
+        acc3_a = vfmaq_f32(acc3_a, q, vld1q_f32(c3.add(base)));
+    }
+
+    out[0] = vaddvq_f32(vaddq_f32(acc0_a, acc0_b));
+    out[1] = vaddvq_f32(vaddq_f32(acc1_a, acc1_b));
+    out[2] = vaddvq_f32(vaddq_f32(acc2_a, acc2_b));
+    out[3] = vaddvq_f32(vaddq_f32(acc3_a, acc3_b));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline(always)]
+unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let result = _mm_add_ss(sums, shuf2);
+    _mm_cvtss_f32(result)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline(always)]
+unsafe fn dot_product_scores4_avx2_const<const CHUNKS: usize>(
+    query: &[f32],
+    candidates: &[f32],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(query.len(), CHUNKS * 8);
+    debug_assert!(candidates.len() >= 4 * query.len());
+    debug_assert!(out.len() >= 4);
+
+    let dim = query.len();
+    let q_ptr = query.as_ptr();
+    let c0 = candidates.as_ptr();
+    let c1 = c0.add(dim);
+    let c2 = c1.add(dim);
+    let c3 = c2.add(dim);
+
+    let mut acc0_a = _mm256_setzero_ps();
+    let mut acc0_b = _mm256_setzero_ps();
+    let mut acc1_a = _mm256_setzero_ps();
+    let mut acc1_b = _mm256_setzero_ps();
+    let mut acc2_a = _mm256_setzero_ps();
+    let mut acc2_b = _mm256_setzero_ps();
+    let mut acc3_a = _mm256_setzero_ps();
+    let mut acc3_b = _mm256_setzero_ps();
+
+    let mut i = 0usize;
+    while i + 1 < CHUNKS {
+        let base0 = i * 8;
+        let base1 = (i + 1) * 8;
+
+        let q0 = _mm256_loadu_ps(q_ptr.add(base0));
+        let q1 = _mm256_loadu_ps(q_ptr.add(base1));
+
+        acc0_a = _mm256_fmadd_ps(q0, _mm256_loadu_ps(c0.add(base0)), acc0_a);
+        acc0_b = _mm256_fmadd_ps(q1, _mm256_loadu_ps(c0.add(base1)), acc0_b);
+        acc1_a = _mm256_fmadd_ps(q0, _mm256_loadu_ps(c1.add(base0)), acc1_a);
+        acc1_b = _mm256_fmadd_ps(q1, _mm256_loadu_ps(c1.add(base1)), acc1_b);
+        acc2_a = _mm256_fmadd_ps(q0, _mm256_loadu_ps(c2.add(base0)), acc2_a);
+        acc2_b = _mm256_fmadd_ps(q1, _mm256_loadu_ps(c2.add(base1)), acc2_b);
+        acc3_a = _mm256_fmadd_ps(q0, _mm256_loadu_ps(c3.add(base0)), acc3_a);
+        acc3_b = _mm256_fmadd_ps(q1, _mm256_loadu_ps(c3.add(base1)), acc3_b);
+        i += 2;
+    }
+
+    if i < CHUNKS {
+        let base = i * 8;
+        let q = _mm256_loadu_ps(q_ptr.add(base));
+        acc0_a = _mm256_fmadd_ps(q, _mm256_loadu_ps(c0.add(base)), acc0_a);
+        acc1_a = _mm256_fmadd_ps(q, _mm256_loadu_ps(c1.add(base)), acc1_a);
+        acc2_a = _mm256_fmadd_ps(q, _mm256_loadu_ps(c2.add(base)), acc2_a);
+        acc3_a = _mm256_fmadd_ps(q, _mm256_loadu_ps(c3.add(base)), acc3_a);
+    }
+
+    out[0] = hsum256_ps(_mm256_add_ps(acc0_a, acc0_b));
+    out[1] = hsum256_ps(_mm256_add_ps(acc1_a, acc1_b));
+    out[2] = hsum256_ps(_mm256_add_ps(acc2_a, acc2_b));
+    out[3] = hsum256_ps(_mm256_add_ps(acc3_a, acc3_b));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline(always)]
+unsafe fn dot_product_scores4_avx2(query: &[f32], candidates: &[f32], dim: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(query.len(), dim);
+    debug_assert!(candidates.len() >= 4 * dim);
+    debug_assert!(dim.is_multiple_of(8));
+
+    let chunks = dim / 8;
+    let q_ptr = query.as_ptr();
+    let c0 = candidates.as_ptr();
+    let c1 = c0.add(dim);
+    let c2 = c1.add(dim);
+    let c3 = c2.add(dim);
+
+    let mut acc0_a = _mm256_setzero_ps();
+    let mut acc0_b = _mm256_setzero_ps();
+    let mut acc1_a = _mm256_setzero_ps();
+    let mut acc1_b = _mm256_setzero_ps();
+    let mut acc2_a = _mm256_setzero_ps();
+    let mut acc2_b = _mm256_setzero_ps();
+    let mut acc3_a = _mm256_setzero_ps();
+    let mut acc3_b = _mm256_setzero_ps();
+
+    let mut i = 0usize;
+    while i + 1 < chunks {
+        let base0 = i * 8;
+        let base1 = (i + 1) * 8;
+
+        let q0 = _mm256_loadu_ps(q_ptr.add(base0));
+        let q1 = _mm256_loadu_ps(q_ptr.add(base1));
+
+        acc0_a = _mm256_fmadd_ps(q0, _mm256_loadu_ps(c0.add(base0)), acc0_a);
+        acc0_b = _mm256_fmadd_ps(q1, _mm256_loadu_ps(c0.add(base1)), acc0_b);
+        acc1_a = _mm256_fmadd_ps(q0, _mm256_loadu_ps(c1.add(base0)), acc1_a);
+        acc1_b = _mm256_fmadd_ps(q1, _mm256_loadu_ps(c1.add(base1)), acc1_b);
+        acc2_a = _mm256_fmadd_ps(q0, _mm256_loadu_ps(c2.add(base0)), acc2_a);
+        acc2_b = _mm256_fmadd_ps(q1, _mm256_loadu_ps(c2.add(base1)), acc2_b);
+        acc3_a = _mm256_fmadd_ps(q0, _mm256_loadu_ps(c3.add(base0)), acc3_a);
+        acc3_b = _mm256_fmadd_ps(q1, _mm256_loadu_ps(c3.add(base1)), acc3_b);
+        i += 2;
+    }
+
+    if i < chunks {
+        let base = i * 8;
+        let q = _mm256_loadu_ps(q_ptr.add(base));
+        acc0_a = _mm256_fmadd_ps(q, _mm256_loadu_ps(c0.add(base)), acc0_a);
+        acc1_a = _mm256_fmadd_ps(q, _mm256_loadu_ps(c1.add(base)), acc1_a);
+        acc2_a = _mm256_fmadd_ps(q, _mm256_loadu_ps(c2.add(base)), acc2_a);
+        acc3_a = _mm256_fmadd_ps(q, _mm256_loadu_ps(c3.add(base)), acc3_a);
+    }
+
+    out[0] = hsum256_ps(_mm256_add_ps(acc0_a, acc0_b));
+    out[1] = hsum256_ps(_mm256_add_ps(acc1_a, acc1_b));
+    out[2] = hsum256_ps(_mm256_add_ps(acc2_a, acc2_b));
+    out[3] = hsum256_ps(_mm256_add_ps(acc3_a, acc3_b));
+}
+
+// ============================================================================
 // Scalar fallback (auto-vectorized by LLVM)
 // ============================================================================
 
@@ -373,6 +639,164 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 
     #[allow(unreachable_code)]
     dot_product_scalar(a, b)
+}
+
+/// Compute dot products from one query against a contiguous slab of candidate vectors.
+///
+/// `candidates` must contain `out.len()` back-to-back vectors of length `dim`.
+pub fn dot_product_scores(query: &[f32], candidates: &[f32], dim: usize, out: &mut [f32]) {
+    assert_eq!(query.len(), dim, "Query length mismatch");
+    assert_eq!(
+        candidates.len(),
+        out.len().saturating_mul(dim),
+        "Candidate slab length mismatch"
+    );
+    if out.is_empty() {
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let groups = out.len() / 4;
+        let remainder = out.len() % 4;
+
+        if dim == 128 {
+            for group_idx in 0..groups {
+                let cand_base = group_idx * 4 * dim;
+                unsafe {
+                    dot_product_scores4_neon_const::<32>(
+                        query,
+                        &candidates[cand_base..cand_base + 4 * dim],
+                        &mut out[group_idx * 4..group_idx * 4 + 4],
+                    );
+                }
+            }
+        } else if dim == 256 {
+            for group_idx in 0..groups {
+                let cand_base = group_idx * 4 * dim;
+                unsafe {
+                    dot_product_scores4_neon_const::<64>(
+                        query,
+                        &candidates[cand_base..cand_base + 4 * dim],
+                        &mut out[group_idx * 4..group_idx * 4 + 4],
+                    );
+                }
+            }
+        } else if dim.is_multiple_of(4) {
+            for group_idx in 0..groups {
+                let cand_base = group_idx * 4 * dim;
+                unsafe {
+                    dot_product_scores4_neon(
+                        query,
+                        &candidates[cand_base..cand_base + 4 * dim],
+                        dim,
+                        &mut out[group_idx * 4..group_idx * 4 + 4],
+                    );
+                }
+            }
+        } else {
+            for (idx, candidate) in candidates.chunks_exact(dim).enumerate() {
+                out[idx] = dot_product(query, candidate);
+            }
+            return;
+        }
+
+        let tail_base = groups * 4;
+        for tail_idx in 0..remainder {
+            let idx = tail_base + tail_idx;
+            let start = idx * dim;
+            out[idx] = dot_product(query, &candidates[start..start + dim]);
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            let groups = out.len() / 4;
+            let remainder = out.len() % 4;
+            if dim == 128 {
+                for group_idx in 0..groups {
+                    let cand_base = group_idx * 4 * dim;
+                    if group_idx + 1 < groups {
+                        unsafe {
+                            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                            _mm_prefetch(
+                                candidates.as_ptr().add((group_idx + 1) * 4 * dim) as *const i8,
+                                _MM_HINT_T0,
+                            );
+                        }
+                    }
+                    unsafe {
+                        dot_product_scores4_avx2_const::<16>(
+                            query,
+                            &candidates[cand_base..cand_base + 4 * dim],
+                            &mut out[group_idx * 4..group_idx * 4 + 4],
+                        );
+                    }
+                }
+            } else if dim == 256 {
+                for group_idx in 0..groups {
+                    let cand_base = group_idx * 4 * dim;
+                    if group_idx + 1 < groups {
+                        unsafe {
+                            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                            _mm_prefetch(
+                                candidates.as_ptr().add((group_idx + 1) * 4 * dim) as *const i8,
+                                _MM_HINT_T0,
+                            );
+                        }
+                    }
+                    unsafe {
+                        dot_product_scores4_avx2_const::<32>(
+                            query,
+                            &candidates[cand_base..cand_base + 4 * dim],
+                            &mut out[group_idx * 4..group_idx * 4 + 4],
+                        );
+                    }
+                }
+            } else if dim.is_multiple_of(8) {
+                for group_idx in 0..groups {
+                    let cand_base = group_idx * 4 * dim;
+                    if group_idx + 1 < groups && dim >= 128 {
+                        unsafe {
+                            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                            _mm_prefetch(
+                                candidates.as_ptr().add((group_idx + 1) * 4 * dim) as *const i8,
+                                _MM_HINT_T0,
+                            );
+                        }
+                    }
+                    unsafe {
+                        dot_product_scores4_avx2(
+                            query,
+                            &candidates[cand_base..cand_base + 4 * dim],
+                            dim,
+                            &mut out[group_idx * 4..group_idx * 4 + 4],
+                        );
+                    }
+                }
+            } else {
+                for (idx, candidate) in candidates.chunks_exact(dim).enumerate() {
+                    out[idx] = dot_product(query, candidate);
+                }
+                return;
+            }
+
+            let tail_base = groups * 4;
+            for tail_idx in 0..remainder {
+                let idx = tail_base + tail_idx;
+                let start = idx * dim;
+                out[idx] = dot_product(query, &candidates[start..start + dim]);
+            }
+            return;
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    for (idx, candidate) in candidates.chunks_exact(dim).enumerate() {
+        out[idx] = dot_product(query, candidate);
+    }
 }
 
 /// Compute squared L2 (Euclidean) distance between two vectors
@@ -611,5 +1035,49 @@ mod tests {
         // Just verify it completes and returns reasonable value
         let result = dot_product(&a, &b);
         assert!(result.is_finite(), "Result should be finite");
+    }
+
+    fn assert_batched_scores_match_scalar(dim: usize, candidate_count: usize) {
+        let query = (0..dim)
+            .map(|idx| ((idx % 17) as f32 - 8.0) / 17.0)
+            .collect::<Vec<_>>();
+        let mut candidates = Vec::with_capacity(dim * candidate_count);
+        for candidate_idx in 0..candidate_count {
+            for lane_idx in 0..dim {
+                candidates.push((((candidate_idx * 13 + lane_idx * 7) % 31) as f32 - 15.0) / 31.0);
+            }
+        }
+        let mut scores = vec![0.0f32; candidate_count];
+        dot_product_scores(&query, &candidates, dim, &mut scores);
+
+        for (idx, candidate) in candidates.chunks_exact(dim).enumerate() {
+            let expected = dot_product(&query, candidate);
+            assert!(
+                (scores[idx] - expected).abs() < 1e-4,
+                "dim={dim} candidate_count={candidate_count} idx={idx} expected={expected} got={}",
+                scores[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn test_dot_product_scores_matches_scalar_specialized_128() {
+        for candidate_count in [3usize, 4, 7] {
+            assert_batched_scores_match_scalar(128, candidate_count);
+        }
+    }
+
+    #[test]
+    fn test_dot_product_scores_matches_scalar_specialized_256() {
+        for candidate_count in [3usize, 4, 7] {
+            assert_batched_scores_match_scalar(256, candidate_count);
+        }
+    }
+
+    #[test]
+    fn test_dot_product_scores_matches_scalar_generic_dim() {
+        for candidate_count in [3usize, 4, 7] {
+            assert_batched_scores_match_scalar(96, candidate_count);
+        }
     }
 }

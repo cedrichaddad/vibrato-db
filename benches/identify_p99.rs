@@ -113,6 +113,11 @@ fn add_gaussian_noise(base: &[f32], sigma: f32, rng: &mut StdRng) -> Vec<f32> {
     l2_normalized(&noisy)
 }
 
+fn low_information_query(base: &[Vec<f32>], query_len: usize) -> Vec<Vec<f32>> {
+    let frame = base[0].clone();
+    vec![frame; query_len]
+}
+
 fn build_tracks(dim: usize, track_count: usize, track_len: usize) -> Vec<TrackData> {
     let base_seeds = [
         0xA1A1_A1A1_A1A1_A1A1u64,
@@ -221,7 +226,7 @@ fn build_hot_state(
                         Vec::new()
                     },
                 },
-            );
+            )?;
         }
     }
 
@@ -286,8 +291,15 @@ fn build_unindexed_state(
     Ok((state, dir))
 }
 
-fn measure_case(state: &ProductionState, requests: &[(IdentifyRequestV2, usize)]) -> Result<LatencyStats> {
-    if let Some((request, expected_id)) = requests.first() {
+fn measure_case(
+    state: &ProductionState,
+    requests: &[(IdentifyRequestV2, usize)],
+    verify_top1: bool,
+) -> Result<LatencyStats> {
+    if verify_top1 {
+        let Some((request, expected_id)) = requests.first() else {
+            return Err(anyhow!("identify benchmark requires at least one request"));
+        };
         let response = state.identify(request)?;
         let top_id = response.results.first().map(|row| row.id);
         if top_id != Some(*expected_id) {
@@ -351,6 +363,21 @@ fn main() -> Result<()> {
         include_metadata,
         Some(noise_sigma),
     );
+    let low_information_requests = (0..num_queries)
+        .map(|probe| {
+            let track = &tracks[probe % tracks.len()];
+            (
+                IdentifyRequestV2 {
+                    vectors: low_information_query(&track.frames, query_len),
+                    k,
+                    ef,
+                    include_metadata,
+                    search_tier: SearchTier::Active,
+                },
+                track.id_offset,
+            )
+        })
+        .collect::<Vec<_>>();
 
     println!(
         "identify_p99 benchmark: dim={} tracks={} track_len={} query_len={} queries={} k={} ef={} include_metadata={} noise_sigma={}",
@@ -365,28 +392,34 @@ fn main() -> Result<()> {
         noise_sigma
     );
 
-    let hot_exact = measure_case(&hot_state, &exact_requests)?;
+    let hot_exact = measure_case(&hot_state, &exact_requests, true)?;
     println!(
         "case=hot_exact p50={:.2}us p95={:.2}us p99={:.2}us",
         hot_exact.p50_us, hot_exact.p95_us, hot_exact.p99_us
     );
 
-    let hot_noisy = measure_case(&hot_state, &noisy_requests)?;
+    let hot_noisy = measure_case(&hot_state, &noisy_requests, true)?;
     println!(
         "case=hot_noisy p50={:.2}us p95={:.2}us p99={:.2}us",
         hot_noisy.p50_us, hot_noisy.p95_us, hot_noisy.p99_us
     );
 
-    let unindexed_exact = measure_case(&unindexed_state, &exact_requests)?;
+    let unindexed_exact = measure_case(&unindexed_state, &exact_requests, true)?;
     println!(
         "case=unindexed_exact p50={:.2}us p95={:.2}us p99={:.2}us",
         unindexed_exact.p50_us, unindexed_exact.p95_us, unindexed_exact.p99_us
     );
 
-    let unindexed_noisy = measure_case(&unindexed_state, &noisy_requests)?;
+    let unindexed_noisy = measure_case(&unindexed_state, &noisy_requests, true)?;
     println!(
         "case=unindexed_noisy p50={:.2}us p95={:.2}us p99={:.2}us",
         unindexed_noisy.p50_us, unindexed_noisy.p95_us, unindexed_noisy.p99_us
+    );
+
+    let hot_low_information = measure_case(&hot_state, &low_information_requests, false)?;
+    println!(
+        "case=hot_low_information p50={:.2}us p95={:.2}us p99={:.2}us",
+        hot_low_information.p50_us, hot_low_information.p95_us, hot_low_information.p99_us
     );
 
     Ok(())
