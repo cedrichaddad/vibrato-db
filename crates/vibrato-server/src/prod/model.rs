@@ -183,8 +183,23 @@ pub struct IdentifyRequestV3 {
     pub ef: usize,
     #[serde(default = "default_true")]
     pub include_metadata: bool,
+    #[serde(default)]
+    pub future_steps: usize,
+    #[serde(default)]
+    pub include_sequence_metadata: bool,
     #[serde(default = "default_identify_search_tier")]
     pub search_tier: SearchTier,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentifySequenceSpanV3 {
+    pub start_id: usize,
+    pub end_id: usize,
+    pub length: usize,
+    pub start_timestamp_ms: u64,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +210,13 @@ pub struct IdentifyResultV3 {
     pub score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<MetadataEnvelopeV3>,
+    pub matched_sequence: IdentifySequenceSpanV3,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub future_sequence: Option<IdentifySequenceSpanV3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_sequence_metadata: Option<Vec<MetadataEnvelopeV3>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub future_sequence_metadata: Option<Vec<MetadataEnvelopeV3>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

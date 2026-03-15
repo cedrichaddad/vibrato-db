@@ -41,8 +41,8 @@ use super::catalog::{
 use super::filter::BitmapSet;
 use super::model::{
     AuditEvent, IdentifyRequestV2, IdentifyResponseV2, IdentifyResultV2, JobResponseV2,
-    MetadataEnvelopeV3, QueryRequestV2, QueryResponseV2, QueryResultV2, SearchTier,
-    StatsResponseV2,
+    IdentifySequenceSpanV3, MetadataEnvelopeV3, QueryRequestV2, QueryResponseV2, QueryResultV2,
+    SearchTier, StatsResponseV2,
 };
 
 #[derive(Default)]
@@ -164,14 +164,17 @@ struct ActiveIdentifyArena {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct IdentifyScoreEntry {
-    id: usize,
+    start_id: usize,
     primary_score: f32,
-    known_sum: f32,
-    known_mask: u8,
+    secondary_score: f32,
+    tertiary_score: f32,
+    run_idx: usize,
+    local_idx: usize,
 }
 
 thread_local! {
     static IDENTIFY_CANDIDATE_SCRATCH: RefCell<Vec<IdentifyScoreEntry>> = RefCell::new(Vec::new());
+    static IDENTIFY_BLOCK_CANDIDATE_SCRATCH: RefCell<Vec<IdentifyScoreEntry>> = RefCell::new(Vec::new());
     static IDENTIFY_TILE_SCORE_SCRATCH: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
@@ -180,6 +183,7 @@ thread_local! {
 struct AnchorPlan {
     primary_offset: usize,
     secondary_offset: Option<usize>,
+    tertiary_offset: Option<usize>,
     max_delta_sq: f32,
     max_norm_sq: f32,
     low_information: bool,
@@ -1384,6 +1388,7 @@ impl ProductionState {
             return Some(AnchorPlan {
                 primary_offset: 0,
                 secondary_offset: None,
+                tertiary_offset: None,
                 max_delta_sq: 0.0,
                 max_norm_sq,
                 low_information: true,
@@ -1402,9 +1407,14 @@ impl ProductionState {
         if max_delta_sq < 1e-5 {
             let primary_offset = seq_len / 2;
             let secondary_offset = (seq_len >= 8).then_some(seq_len / 4);
+            let tertiary_offset = (seq_len >= 12).then_some((seq_len * 3) / 4);
             return Some(AnchorPlan {
                 primary_offset,
                 secondary_offset: secondary_offset.filter(|offset| *offset != primary_offset),
+                tertiary_offset: tertiary_offset.filter(|offset| {
+                    *offset != primary_offset
+                        && secondary_offset.map(|secondary| secondary != *offset).unwrap_or(true)
+                }),
                 max_delta_sq,
                 max_norm_sq,
                 low_information: true,
@@ -1422,10 +1432,20 @@ impl ProductionState {
             .iter()
             .copied()
             .find_map(|(idx, _)| (idx != primary_offset && idx.abs_diff(primary_offset) >= min_gap).then_some(idx));
+        let tertiary_offset = salience.iter().copied().find_map(|(idx, _)| {
+            (idx != primary_offset
+                && secondary_offset.map(|secondary| idx != secondary).unwrap_or(true)
+                && idx.abs_diff(primary_offset) >= min_gap
+                && secondary_offset
+                    .map(|secondary| idx.abs_diff(secondary) >= min_gap / 2)
+                    .unwrap_or(true))
+            .then_some(idx)
+        });
 
         Some(AnchorPlan {
             primary_offset,
             secondary_offset,
+            tertiary_offset,
             max_delta_sq,
             max_norm_sq,
             low_information: false,
@@ -1442,12 +1462,45 @@ impl ProductionState {
     }
 
     #[inline(always)]
-    fn identify_known_mask_for_plan(anchor_plan: &AnchorPlan) -> u8 {
-        let mut mask = 0b01;
-        if anchor_plan.secondary_offset.is_some() {
-            mask |= 0b10;
+    fn identify_block_size(dim: usize) -> usize {
+        match dim {
+            128 => 2048,
+            256 => 1024,
+            _ => 1024,
         }
-        mask
+    }
+
+    #[inline(always)]
+    fn identify_primary_keep(anchor_plan: &AnchorPlan, k: usize) -> usize {
+        if anchor_plan.low_information {
+            (k.saturating_mul(32)).max(128)
+        } else if anchor_plan.max_delta_sq >= 0.35 {
+            (k.saturating_mul(16)).max(64)
+        } else {
+            (k.saturating_mul(24)).max(96)
+        }
+    }
+
+    #[inline(always)]
+    fn identify_secondary_keep(anchor_plan: &AnchorPlan, k: usize) -> usize {
+        if anchor_plan.low_information {
+            (k.saturating_mul(8)).max(32)
+        } else if anchor_plan.max_delta_sq >= 0.35 {
+            (k.saturating_mul(4)).max(16)
+        } else {
+            (k.saturating_mul(6)).max(24)
+        }
+    }
+
+    #[inline(always)]
+    fn identify_tertiary_keep(anchor_plan: &AnchorPlan, k: usize) -> usize {
+        if anchor_plan.low_information {
+            (k.saturating_mul(4)).max(16)
+        } else if anchor_plan.max_delta_sq >= 0.35 {
+            (k.saturating_mul(2)).max(8)
+        } else {
+            (k.saturating_mul(3)).max(12)
+        }
     }
 
     #[inline(always)]
@@ -1494,10 +1547,36 @@ impl ProductionState {
         Some(dot_product(query_vec, stored))
     }
 
+    #[inline(always)]
+    fn identify_candidate_anchor_score_cached<V: IdentifyRunView + ?Sized>(
+        view: &V,
+        dim: usize,
+        candidate: &IdentifyScoreEntry,
+        primary_offset: usize,
+        anchor_offset: usize,
+        query_vec: &[f32],
+    ) -> Option<f32> {
+        let target_id = candidate.start_id.saturating_add(anchor_offset);
+        let delta = anchor_offset as isize - primary_offset as isize;
+        let target_local = candidate.local_idx as isize + delta;
+        if target_local >= 0 {
+            let target_local = target_local as usize;
+            let run_start = view.run_start_id(candidate.run_idx);
+            let run_len = view.run_len(candidate.run_idx, dim);
+            if target_local < run_len
+                && run_start.saturating_add(target_local) == target_id
+            {
+                let stored = view.vector_at(candidate.run_idx, dim, target_local)?;
+                return Some(dot_product(query_vec, stored));
+            }
+        }
+        Self::identify_candidate_anchor_score(view, dim, candidate.start_id, anchor_offset, query_vec)
+    }
+
     fn verify_identify_candidate<V: IdentifyRunView + ?Sized>(
         view: &V,
         dim: usize,
-        start_id: usize,
+        candidate: &IdentifyScoreEntry,
         query_sequence: &[Vec<f32>],
         anchor_plan: &AnchorPlan,
         known_mask: u8,
@@ -1505,11 +1584,27 @@ impl ProductionState {
         worst_topk_score: f32,
         bound_epsilon: f32,
     ) -> Option<f32> {
+        let start_id = candidate.start_id;
         let seq_len = query_sequence.len();
-        let mut run_idx = Self::locate_identify_run(view, dim, start_id)?;
-        let mut current_run_start = view.run_start_id(run_idx);
-        let mut current_run_len = view.run_len(run_idx, dim);
-        let mut local_idx = start_id.saturating_sub(current_run_start);
+        let (mut run_idx, mut current_run_len, mut local_idx) =
+            if candidate.local_idx >= anchor_plan.primary_offset {
+                let start_local_idx = candidate.local_idx - anchor_plan.primary_offset;
+                let run_start = view.run_start_id(candidate.run_idx);
+                let run_len = view.run_len(candidate.run_idx, dim);
+                if run_start.saturating_add(start_local_idx) == start_id && start_local_idx < run_len {
+                    (candidate.run_idx, run_len, start_local_idx)
+                } else {
+                    let run_idx = Self::locate_identify_run(view, dim, start_id)?;
+                    let run_start = view.run_start_id(run_idx);
+                    let run_len = view.run_len(run_idx, dim);
+                    (run_idx, run_len, start_id.saturating_sub(run_start))
+                }
+            } else {
+                let run_idx = Self::locate_identify_run(view, dim, start_id)?;
+                let run_start = view.run_start_id(run_idx);
+                let run_len = view.run_len(run_idx, dim);
+                (run_idx, run_len, start_id.saturating_sub(run_start))
+            };
         let mut total_sim = known_sum;
 
         for (query_idx, query_vec) in query_sequence.iter().enumerate() {
@@ -1518,7 +1613,7 @@ impl ProductionState {
                 if run_idx >= view.run_count() {
                     return None;
                 }
-                current_run_start = view.run_start_id(run_idx);
+                let current_run_start = view.run_start_id(run_idx);
                 if current_run_start != start_id.saturating_add(query_idx) {
                     return None;
                 }
@@ -1532,7 +1627,12 @@ impl ProductionState {
                     .secondary_offset
                     .map(|offset| offset == query_idx)
                     .unwrap_or(false);
-            if !(skip_primary || skip_secondary) {
+            let skip_tertiary = (known_mask & 0b100) != 0
+                && anchor_plan
+                    .tertiary_offset
+                    .map(|offset| offset == query_idx)
+                    .unwrap_or(false);
+            if !(skip_primary || skip_secondary || skip_tertiary) {
                 let stored = view.vector_at(run_idx, dim, local_idx)?;
                 total_sim += dot_product(query_vec, stored);
             }
@@ -1563,13 +1663,10 @@ impl ProductionState {
 
         let dim = self.collection.dim;
         let anchor_query = &query_sequence[anchor_plan.primary_offset];
-        let anchor_overfetch = (k.saturating_mul(16)).max(64);
-        let total_vectors = (0..view.run_count())
-            .map(|run_idx| view.run_len(run_idx, dim))
-            .sum::<usize>();
-        if total_vectors == 0 {
-            return Vec::new();
-        }
+        let primary_keep = Self::identify_primary_keep(anchor_plan, k);
+        let secondary_keep = Self::identify_secondary_keep(anchor_plan, k);
+        let tertiary_keep = Self::identify_tertiary_keep(anchor_plan, k);
+        let block_size = Self::identify_block_size(dim);
 
         #[derive(Clone, Copy, PartialEq)]
         struct MinScore {
@@ -1594,156 +1691,254 @@ impl ProductionState {
         let tile_width = Self::identify_tile_width(dim);
         let seq_len_f32 = query_sequence.len() as f32;
         let bound_epsilon = 8.0 * f32::EPSILON * query_sequence.len() as f32;
-        let known_mask_template = Self::identify_known_mask_for_plan(anchor_plan);
 
         IDENTIFY_CANDIDATE_SCRATCH.with(|candidate_scratch| {
-            IDENTIFY_TILE_SCORE_SCRATCH.with(|tile_score_scratch| {
-                let mut scratch = candidate_scratch.borrow_mut();
-                let scratch_capacity = scratch.capacity();
-                if scratch_capacity < total_vectors {
-                    scratch.reserve(total_vectors - scratch_capacity);
-                }
-                scratch.resize(total_vectors, IdentifyScoreEntry::default());
+            IDENTIFY_BLOCK_CANDIDATE_SCRATCH.with(|block_scratch| {
+                IDENTIFY_TILE_SCORE_SCRATCH.with(|tile_score_scratch| {
+                    let mut shortlist = candidate_scratch.borrow_mut();
+                    shortlist.clear();
+                    let shortlist_capacity = shortlist.capacity();
+                    if shortlist_capacity < primary_keep.saturating_mul(4) {
+                        shortlist.reserve(primary_keep.saturating_mul(4) - shortlist_capacity);
+                    }
 
-                let mut tile_scores = tile_score_scratch.borrow_mut();
-                let tile_scores_capacity = tile_scores.capacity();
-                if tile_scores_capacity < tile_width {
-                    tile_scores.reserve(tile_width - tile_scores_capacity);
-                }
-                tile_scores.resize(tile_width, 0.0);
+                    let mut block = block_scratch.borrow_mut();
+                    block.clear();
+                    let block_capacity = block.capacity();
+                    if block_capacity < block_size {
+                        block.reserve(block_size - block_capacity);
+                    }
 
-                let mut candidate_count = 0usize;
-                for run_idx in 0..view.run_count() {
-                    let run_start_id = view.run_start_id(run_idx);
-                    let run_vectors = view.run_vectors(run_idx);
-                    let run_len = run_vectors.len() / dim;
-                    let mut local_idx = 0usize;
-                    while local_idx < run_len {
-                        let batch_count = (run_len - local_idx).min(tile_width);
-                        let start = local_idx * dim;
-                        let end = start + batch_count * dim;
-                        dot_product_scores(
-                            anchor_query,
-                            &run_vectors[start..end],
-                            dim,
-                            &mut tile_scores[..batch_count],
-                        );
-                        for lane_idx in 0..batch_count {
-                            let anchor_id = run_start_id.saturating_add(local_idx + lane_idx);
-                            if anchor_id < anchor_plan.primary_offset {
+                    let mut tile_scores = tile_score_scratch.borrow_mut();
+                    let tile_scores_capacity = tile_scores.capacity();
+                    if tile_scores_capacity < tile_width {
+                        tile_scores.reserve(tile_width - tile_scores_capacity);
+                    }
+                    tile_scores.resize(tile_width, 0.0);
+
+                    for run_idx in 0..view.run_count() {
+                        let run_start_id = view.run_start_id(run_idx);
+                        let run_vectors = view.run_vectors(run_idx);
+                        let run_len = run_vectors.len() / dim;
+                        let mut block_start = 0usize;
+                        while block_start < run_len {
+                            let block_count = (run_len - block_start).min(block_size);
+                            block.clear();
+                            block.resize(block_count, IdentifyScoreEntry::default());
+
+                            let mut produced = 0usize;
+                            let mut local_idx = block_start;
+                            while local_idx < block_start + block_count {
+                                let batch_count =
+                                    (block_start + block_count - local_idx).min(tile_width);
+                                let start = local_idx * dim;
+                                let end = start + batch_count * dim;
+                                dot_product_scores(
+                                    anchor_query,
+                                    &run_vectors[start..end],
+                                    dim,
+                                    &mut tile_scores[..batch_count],
+                                );
+                                for lane_idx in 0..batch_count {
+                                    let anchor_id =
+                                        run_start_id.saturating_add(local_idx + lane_idx);
+                                    if anchor_id < anchor_plan.primary_offset {
+                                        continue;
+                                    }
+                                    block[produced] = IdentifyScoreEntry {
+                                        start_id: anchor_id - anchor_plan.primary_offset,
+                                        primary_score: tile_scores[lane_idx],
+                                        secondary_score: 0.0,
+                                        tertiary_score: 0.0,
+                                        run_idx,
+                                        local_idx: local_idx + lane_idx,
+                                    };
+                                    produced += 1;
+                                }
+                                local_idx += batch_count;
+                            }
+
+                            if produced == 0 {
+                                block_start += block_count;
                                 continue;
                             }
-                            scratch[candidate_count] = IdentifyScoreEntry {
-                                id: anchor_id - anchor_plan.primary_offset,
-                                primary_score: tile_scores[lane_idx],
-                                known_sum: tile_scores[lane_idx],
-                                known_mask: 0b01,
-                            };
-                            candidate_count += 1;
+
+                            let block_limit = produced.min(primary_keep);
+                            let block_slice = &mut block[..produced];
+                            if block_limit < block_slice.len() {
+                                block_slice.select_nth_unstable_by(block_limit - 1, |a, b| {
+                                    b.primary_score
+                                        .partial_cmp(&a.primary_score)
+                                        .unwrap_or(Ordering::Equal)
+                                });
+                            }
+                            shortlist.extend_from_slice(&block_slice[..block_limit]);
+                            if shortlist.len() > primary_keep.saturating_mul(4) {
+                                shortlist.select_nth_unstable_by(primary_keep - 1, |a, b| {
+                                    b.primary_score
+                                        .partial_cmp(&a.primary_score)
+                                        .unwrap_or(Ordering::Equal)
+                                });
+                                shortlist.truncate(primary_keep);
+                            }
+
+                            block_start += block_count;
                         }
-                        local_idx += batch_count;
                     }
-                }
 
-                if candidate_count == 0 {
-                    scratch.clear();
-                    return Vec::new();
-                }
+                    if shortlist.is_empty() {
+                        return Vec::new();
+                    }
 
-                let shortlist_len = candidate_count.min(anchor_overfetch);
-                let shortlist = &mut scratch[..candidate_count];
-                if shortlist_len < shortlist.len() {
-                    shortlist.select_nth_unstable_by(shortlist_len - 1, |a, b| {
-                        b.primary_score
-                            .partial_cmp(&a.primary_score)
-                            .unwrap_or(Ordering::Equal)
-                    });
-                }
-                let shortlist = &mut shortlist[..shortlist_len];
-                shortlist.sort_unstable_by(|a, b| {
-                    b.primary_score
-                        .partial_cmp(&a.primary_score)
-                        .unwrap_or(Ordering::Equal)
-                });
+                    if shortlist.len() > primary_keep {
+                        shortlist.select_nth_unstable_by(primary_keep - 1, |a, b| {
+                            b.primary_score
+                                .partial_cmp(&a.primary_score)
+                                .unwrap_or(Ordering::Equal)
+                        });
+                        shortlist.truncate(primary_keep);
+                    }
 
-                let mut topk = std::collections::BinaryHeap::with_capacity(k + 1);
-                for candidate in shortlist.iter_mut() {
-                    candidate.known_sum = candidate.primary_score;
-                    candidate.known_mask = 0b01;
+                    shortlist.sort_unstable_by_key(|entry| (entry.run_idx, entry.local_idx));
 
                     if let Some(secondary_offset) = anchor_plan.secondary_offset {
-                        let Some(secondary_score) = Self::identify_candidate_anchor_score(
+                        for candidate in shortlist.iter_mut() {
+                            let Some(score) = Self::identify_candidate_anchor_score_cached(
+                                view,
+                                dim,
+                                candidate,
+                                anchor_plan.primary_offset,
+                                secondary_offset,
+                                &query_sequence[secondary_offset],
+                            ) else {
+                                candidate.secondary_score = f32::NEG_INFINITY;
+                                continue;
+                            };
+                            candidate.secondary_score = score;
+                        }
+                        shortlist.retain(|candidate| candidate.secondary_score.is_finite());
+                        if shortlist.len() > secondary_keep {
+                            shortlist.select_nth_unstable_by(secondary_keep - 1, |a, b| {
+                                let a_score = a.primary_score + a.secondary_score;
+                                let b_score = b.primary_score + b.secondary_score;
+                                b_score.partial_cmp(&a_score).unwrap_or(Ordering::Equal)
+                            });
+                            shortlist.truncate(secondary_keep);
+                        }
+                    }
+
+                    shortlist.sort_unstable_by_key(|entry| (entry.run_idx, entry.local_idx));
+
+                    if let Some(tertiary_offset) = anchor_plan.tertiary_offset {
+                        for candidate in shortlist.iter_mut() {
+                            let Some(score) = Self::identify_candidate_anchor_score_cached(
+                                view,
+                                dim,
+                                candidate,
+                                anchor_plan.primary_offset,
+                                tertiary_offset,
+                                &query_sequence[tertiary_offset],
+                            ) else {
+                                candidate.tertiary_score = f32::NEG_INFINITY;
+                                continue;
+                            };
+                            candidate.tertiary_score = score;
+                        }
+                        shortlist.retain(|candidate| candidate.tertiary_score.is_finite());
+                        if shortlist.len() > tertiary_keep {
+                            shortlist.select_nth_unstable_by(tertiary_keep - 1, |a, b| {
+                                let a_score =
+                                    a.primary_score + a.secondary_score + a.tertiary_score;
+                                let b_score =
+                                    b.primary_score + b.secondary_score + b.tertiary_score;
+                                b_score.partial_cmp(&a_score).unwrap_or(Ordering::Equal)
+                            });
+                            shortlist.truncate(tertiary_keep);
+                        }
+                    }
+
+                    shortlist.sort_unstable_by_key(|entry| (entry.run_idx, entry.local_idx));
+
+                    let mut topk = std::collections::BinaryHeap::with_capacity(k + 1);
+                    for candidate in shortlist.iter() {
+                        let mut known_sum = candidate.primary_score;
+                        let mut known_mask = 0b01;
+                        if anchor_plan.secondary_offset.is_some() {
+                            known_sum += candidate.secondary_score;
+                            known_mask |= 0b10;
+                        }
+                        if anchor_plan.tertiary_offset.is_some() {
+                            known_sum += candidate.tertiary_score;
+                            known_mask |= 0b100;
+                        }
+
+                        if topk.len() >= k {
+                            let remaining_frames = query_sequence
+                                .len()
+                                .saturating_sub(Self::identify_known_count(known_mask));
+                            let upper_bound =
+                                (known_sum + remaining_frames as f32) / seq_len_f32;
+                            let worst_topk_score = topk
+                                .peek()
+                                .map(|entry: &MinScore| entry.score)
+                                .unwrap_or(f32::NEG_INFINITY);
+                            if upper_bound + bound_epsilon < worst_topk_score {
+                                continue;
+                            }
+                        }
+
+                        let worst_topk_score = if topk.len() < k {
+                            f32::NEG_INFINITY
+                        } else {
+                            topk.peek()
+                                .map(|entry: &MinScore| entry.score)
+                                .unwrap_or(f32::NEG_INFINITY)
+                        };
+
+                        let Some(score) = Self::verify_identify_candidate(
                             view,
                             dim,
-                            candidate.id,
-                            secondary_offset,
-                            &query_sequence[secondary_offset],
+                            candidate,
+                            query_sequence,
+                            anchor_plan,
+                            known_mask,
+                            known_sum,
+                            worst_topk_score,
+                            bound_epsilon,
                         ) else {
                             continue;
                         };
-                        candidate.known_sum += secondary_score;
-                        candidate.known_mask = known_mask_template;
-                    }
 
-                    if topk.len() >= k {
-                        let remaining_frames =
-                            query_sequence.len().saturating_sub(Self::identify_known_count(candidate.known_mask));
-                        let upper_bound =
-                            (candidate.known_sum + remaining_frames as f32) / seq_len_f32;
-                        let worst_topk_score = topk
-                            .peek()
-                            .map(|entry: &MinScore| entry.score)
-                            .unwrap_or(f32::NEG_INFINITY);
-                        if upper_bound + bound_epsilon < worst_topk_score {
-                            continue;
-                        }
-                    }
-
-                    let worst_topk_score = if topk.len() < k {
-                        f32::NEG_INFINITY
-                    } else {
-                        topk.peek()
-                            .map(|entry: &MinScore| entry.score)
-                            .unwrap_or(f32::NEG_INFINITY)
-                    };
-
-                    let Some(score) = Self::verify_identify_candidate(
-                        view,
-                        dim,
-                        candidate.id,
-                        query_sequence,
-                        anchor_plan,
-                        candidate.known_mask,
-                        candidate.known_sum,
-                        worst_topk_score,
-                        bound_epsilon,
-                    ) else {
-                        continue;
-                    };
-
-                    if topk.len() < k {
-                        topk.push(MinScore {
-                            id: candidate.id,
-                            score,
-                        });
-                    } else if let Some(worst) = topk.peek() {
-                        if score > worst.score {
-                            topk.pop();
+                        if topk.len() < k {
                             topk.push(MinScore {
-                                id: candidate.id,
+                                id: candidate.start_id,
                                 score,
                             });
+                        } else if let Some(worst) = topk.peek() {
+                            if score > worst.score {
+                                topk.pop();
+                                topk.push(MinScore {
+                                    id: candidate.start_id,
+                                    score,
+                                });
+                            }
                         }
                     }
-                }
 
-                scratch.clear();
-                let mut out = Vec::with_capacity(topk.len());
-                while let Some(entry) = topk.pop() {
-                    out.push((entry.id, entry.score));
-                }
-                out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                out
+                    shortlist.clear();
+                    block.clear();
+
+                    let mut out = Vec::with_capacity(topk.len());
+                    while let Some(entry) = topk.pop() {
+                        out.push((entry.id, entry.score));
+                    }
+                    out.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(Ordering::Equal)
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
+                    out
+                })
             })
         })
     }
@@ -2816,8 +3011,36 @@ impl ProductionState {
         }
         merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
-        let metadata_map = if request.include_metadata {
-            self.metadata_envelopes_for_ids(&merged.iter().map(|(id, _)| *id).collect::<Vec<_>>())?
+        let mut boundary_ids = Vec::with_capacity(merged.len().saturating_mul(4));
+        let mut envelope_ids = Vec::new();
+        for (start_id, _) in &merged {
+            boundary_ids.push(*start_id);
+            boundary_ids.push(Self::identify_sequence_end_id(*start_id, seq_len));
+            if request.include_metadata {
+                envelope_ids.push(*start_id);
+            }
+            if request.include_sequence_metadata {
+                envelope_ids.extend(*start_id..start_id.saturating_add(seq_len));
+            }
+            if request.future_steps > 0 {
+                let future_start = start_id.saturating_add(seq_len);
+                boundary_ids.push(future_start);
+                boundary_ids
+                    .push(Self::identify_sequence_end_id(future_start, request.future_steps));
+                if request.include_sequence_metadata {
+                    envelope_ids
+                        .extend(future_start..future_start.saturating_add(request.future_steps));
+                }
+            }
+        }
+        boundary_ids.sort_unstable();
+        boundary_ids.dedup();
+        envelope_ids.sort_unstable();
+        envelope_ids.dedup();
+
+        let boundary_metadata = self.metadata_for_ids_internal(&boundary_ids)?;
+        let envelope_map = if !envelope_ids.is_empty() {
+            self.metadata_envelopes_for_ids(&envelope_ids)?
         } else {
             HashMap::new()
         };
@@ -2832,22 +3055,55 @@ impl ProductionState {
             .into_iter()
             .map(|(id, score)| {
                 let metadata = if request.include_metadata {
-                    metadata_map.get(&id).cloned()
+                    envelope_map.get(&id).cloned()
                 } else {
                     None
                 };
-                let (start_timestamp_ms, duration_ms) = if let Some(meta) = metadata.as_ref() {
-                    (meta.sequence_ts, 0u64.saturating_mul(seq_len as u64))
+                let matched_sequence =
+                    Self::build_identify_sequence_span(&boundary_metadata, id, seq_len);
+                let future_sequence = if request.future_steps == 0 {
+                    None
                 } else {
-                    (0, 0)
+                    let future_start = id.saturating_add(seq_len);
+                    let future_end =
+                        Self::identify_sequence_end_id(future_start, request.future_steps);
+                    (boundary_metadata.contains_key(&future_start)
+                        && boundary_metadata.contains_key(&future_end))
+                    .then(|| {
+                        Self::build_identify_sequence_span(
+                            &boundary_metadata,
+                            future_start,
+                            request.future_steps,
+                        )
+                    })
+                };
+                let matched_sequence_metadata = if request.include_sequence_metadata {
+                    Self::build_identify_sequence_metadata(&envelope_map, id, seq_len)
+                } else {
+                    None
+                };
+                let future_sequence_metadata = if request.include_sequence_metadata {
+                    future_sequence.as_ref().and_then(|future| {
+                        Self::build_identify_sequence_metadata(
+                            &envelope_map,
+                            future.start_id,
+                            future.length,
+                        )
+                    })
+                } else {
+                    None
                 };
 
                 IdentifyResultV2 {
                     id,
-                    start_timestamp_ms,
-                    duration_ms,
+                    start_timestamp_ms: matched_sequence.start_timestamp_ms,
+                    duration_ms: matched_sequence.duration_ms,
                     score,
                     metadata,
+                    matched_sequence,
+                    future_sequence,
+                    matched_sequence_metadata,
+                    future_sequence_metadata,
                 }
             })
             .collect();
@@ -4096,6 +4352,51 @@ impl ProductionState {
             out.insert(id, MetadataEnvelopeV3::from_internal(&meta, tags));
         }
         Ok(out)
+    }
+
+    #[inline]
+    fn identify_sequence_end_id(start_id: usize, length: usize) -> usize {
+        start_id.saturating_add(length.saturating_sub(1))
+    }
+
+    fn build_identify_sequence_span(
+        metadata_map: &HashMap<usize, VectorMetadataV3>,
+        start_id: usize,
+        length: usize,
+    ) -> IdentifySequenceSpanV3 {
+        let end_id = Self::identify_sequence_end_id(start_id, length);
+        let start_meta = metadata_map.get(&start_id);
+        let end_meta = metadata_map.get(&end_id);
+        let start_timestamp_ms = start_meta.map(|meta| meta.sequence_ts).unwrap_or(0);
+        let duration_ms = match (start_meta, end_meta) {
+            (Some(start), Some(end)) => end.sequence_ts.saturating_sub(start.sequence_ts),
+            _ => 0,
+        };
+
+        IdentifySequenceSpanV3 {
+            start_id,
+            end_id,
+            length,
+            start_timestamp_ms,
+            duration_ms,
+            entity_id: start_meta.map(|meta| meta.entity_id),
+        }
+    }
+
+    fn build_identify_sequence_metadata(
+        envelope_map: &HashMap<usize, MetadataEnvelopeV3>,
+        start_id: usize,
+        length: usize,
+    ) -> Option<Vec<MetadataEnvelopeV3>> {
+        if length == 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(length);
+        for id in start_id..start_id.saturating_add(length) {
+            let envelope = envelope_map.get(&id)?;
+            out.push(envelope.clone());
+        }
+        Some(out)
     }
 
     fn resolve_filter_tag_ids(
@@ -5745,6 +6046,7 @@ mod tests {
         assert!(plan.low_information);
         assert_eq!(plan.primary_offset, 6);
         assert_eq!(plan.secondary_offset, Some(3));
+        assert_eq!(plan.tertiary_offset, Some(9));
     }
 
     #[test]
@@ -5778,9 +6080,79 @@ mod tests {
         let plan = ProductionState::build_anchor_plan(&query).expect("anchor plan");
         let mut single_anchor = plan;
         single_anchor.secondary_offset = None;
+        single_anchor.tertiary_offset = None;
         let exact = state.identify_exact_over_runs(runs.as_slice(), &query, 5, &plan);
         let single = state.identify_exact_over_runs(runs.as_slice(), &query, 5, &single_anchor);
         assert_eq!(exact, single);
+    }
+
+    #[test]
+    fn identify_returns_matched_and_future_sequence_windows() {
+        let (state, _dir) = test_state(4);
+        let vectors = [
+            l2_normalized(&[1.0, 0.0, 0.0, 0.0]),
+            l2_normalized(&[0.8, 0.2, 0.0, 0.0]),
+            l2_normalized(&[0.0, 1.0, 0.0, 0.0]),
+            l2_normalized(&[0.0, 0.8, 0.2, 0.0]),
+            l2_normalized(&[0.0, 0.0, 1.0, 0.0]),
+            l2_normalized(&[0.0, 0.0, 0.8, 0.2]),
+            l2_normalized(&[0.0, 0.0, 0.0, 1.0]),
+            l2_normalized(&[0.2, 0.0, 0.0, 0.8]),
+        ];
+        for (id, vector) in vectors.into_iter().enumerate() {
+            state
+                .insert_hot_vector(
+                    id,
+                    vector,
+                    VectorMetadataV3 {
+                        entity_id: 99,
+                        sequence_ts: (id as u64) * 10,
+                        tags: Vec::new(),
+                        payload: format!("frame-{id}").into_bytes(),
+                    },
+                )
+                .expect("insert hot vector");
+        }
+
+        let request = IdentifyRequestV2 {
+            vectors: vec![
+                l2_normalized(&[0.0, 1.0, 0.0, 0.0]),
+                l2_normalized(&[0.0, 0.8, 0.2, 0.0]),
+                l2_normalized(&[0.0, 0.0, 1.0, 0.0]),
+            ],
+            k: 1,
+            ef: 64,
+            include_metadata: true,
+            future_steps: 2,
+            include_sequence_metadata: true,
+            search_tier: SearchTier::Active,
+        };
+
+        let response = state.identify(&request).expect("identify");
+        let result = response.results.first().expect("result");
+        assert_eq!(result.id, 2);
+        assert_eq!(result.matched_sequence.start_id, 2);
+        assert_eq!(result.matched_sequence.end_id, 4);
+        assert_eq!(result.matched_sequence.length, 3);
+        assert_eq!(result.matched_sequence.start_timestamp_ms, 20);
+        assert_eq!(result.matched_sequence.duration_ms, 20);
+        assert_eq!(result.future_sequence.as_ref().map(|span| span.start_id), Some(5));
+        assert_eq!(result.future_sequence.as_ref().map(|span| span.end_id), Some(6));
+        assert_eq!(result.future_sequence.as_ref().map(|span| span.length), Some(2));
+        assert_eq!(
+            result
+                .matched_sequence_metadata
+                .as_ref()
+                .map(|frames| frames.len()),
+            Some(3)
+        );
+        assert_eq!(
+            result
+                .future_sequence_metadata
+                .as_ref()
+                .map(|frames| frames.len()),
+            Some(2)
+        );
     }
 
     #[test]

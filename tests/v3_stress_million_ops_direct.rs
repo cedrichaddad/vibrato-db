@@ -146,6 +146,8 @@ fn verify_strict_identify_direct(
         k: 1,
         ef: STRICT_EF,
         include_metadata: true,
+        future_steps: 0,
+        include_sequence_metadata: false,
         search_tier: search_tier.clone(),
     };
     let response = state
